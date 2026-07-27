@@ -52,6 +52,29 @@ if(AI_COMPASS_BUILD_HIP_TRACER)
     )
 endif()
 
+# GPUPerfAPI adapter library
+if(AI_COMPASS_USE_GPU_PERF_API)
+    add_library(ai_gpu_perf STATIC
+        src/gpu-perf/gpu_perf_hip_adapter.cpp
+    )
+    target_include_directories(ai_gpu_perf
+        PUBLIC
+            src/gpu-perf
+            ${CMAKE_CURRENT_SOURCE_DIR}/../gpu_performance_api/include
+        PRIVATE
+            src/core/include
+            "C:/VulkanSDK/1.4.350.0/Include"
+    )
+    target_link_libraries(ai_gpu_perf
+        PUBLIC
+            ai_compass_core
+    )
+    target_link_libraries(ai_gpu_perf
+        PRIVATE
+            "C:/VulkanSDK/1.4.350.0/Lib/vulkan-1.lib"
+    )
+endif()
+
 # Output library
 add_library(ai_output
     src/output/rocprofv2_output.cpp
@@ -60,8 +83,16 @@ target_include_directories(ai_output PUBLIC src/output)
 target_link_libraries(ai_output PRIVATE ai_compass_core)
 
 # Install
-install(TARGETS aicompass ai_hip_tracer ai_compass_core ai_output
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
-)
+if(AI_COMPASS_USE_GPU_PERF_API)
+    install(TARGETS aicompass ai_hip_tracer ai_compass_core ai_gpu_perf ai_output
+        RUNTIME DESTINATION bin
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+    )
+else()
+    install(TARGETS aicompass ai_hip_tracer ai_compass_core ai_output
+        RUNTIME DESTINATION bin
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+    )
+endif()
