@@ -1,0 +1,38 @@
+# Build outputs
+build/
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# IDE files
+.vs/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+
+# Trace outputs
+*.csv
+*.json
+trace_*/
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large third-party binaries
+third_party/**/*.dll
+third_party/**/*.lib
