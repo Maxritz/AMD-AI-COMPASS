@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI-COMPASS Analyze — kernel profiling + bottleneck detection + perf report
+AI-COMPASS Analyze  kernel profiling + bottleneck detection + perf report
 
 Usage:
     python tools/analyze.py trace.csv [--output report_dir] [--compare baseline.csv]
@@ -14,32 +14,23 @@ import argparse
 from collections import defaultdict
 from datetime import datetime
 
-# ── Kernel classification ──────────────────────────────────────────────
-MMQ_KERNELS = {"mul_mat_vec", "quantize_mul_mat", "dequantize_mul_mat_vec"}
-MMVQ_KERNELS = {"mul_mat_vec_q"}
-ATTN_KERNELS = {"flash_attn", "attn", "soft_max", "attn_vec"}
-NORM_KERNELS = {"rms_norm", "norm", "layer_norm"}
-ROPE_KERNELS = {"rope", "rope_neox"}
-ACT_KERNELS = {"silu", "gelu", "relu", "sigmoid", "hard_swish"}
-CONV_KERNELS = {"im2col", "conv"}
-MOE_KERNELS = {"moe", "expert", "ffn_gate", "top_k", "soft_max_expert"}
-QUANT_KERNELS = {"quantize", "dequantize", "quant"}
-SGEMV_KERNELS = {"sgemm", "gemm", "mat_mul"}
-VEC_KERNELS = {"vec", "add", "mul", "cpy", "dup", "get_rows", "scale"}
-
+#  Kernel classification 
 def classify_kernel(name):
     nl = name.lower()
-    if any(k in nl for k in MMQ_KERNELS): return "MMQ"
-    if any(k in nl for k in MMVQ_KERNELS): return "MMVQ"
-    if any(k in nl for k in ATTN_KERNELS): return "Attention"
-    if any(k in nl for k in NORM_KERNELS): return "Norm"
-    if any(k in nl for k in ROPE_KERNELS): return "RoPE"
-    if any(k in nl for k in ACT_KERNELS): return "Activation"
-    if any(k in nl for k in CONV_KERNELS): return "Conv"
-    if any(k in nl for k in MOE_KERNELS): return "MoE"
-    if any(k in nl for k in QUANT_KERNELS): return "Quantize"
-    if any(k in nl for k in SGEMV_KERNELS): return "GEMM"
-    if any(k in nl for k in VEC_KERNELS): return "Vector"
+    # ggml mul_mat implementations
+    if any(k in nl for k in ["mul_mat_vec_q", "mmvq", "mul_mat_vec"]): return "MMVQ"
+    if any(k in nl for k in ["mul_mat", "quantize_mul_mat", "dequantize_mul_mat", "mmq"]): return "MMQ"
+    # ggml ops
+    if any(k in nl for k in ["flash_attn", "attn", "soft_max", "attn_vec", "flash_attn"]): return "Attention"
+    if any(k in nl for k in ["rms_norm", "norm", "layer_norm"]): return "Norm"
+    if any(k in nl for k in ["rope", "rope_neox"]): return "RoPE"
+    if any(k in nl for k in ["silu", "gelu", "relu", "sigmoid", "hard_swish"]): return "Activation"
+    if any(k in nl for k in ["im2col", "conv"]): return "Conv"
+    if any(k in nl for k in ["moe", "expert", "ffn_gate", "top_k", "soft_max_expert"]): return "MoE"
+    if any(k in nl for k in ["quantize", "dequantize", "quant"]): return "Quantize"
+    if any(k in nl for k in ["sgemm", "gemm", "mat_mul"]): return "GEMM"
+    if any(k in nl for k in ["vec", "add", "mul", "cpy", "dup", "get_rows", "scale", "concat", "repeat"]): return "Vector"
+    # Unknown / kptr_
     return "Other"
 
 
@@ -158,7 +149,7 @@ def analyze_trace(records, cu_count=32):
         })
 
     # Throughput estimates
-    # PP: prompt processing throughput (tokens/s) — rough estimate from kernel count
+    # PP: prompt processing throughput (tokens/s)  rough estimate from kernel count
     pp_time_ms = sum(k["duration_us"] for k in pp_kernels) / 1000
     tg_time_ms = sum(k["duration_us"] for k in tg_kernels) / 1000
 
@@ -168,7 +159,7 @@ def analyze_trace(records, cu_count=32):
         if stats["pct"] > 25:
             bottlenecks.append(f"{cat} dominates at {stats['pct']}% of total time")
         if stats["avg_occupancy_pct"] < 30 and stats["pct"] > 5:
-            bottlenecks.append(f"{cat} has low occupancy ({stats['avg_occupancy_pct']}%) — likely occupancy-bound")
+            bottlenecks.append(f"{cat} has low occupancy ({stats['avg_occupancy_pct']}%)  likely occupancy-bound")
 
     # Check GPU utilization (from ADLX metrics if available, else estimate)
     ideal_time_us = sum(r["duration_us"] for r in records if r["block_x"] > 64)
@@ -243,39 +234,39 @@ th {{ background: #161b22; }} tr:nth-child(even) {{ background: #161b22; }}
 .meter {{ height: 20px; background: #21262d; border-radius: 10px; overflow: hidden; margin: 4px 0; }}
 .meter-bar {{ height: 100%; background: #58a6ff; border-radius: 10px; }}
 </style></head><body>
-<h1>🧭 AI-COMPASS Performance Report</h1>
+<h1>[AI] [AI-COMPASS] Performance Report</h1>
 <p>Generated: {analysis["analysis_time"]}</p>
 <div class="card">
 <h2>Summary</h2>
 <table>
 <tr><td>Total Kernels</td><td>{s["total_kernels"]}</td></tr>
 <tr><td>Total GPU Time</td><td>{s["total_time_ms"]} ms</td></tr>
-<tr><td>Avg Kernel</td><td>{s["avg_kernel_us"]} µs</td></tr>
+<tr><td>Avg Kernel</td><td>{s["avg_kernel_us"]} s</td></tr>
 <tr><td>Est. GPU Busy</td><td>{s["estimated_gpu_busy_pct"]}%</td></tr>
 <tr><td>Est. GPU Utilization</td><td>{s["estimated_gpu_utilization_pct"]}%</td></tr>
 </table>
 </div>
 <div class="card">
 <h2>Phases</h2>
-<table><tr><th>Phase</th><th>Kernels</th><th>Time (ms)</th><th>% Total</th><th>Avg Kernel (µs)</th></tr>
+<table><tr><th>Phase</th><th>Kernels</th><th>Time (ms)</th><th>% Total</th><th>Avg Kernel (s)</th></tr>
 """
     for p in phases:
         html += f"<tr><td>{p['phase']}</td><td>{p['kernel_count']}</td><td>{p['total_ms']}</td><td>{p['pct_of_total']}%</td><td>{p['avg_kernel_us']}</td></tr>"
 
-    html += """</table></div><div class="card"><h2>Category Breakdown</h2><table><tr><th>Category</th><th>Count</th><th>Total (ms)</th><th>%</th><th>Avg (µs)</th><th>Max (µs)</th><th>Occupancy</th></tr>"""
+    html += """</table></div><div class="card"><h2>Category Breakdown</h2><table><tr><th>Category</th><th>Count</th><th>Total (ms)</th><th>%</th><th>Avg (s)</th><th>Max (s)</th><th>Occupancy</th></tr>"""
     for cat, st in sorted(cats.items(), key=lambda x: -x[1]["pct"]):
         html += f"<tr><td>{cat}</td><td>{st['count']}</td><td>{st['total_ms']}</td><td>{st['pct']}%</td><td>{st['avg_us']}</td><td>{st['max_us']}</td><td>{st['avg_occupancy_pct']}%</td></tr>"
 
     html += """</table></div>"""
 
     if bots:
-        html += """<div class="card"><h2>🚨 Bottlenecks</h2><ul>"""
+        html += """<div class="card"><h2>[BELL] Bottlenecks</h2><ul>"""
         for b in bots:
             html += f'<li class="bottleneck">{b}</li>'
         html += "</ul></div>"
 
     if targets:
-        html += """<div class="card"><h2>🔧 Optimization Targets</h2>"""
+        html += """<div class="card"><h2> Optimization Targets</h2>"""
         for t in targets:
             html += f"<p><b>{t['target']}</b> ({t['current_pct']}% of time): {t['suggestion']}</p>"
         html += "</div>"
@@ -285,7 +276,7 @@ th {{ background: #161b22; }} tr:nth-child(even) {{ background: #161b22; }}
         html += f"<tr><td>{k['kernel']}</td><td>{k['category']}</td><td>{k['duration_ms']}</td><td>{k['grid']}</td><td>{k['block']}</td><td>{k['occupancy_pct']}%</td></tr>"
     html += """</table></div></body></html>"""
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
     return output_path
 
@@ -326,7 +317,7 @@ def compare_traces(baseline_path, target_path, cu_count=32):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AI-COMPASS Analyze — kernel profiling & bottleneck detection")
+    parser = argparse.ArgumentParser(description="AI-COMPASS Analyze  kernel profiling & bottleneck detection")
     parser.add_argument("trace", help="HIP trace CSV file")
     parser.add_argument("-o", "--output", default="analysis_output", help="Output directory")
     parser.add_argument("--compare", help="Baseline CSV for before/after comparison")
@@ -338,39 +329,39 @@ def main():
 
     records = parse_trace(args.trace)
     if not records:
-        print(f"❌ No records found in {args.trace}")
+        print(f"[FAIL] No records found in {args.trace}")
         return 1
 
-    print(f"🧭 Analyzing {len(records)} kernel records from {args.trace}...")
+    print(f"[AI] Analyzing {len(records)} kernel records from {args.trace}...")
 
     analysis = analyze_trace(records, args.cu_count)
     analysis["trace_file"] = args.trace
 
     # Print summary
     s = analysis["summary"]
-    print(f"\n📊 Summary:")
+    print(f"\n[DATA] Summary:")
     print(f"   {s['total_kernels']} kernels | {s['total_time_ms']} ms total")
-    print(f"   Avg kernel: {s['avg_kernel_us']} µs | Est. GPU busy: {s['estimated_gpu_busy_pct']}%")
+    print(f"   Avg kernel: {s['avg_kernel_us']} s | Est. GPU busy: {s['estimated_gpu_busy_pct']}%")
 
     # Print phases
-    print(f"\n📈 Phases:")
+    print(f"\n Phases:")
     for p in analysis["phases"]:
         print(f"   {p['phase']}: {p['kernel_count']} kernels, {p['total_ms']} ms ({p['pct_of_total']}%)")
 
     # Print category breakdown
-    print(f"\n🏷️  Category Breakdown:")
+    print(f"\n  Category Breakdown:")
     for cat, st in sorted(analysis["category_breakdown"].items(), key=lambda x: -x[1]["pct"]):
         print(f"   {cat:15s} {st['count']:5d} kernels  {st['total_ms']:8.1f} ms  {st['pct']:5.1f}%  occ:{st['avg_occupancy_pct']:5.1f}%")
 
     # Print bottlenecks
     if analysis["bottlenecks"]:
-        print(f"\n🚨 Bottlenecks:")
+        print(f"\n[BELL] Bottlenecks:")
         for b in analysis["bottlenecks"]:
-            print(f"   ⚠ {b}")
+            print(f"   [WARN] {b}")
 
     # Print optimization targets
     if analysis["optimization_targets"]:
-        print(f"\n🔧 Optimization Targets:")
+        print(f"\n Optimization Targets:")
         for t in analysis["optimization_targets"]:
             print(f"   [{t['target']}] ({t['current_pct']}%): {t['suggestion']}")
 
@@ -378,30 +369,30 @@ def main():
     json_path = os.path.join(args.output, "analysis.json")
     with open(json_path, "w") as f:
         json.dump(analysis, f, indent=2)
-    print(f"\n💾 JSON report: {json_path}")
+    print(f"\n JSON report: {json_path}")
 
     # HTML report
     if args.html:
         html_path = os.path.join(args.output, "report.html")
         generate_html_report(analysis, html_path)
-        print(f"📄 HTML report: {html_path}")
+        print(f"[FILE] HTML report: {html_path}")
 
     # Compare mode
     if args.compare:
-        print(f"\n🔄 Comparing against baseline: {args.compare}...")
+        print(f"\n[SYNC] Comparing against baseline: {args.compare}...")
         diff = compare_traces(args.compare, args.trace, args.cu_count)
         diff_path = os.path.join(args.output, "comparison.json")
         with open(diff_path, "w") as f:
             json.dump(diff, f, indent=2)
         if diff["improvements"]:
-            print(f"\n✅ Improvements:")
+            print(f"\n[OK] Improvements:")
             for k, v in diff["improvements"].items():
                 print(f"   {k}: {v}")
         if diff["regressions"]:
-            print(f"\n❌ Regressions:")
+            print(f"\n[FAIL] Regressions:")
             for k, v in diff["regressions"].items():
                 print(f"   {k}: {v}")
-        print(f"💾 Comparison: {diff_path}")
+        print(f" Comparison: {diff_path}")
 
     return 0
 

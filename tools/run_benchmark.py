@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI-COMPASS Benchmark Runner — end-to-end performance test
+AI-COMPASS Benchmark Runner  end-to-end performance test
 
 Records HIP kernel trace + GPU metrics for a model, then generates
 a comprehensive performance report with optimization recommendations.
@@ -46,14 +46,14 @@ def main():
     # Find llama-bench
     lb = args.llama_bench or find_llama_bench()
     if not lb:
-        print("❌ llama-bench not found. Build it first:")
+        print(" llama-bench not found. Build it first:")
         print("   cd llma.cpp-ROCM-Test && mkdir build-hip && cd build-hip")
         print("   cmake .. -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release")
         print("   cmake --build . --config Release --target llama-bench")
         return 1
 
     if not os.path.exists(args.model):
-        print(f"❌ Model not found: {args.model}")
+        print(f" Model not found: {args.model}")
         return 1
 
     # Setup output dir
@@ -66,7 +66,7 @@ def main():
     os.makedirs(report_dir, exist_ok=True)
 
     print("=" * 60)
-    print("🧭 AI-COMPASS Benchmark Runner")
+    print("[AICOMPASS] AI-COMPASS Benchmark Runner")
     print("=" * 60)
     print(f"Model:    {args.model}")
     print(f"PP:       {args.pp}")
@@ -76,12 +76,16 @@ def main():
     print()
 
     # Step 1: Run llama-bench with HIP tracer
-    print("📡 Launching with HIP tracer...")
+    print(" Launching with HIP tracer...")
     env = os.environ.copy()
-    env["HIP_TRACER_OUTPUT"] = trace_csv
-    env["HIP_TRACER_DLL"] = os.path.join(AI_COMPASS_ROOT, "build", "ai_hip_tracer.dll")
-
-    cmd = [lb, "-m", args.model, "-p", str(args.pp), "-n", str(args.tg), "-ngl", "99"]
+    launcher = os.path.join(AI_COMPASS_ROOT, "..", "hip_tracer", "build", "hip_tracer_launcher.exe")
+    if not os.path.exists(launcher):
+        launcher = os.path.join(AI_COMPASS_ROOT, "..", "hip_tracer", "build", "hip_tracer_launcher.exe")
+    if not os.path.exists(launcher):
+        print(f"  ? hip_tracer_launcher.exe not found. Running without tracer.")
+        cmd = [lb, "-m", args.model, "-p", str(args.pp), "-n", str(args.tg), "-ngl", "99"]
+    else:
+        cmd = [launcher, "--output", trace_csv, lb, "-m", args.model, "-p", str(args.pp), "-n", str(args.tg), "-ngl", "99"]
     print(f"   {' '.join(cmd)}")
 
     try:
@@ -90,14 +94,14 @@ def main():
         if result.stderr:
             print(f"STDERR: {result.stderr[-1000:]}")
     except subprocess.TimeoutExpired:
-        print("⚠ Benchmark timed out (10 min)")
+        print(" Benchmark timed out (10 min)")
         return 1
     except FileNotFoundError:
-        print(f"❌ Failed to launch {lb}")
+        print(f" Failed to launch {lb}")
         return 1
 
     # Step 2: Analyze the trace
-    print(f"\n📊 Analyzing trace: {trace_csv}")
+    print(f"\n Analyzing trace: {trace_csv}")
     if os.path.exists(trace_csv):
         from analyze import parse_trace, analyze_trace, generate_html_report
 
@@ -108,7 +112,7 @@ def main():
             # Print summary
             s = analysis["summary"]
             print(f"   Kernels: {s['total_kernels']}  Time: {s['total_time_ms']} ms")
-            print(f"   Avg: {s['avg_kernel_us']} µs  GPU busy: {s['estimated_gpu_busy_pct']}%")
+            print(f"   Avg: {s['avg_kernel_us']} s  GPU busy: {s['estimated_gpu_busy_pct']}%")
 
             # Category breakdown
             print(f"\n   Category breakdown:")
@@ -117,13 +121,13 @@ def main():
 
             # Bottlenecks
             if analysis["bottlenecks"]:
-                print(f"\n   🚨 Bottlenecks:")
+                print(f"\n    Bottlenecks:")
                 for b in analysis["bottlenecks"]:
-                    print(f"      ⚠ {b}")
+                    print(f"       {b}")
 
             # Optimization targets
             if analysis["optimization_targets"]:
-                print(f"\n   🔧 Optimization Targets:")
+                print(f"\n    Optimization Targets:")
                 for t in analysis["optimization_targets"]:
                     print(f"      [{t['target']}] {t['suggestion']}")
 
@@ -135,29 +139,29 @@ def main():
             # Write HTML report
             html_path = os.path.join(report_dir, "report.html")
             generate_html_report(analysis, html_path)
-            print(f"\n   📄 Report: {html_path}")
+            print(f"\n    Report: {html_path}")
 
             # Compare mode
             if args.compare and os.path.exists(args.compare):
-                print(f"\n   🔄 Comparing vs baseline: {args.compare}")
+                print(f"\n    Comparing vs baseline: {args.compare}")
                 from analyze import compare_traces
                 diff = compare_traces(args.compare, trace_csv)
                 with open(os.path.join(report_dir, "comparison.json"), "w") as f:
                     json.dump(diff, f, indent=2)
                 if diff["improvements"]:
-                    print(f"   ✅ Improvements:")
+                    print(f"    Improvements:")
                     for k, v in diff["improvements"].items():
                         print(f"      {k}: {v}")
                 if diff["regressions"]:
-                    print(f"   ❌ Regressions:")
+                    print(f"    Regressions:")
                     for k, v in diff["regressions"].items():
                         print(f"      {k}: {v}")
         else:
-            print("⚠ No kernel records found in trace")
+            print(" No kernel records found in trace")
     else:
-        print(f"⚠ Trace CSV not found: {trace_csv}")
+        print(f" Trace CSV not found: {trace_csv}")
 
-    print(f"\n✅ Done. Results in: {out_dir}")
+    print(f"\n Done. Results in: {out_dir}")
     print(f"   Report: {os.path.join(report_dir, 'report.html')}")
     print(f"   Trace:  {trace_csv}")
     print(f"   To view in RCV: rocprof-compute-viewer.exe {out_dir}")
