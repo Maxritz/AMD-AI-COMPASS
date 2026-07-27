@@ -15,22 +15,76 @@ from collections import defaultdict
 from datetime import datetime
 
 #  Kernel classification 
-def classify_kernel(name):
-    nl = name.lower()
-    # ggml mul_mat implementations
-    if any(k in nl for k in ["mul_mat_vec_q", "mmvq", "mul_mat_vec"]): return "MMVQ"
-    if any(k in nl for k in ["mul_mat", "quantize_mul_mat", "dequantize_mul_mat", "mmq"]): return "MMQ"
-    # ggml ops
-    if any(k in nl for k in ["flash_attn", "attn", "soft_max", "attn_vec", "flash_attn"]): return "Attention"
-    if any(k in nl for k in ["rms_norm", "norm", "layer_norm"]): return "Norm"
-    if any(k in nl for k in ["rope", "rope_neox"]): return "RoPE"
-    if any(k in nl for k in ["silu", "gelu", "relu", "sigmoid", "hard_swish"]): return "Activation"
-    if any(k in nl for k in ["im2col", "conv"]): return "Conv"
-    if any(k in nl for k in ["moe", "expert", "ffn_gate", "top_k", "soft_max_expert"]): return "MoE"
-    if any(k in nl for k in ["quantize", "dequantize", "quant"]): return "Quantize"
-    if any(k in nl for k in ["sgemm", "gemm", "mat_mul"]): return "GEMM"
-    if any(k in nl for k in ["vec", "add", "mul", "cpy", "dup", "get_rows", "scale", "concat", "repeat"]): return "Vector"
-    # Unknown / kptr_
+# Pattern-based kernel classifier for when HIP names aren't resolvable
+# Keys: (block_x, block_y, block_z, min_gx, max_gx, min_smem, max_smem) -> (category, name)
+KERNEL_DB = [
+    # MMVQ K-quant: large shared mem (K tile buffer)
+    ((32, 8, 1, 0, 9999, 50000, 99999), "MMVQ", "mmvq_kq"),
+    # MMVQ small grid, block 128
+    ((128, 1, 1, 1, 100, 0, 100), "MMVQ", "mul_mat_vec_q"),
+    # MMVQ small grid, block 32
+    ((32, 1, 1, 1, 100, 0, 100), "MMVQ", "mul_mat_vec_q"),
+    # MMQ K-tile: large grid, block 64, shared mem
+    ((64, 1, 1, 100, 99999, 128, 99999), "MMQ", "mul_mat_q_K"),
+    # MMQ: large grid, block 64, no shared mem
+    ((64, 1, 1, 100, 99999, 0, 100), "MMQ", "mul_mat_q"),
+    # Attention with head-dim block (1024 = head dim for Gemma)
+    ((1024, 1, 1, 1, 99999, 0, 99999), "Attention", "attn_head"),
+    # Flash attention: block 128, grid >= 16
+    ((128, 1, 1, 16, 9999, 0, 100), "Attention", "flash_attn"),
+    # Soft max: block 256, small grid
+    ((256, 1, 1, 1, 50, 0, 100), "Attention", "soft_max"),
+    # Soft max batched: block 256, large grid
+    ((256, 1, 1, 51, 9999, 0, 100), "Attention", "soft_max_batch"),
+    # RMS norm: block 256, grid >= 100, shared mem >= 100
+    ((256, 1, 1, 100, 99999, 100, 99999), "Norm", "rms_norm"),
+    # RoPE: block 256
+    ((256, 1, 1, 1, 99, 0, 100), "RoPE", "rope"),
+    # Element-wise: block 256, small grid
+    ((256, 1, 1, 1, 99, 0, 100), "Vector", "elementwise"),
+    # Get rows: block 32x8, grid 100+
+    ((32, 8, 1, 100, 99999, 0, 100), "Vector", "get_rows"),
+    # Copy: block 32x8, very large grid
+    ((32, 8, 1, 10000, 9999999, 0, 100), "Vector", "cpy"),
+    # Scale: block 1x256
+    ((1, 256, 1, 1, 99, 0, 100), "Vector", "scale"),
+    # Dequantize: block 1x256, large grid
+    ((1, 256, 1, 100, 99999, 0, 100), "Quantize", "dequantize"),
+    # Reshape: block 32x2
+    ((32, 2, 1, 1, 100, 0, 100), "Vector", "reshape"),
+    # Cross-entropy: block 512
+    ((512, 1, 1, 1, 100, 0, 100), "Other", "cross_entropy"),
+]
+
+def classify_kernel(name, gx=0, gy=0, gz=0, bx=0, by=0, bz=0, smem=0):
+    # If name is NOT a kptr_, use name-based classification
+    if name and not name.startswith("kptr_"):
+        nl = name.lower()
+        if any(k in nl for k in ["mul_mat_vec_q", "mmvq"]): return "MMVQ"
+        if any(k in nl for k in ["mul_mat", "mmq"]): return "MMQ"
+        if any(k in nl for k in ["flash_attn", "attn", "soft_max"]): return "Attention"
+        if any(k in nl for k in ["rms_norm", "norm"]): return "Norm"
+        if any(k in nl for k in ["rope"]): return "RoPE"
+        if any(k in nl for k in ["silu", "gelu", "relu"]): return "Activation"
+        if any(k in nl for k in ["moe", "expert", "top_k"]): return "MoE"
+        if any(k in nl for k in ["quantize", "dequantize"]): return "Quantize"
+        if any(k in nl for k in ["get_rows", "add", "mul", "cpy", "scale"]): return "Vector"
+    # Else use pattern matching
+    for pattern, cat, _ in KERNEL_DB:
+        pbx, pby, pbz, mn, mx, mns, mxs = pattern
+        if (bx == pbx and by == pby and bz == pbz and
+            mn <= gx <= mx and mns <= smem <= mxs):
+            return cat
+    # Fallback by block dims
+    if bx == 256 and by == 1:
+        if gx > 100: return "Norm"
+        return "Vector"
+    if bx == 32 and by == 8:
+        return "Vector"
+    if bx == 128:
+        return "Attention"
+    if bx == 1 and by == 256:
+        return "Quantize"
     return "Other"
 
 
@@ -90,10 +144,14 @@ def analyze_trace(records, cu_count=32):
     total_time_us = sum(r["duration_us"] for r in records)
     wall_time_ms = total_time_us / 1000
 
-    # Classify kernels
+    # Classify kernels (using pattern matching when names are kptr_)
     by_category = defaultdict(list)
     for r in records:
-        cat = classify_kernel(r["kernel_name"])
+        cat = classify_kernel(r["kernel_name"],
+            gx=int(r.get("grid_x", 0)), gy=int(r.get("grid_y", 0)),
+            gz=int(r.get("grid_z", 0)), bx=int(r.get("block_x", 0)),
+            by=int(r.get("block_y", 0)), bz=int(r.get("block_z", 0)),
+            smem=int(r.get("shared_mem", 0)))
         by_category[cat].append(r)
 
     # Per-category stats

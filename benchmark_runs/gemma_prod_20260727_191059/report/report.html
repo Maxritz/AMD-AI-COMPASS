@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>AI-COMPASS Performance Report</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 2em; background: #0d1117; color: #c9d1d9; }
+h1 { color: #58a6ff; } h2 { color: #79c0ff; border-bottom: 1px solid #30363d; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { padding: 8px 12px; text-align: left; border: 1px solid #30363d; }
+th { background: #161b22; } tr:nth-child(even) { background: #161b22; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin: 1em 0; }
+.bottleneck { color: #f85149; } .ok { color: #3fb950; } .warn { color: #d29922; }
+.meter { height: 20px; background: #21262d; border-radius: 10px; overflow: hidden; margin: 4px 0; }
+.meter-bar { height: 100%; background: #58a6ff; border-radius: 10px; }
+</style></head><body>
+<h1>[AI] [AI-COMPASS] Performance Report</h1>
+<p>Generated: 2026-07-27T19:11:15.666946</p>
+<div class="card">
+<h2>Summary</h2>
+<table>
+<tr><td>Total Kernels</td><td>4956</td></tr>
+<tr><td>Total GPU Time</td><td>68.88 ms</td></tr>
+<tr><td>Avg Kernel</td><td>13.9 s</td></tr>
+<tr><td>Est. GPU Busy</td><td>47.7%</td></tr>
+<tr><td>Est. GPU Utilization</td><td>40.5%</td></tr>
+</table>
+</div>
+<div class="card">
+<h2>Phases</h2>
+<table><tr><th>Phase</th><th>Kernels</th><th>Time (ms)</th><th>% Total</th><th>Avg Kernel (s)</th></tr>
+<tr><td>Prompt Processing</td><td>990</td><td>41.21</td><td>59.8%</td><td>41.6</td></tr><tr><td>Token Generation</td><td>3966</td><td>27.67</td><td>40.2%</td><td>7.0</td></tr></table></div><div class="card"><h2>Category Breakdown</h2><table><tr><th>Category</th><th>Count</th><th>Total (ms)</th><th>%</th><th>Avg (s)</th><th>Max (s)</th><th>Occupancy</th></tr><tr><td>Other</td><td>4956</td><td>68.88</td><td>100.0%</td><td>13.9</td><td>18718.8</td><td>52.0%</td></tr></table></div><div class="card"><h2>[BELL] Bottlenecks</h2><ul><li class="bottleneck">Other dominates at 100.0% of total time</li></ul></div><div class="card"><h2>Top-10 Slowest Kernels</h2><table><tr><th>Kernel</th><th>Category</th><th>Duration (ms)</th><th>Grid</th><th>Block</th><th>Occupancy</th></tr><tr><td>kptr_00007FFABF30B3C0</td><td>Other</td><td>18.719</td><td>262144x1x1</td><td>32x8x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFABF2EC218</td><td>Other</td><td>14.693</td><td>15x256x1</td><td>128x1x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFABF36B398</td><td>Other</td><td>6.018</td><td>16x2x1</td><td>32x8x1</td><td>6.2%</td></tr><tr><td>kptr_00007FFABF3640D8</td><td>Other</td><td>5.612</td><td>32x2x1</td><td>32x8x1</td><td>12.5%</td></tr><tr><td>kptr_00007FFABF319688</td><td>Other</td><td>4.655</td><td>15360x1x1</td><td>256x1x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFABF2F9610</td><td>Other</td><td>4.104</td><td>1x15x1</td><td>256x1x1</td><td>2.9%</td></tr><tr><td>kptr_00007FFABF315488</td><td>Other</td><td>3.59</td><td>4096x1x1</td><td>1x256x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFABF3164C8</td><td>Other</td><td>2.576</td><td>2048x1x1</td><td>256x1x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFABF314D48</td><td>Other</td><td>1.686</td><td>256x1x1</td><td>1024x1x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFABF3152F0</td><td>Other</td><td>0.795</td><td>256x8x1</td><td>128x1x1</td><td>100.0%</td></tr></table></div></body></html>
