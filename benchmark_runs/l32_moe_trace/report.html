@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>AI-COMPASS Performance Report</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 2em; background: #0d1117; color: #c9d1d9; }
+h1 { color: #58a6ff; } h2 { color: #79c0ff; border-bottom: 1px solid #30363d; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { padding: 8px 12px; text-align: left; border: 1px solid #30363d; }
+th { background: #161b22; } tr:nth-child(even) { background: #161b22; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin: 1em 0; }
+.bottleneck { color: #f85149; } .ok { color: #3fb950; } .warn { color: #d29922; }
+.meter { height: 20px; background: #21262d; border-radius: 10px; overflow: hidden; margin: 4px 0; }
+.meter-bar { height: 100%; background: #58a6ff; border-radius: 10px; }
+</style></head><body>
+<h1>[AI] [AI-COMPASS] Performance Report</h1>
+<p>Generated: 2026-07-28T00:14:58.001416</p>
+<div class="card">
+<h2>System</h2>
+<table>
+<tr><td>Architecture</td><td>RDNA4</td></tr>
+<tr><td>CUs</td><td>32</td></tr>
+<tr><td>Wave Size</td><td>32</td></tr>
+<tr><td>L2 Cache</td><td>12288 KB</td></tr>
+</table>
+</div>
+<div class="card">
+<h2>Summary</h2>
+<table>
+<tr><td>Total Kernels</td><td>7206</td></tr>
+<tr><td>Total GPU Time</td><td>118.64 ms</td></tr>
+<tr><td>Avg Kernel</td><td>16.5 s</td></tr>
+<tr><td>Est. GPU Busy</td><td>52.3%</td></tr>
+<tr><td>Est. GPU Utilization</td><td>44.5%</td></tr>
+</table>
+</div>
+<div class="card">
+<h2>Phases</h2>
+<table><tr><th>Phase</th><th>Kernels</th><th>Time (ms)</th><th>% Total</th><th>Avg Kernel (s)</th></tr>
+<tr><td>Prompt Processing</td><td>1440</td><td>110.51</td><td>93.1%</td><td>76.7</td></tr><tr><td>Token Generation</td><td>5766</td><td>8.13</td><td>6.9%</td><td>1.4</td></tr></table></div><div class="card"><h2>Category Breakdown</h2><table><tr><th>Category</th><th>Count</th><th>Total (ms)</th><th>%</th><th>Avg (s)</th><th>Max (s)</th><th>Occupancy</th></tr><tr><td>MMVQ</td><td>2734</td><td>36.06</td><td>30.4%</td><td>13.2</td><td>10122.3</td><td>54.8%</td></tr><tr><td>Attention</td><td>2348</td><td>31.28</td><td>26.4%</td><td>13.3</td><td>15047.9</td><td>67.5%</td></tr><tr><td>Other</td><td>1446</td><td>27.21</td><td>22.9%</td><td>18.8</td><td>19865.4</td><td>19.6%</td></tr><tr><td>Vector</td><td>342</td><td>19.77</td><td>16.7%</td><td>57.8</td><td>18392.7</td><td>38.4%</td></tr><tr><td>Quantize</td><td>336</td><td>4.32</td><td>3.6%</td><td>12.9</td><td>3895.5</td><td>100.0%</td></tr></table></div><div class="card"><h2>[BELL] Bottlenecks</h2><ul><li class="bottleneck">MMVQ dominates at 30.4% of total time</li><li class="bottleneck">Attention dominates at 26.4% of total time</li><li class="bottleneck">Other has low occupancy (19.6%)  likely occupancy-bound on RDNA4 (32-wave)</li></ul></div><div class="card"><h2> Optimization Targets</h2><p><b>MMVQ</b> (30.4% of time): MMVQ significant. Check Split-K heuristic and small_k path.</p><p><b>Attention</b> (26.4% of time): Attention is a significant fraction. Consider flash attention tuning.</p></div><div class="card"><h2>Top-10 Slowest Kernels</h2><table><tr><th>Kernel</th><th>Category</th><th>Duration (ms)</th><th>Grid</th><th>Block</th><th>Occupancy</th></tr><tr><td>kptr_00007FFAB96448D8</td><td>Other</td><td>19.865</td><td>8192x2x1</td><td>32x2x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFAB9636E08</td><td>Other</td><td>18.393</td><td>8x1x1</td><td>256x1x1</td><td>3.1%</td></tr><tr><td>kptr_00007FFAB9625198</td><td>Other</td><td>15.048</td><td>768x1x1</td><td>128x1x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFAB9657790</td><td>Other</td><td>10.122</td><td>32x16x4</td><td>128x1x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFAB96A53A8</td><td>Other</td><td>5.536</td><td>24x1x8</td><td>32x8x1</td><td>75.0%</td></tr><tr><td>kptr_00007FFAB969E0E8</td><td>Other</td><td>5.496</td><td>24x1x1</td><td>32x8x1</td><td>9.4%</td></tr><tr><td>kptr_00007FFAB96A7078</td><td>Other</td><td>5.316</td><td>8x1x1</td><td>32x8x1</td><td>3.1%</td></tr><tr><td>kptr_00007FFAB96A36D8</td><td>Other</td><td>5.286</td><td>24x1x1</td><td>32x8x1</td><td>9.4%</td></tr><tr><td>kptr_00007FFAB96537A8</td><td>Other</td><td>4.79</td><td>4096x1x1</td><td>256x1x1</td><td>100.0%</td></tr><tr><td>kptr_00007FFAB9632610</td><td>Other</td><td>4.094</td><td>2x1x64</td><td>256x1x1</td><td>50.0%</td></tr></table></div></body></html>

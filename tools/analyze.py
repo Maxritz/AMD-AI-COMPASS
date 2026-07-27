@@ -48,6 +48,17 @@ KERNEL_DB_RDNA2 = [
     ((256, 1, 1, 51, 9999, 0, 100), "Attention", "soft_max_batch"),
     # RMS norm
     ((256, 1, 1, 100, 99999, 100, 99999), "Norm", "rms_norm"),
+    # MoE sync fallback — tiny grid (8 or fewer), block 256, no smem
+    ((256, 1, 1, 1, 15, 0, 100), "MoE", "sync_fallback"),
+    # MoE dispatch (per-expert, medium grid, block 128)
+    ((128, 1, 1, 1000, 99999, 0, 100), "MoE", "moe_dispatch"),
+    # MoE routing/top-k (block 128, 3D grid)
+    ((128, 1, 1, 1, 999, 0, 100), "MoE", "moe_routing"),
+    # MoE gather/scatter (block 32x2, large grid)
+    ((32, 2, 1, 1000, 9999999, 0, 100), "MoE", "moe_gather"),
+    ((32, 2, 1, 1, 999, 0, 100), "MoE", "moe_scatter"),
+    # MoE expert compress (block 32x4, small smem)
+    ((32, 4, 1, 1, 9999, 0, 30000), "MoE", "moe_compress"),
     # RoPE
     ((256, 1, 1, 1, 99, 0, 100), "RoPE", "rope"),
     # Elementwise
@@ -81,6 +92,17 @@ KERNEL_DB_RDNA4 = [
     ((256, 1, 1, 51, 9999, 0, 100), "Attention", "soft_max_batch"),
     # RMS norm
     ((256, 1, 1, 100, 99999, 100, 99999), "Norm", "rms_norm"),
+    # MoE sync fallback — tiny grid (8 or fewer), block 256, no smem
+    ((256, 1, 1, 1, 15, 0, 100), "MoE", "sync_fallback"),
+    # MoE dispatch (per-expert, medium grid, block 128)
+    ((128, 1, 1, 1000, 99999, 0, 100), "MoE", "moe_dispatch"),
+    # MoE routing/top-k (block 128, 3D grid)
+    ((128, 1, 1, 1, 999, 0, 100), "MoE", "moe_routing"),
+    # MoE gather/scatter (block 32x2, large grid)
+    ((32, 2, 1, 1000, 9999999, 0, 100), "MoE", "moe_gather"),
+    ((32, 2, 1, 1, 999, 0, 100), "MoE", "moe_scatter"),
+    # MoE expert compress (block 32x4, small smem)
+    ((32, 4, 1, 1, 9999, 0, 30000), "MoE", "moe_compress"),
     # RoPE
     ((256, 1, 1, 1, 99, 0, 100), "RoPE", "rope"),
     # Elementwise
@@ -137,7 +159,7 @@ def classify_kernel(name, arch="rdna4", gx=0, gy=0, gz=0, bx=0, by=0, bz=0, smem
         if any(k in nl for k in ["rms_norm", "norm"]): return "Norm"
         if any(k in nl for k in ["rope"]): return "RoPE"
         if any(k in nl for k in ["silu", "gelu", "relu"]): return "Activation"
-        if any(k in nl for k in ["moe", "expert", "top_k"]): return "MoE"
+        if any(k in nl for k in ["moe", "expert", "top_k", "routing", "gate"]): return "MoE"
         if any(k in nl for k in ["quantize", "dequantize"]): return "Quantize"
         if any(k in nl for k in ["get_rows", "add", "mul", "cpy", "scale"]): return "Vector"
     # Else use pattern matching
@@ -146,6 +168,16 @@ def classify_kernel(name, arch="rdna4", gx=0, gy=0, gz=0, bx=0, by=0, bz=0, smem
         if (bx == pbx and by == pby and bz == pbz and
             mn <= gx <= mx and mns <= smem <= mxs):
             return cat
+    # MoE-specific fallback: small grid (<16) with block 256 = sync fallback
+    if bx == 256 and by == 1 and bz == 1 and gx < 16:
+        return "MoE"
+    # MoE gather/scatter: block 32x2, any grid
+    if bx == 32 and by == 2:
+        if gy > 1 or gz > 1:
+            return "MoE"
+    # MoE compress: block 32x4 with medium smem
+    if bx == 32 and by == 4 and 1000 < smem < 50000:
+        return "MoE"
     # Fallback by block dims (arch-aware)
     if arch in ("rdna1", "rdna2"):
         if bx == 256 and by == 1:
@@ -158,7 +190,13 @@ def classify_kernel(name, arch="rdna4", gx=0, gy=0, gz=0, bx=0, by=0, bz=0, smem
             if gx > 100: return "Norm"
             return "Vector"
         if bx == 32 and by == 8:
-            return "MMVQ"
+            if smem > 50000:
+                return "MMVQ"
+            return "Vector"
+        if bx == 32 and by == 4:
+            if smem > 1000:
+                return "MoE"
+            return "Vector"
     if bx == 128:
         return "Attention"
     if bx == 1 and by == 256:
@@ -249,11 +287,21 @@ def generate_optimization_targets(category_stats, bottlenecks, arch="rdna4"):
                 "current_pct": category_stats["Attention"]["pct"],
                 "suggestion": "Attention is a significant fraction. Consider flash attention tuning.",
             })
-    if "MoE" in category_stats and category_stats["MoE"]["pct"] > 10:
+    if "MoE" in category_stats and category_stats["MoE"]["pct"] > 5:
+        s = category_stats["MoE"]
         targets.append({
             "target": "MoE",
-            "current_pct": category_stats["MoE"]["pct"],
-            "suggestion": "MoE dispatch overhead. Check ExpertPool async prefetch.",
+            "current_pct": s["pct"],
+            "suggestion": (
+                f"MoE dispatch overhead at {s['pct']}% with {s['avg_occupancy_pct']}% occupancy. "
+                "The sync fallback kernel (grid<16, block=256, occ~3%) is the host-side expert sort "
+                "in ggml_cuda_mul_mat_id. Fix options:\n"
+                "  1. Increase MMVQ_MAX_BATCH_SIZE (currently 8) and per-type mmvq_mmid_max_batch "
+                "(currently 4 for Q4_K on RDNA4) to keep more MoE dispatches on the fast path\n"
+                "  2. Use async memcpy + batched per-expert dispatch to avoid stream sync\n"
+                "  3. Implement GPU-side expert sort (thrust::sort_by_key) to eliminate CPU bounce\n"
+                "  4. Profile with: --arch {arch} and check top slowest kernels for sync_fallback"
+            ),
         })
     return targets
 
@@ -334,10 +382,12 @@ def analyze_trace(records, arch="rdna4"):
         if stats["pct"] > 25:
             bottlenecks.append(f"{cat} dominates at {stats['pct']}% of total time")
         if stats["avg_occupancy_pct"] < 30 and stats["pct"] > 5:
-            bottlenecks.append(
-                f"{cat} has low occupancy ({stats['avg_occupancy_pct']}%)  "
-                f"likely occupancy-bound on {arch.upper()} ({prof['wave']}-wave)"
-            )
+            occ_msg = f"likely occupancy-bound on {arch.upper()} ({prof['wave']}-wave)"
+            if cat == "MoE" and stats["avg_occupancy_pct"] < 10:
+                occ_msg += " — this is the sync fallback (CPU sort, host<->device copies)"
+            elif cat == "MoE":
+                occ_msg += " — MoE dispatch overhead, check mmvq_mmid_max_batch limits"
+            bottlenecks.append(f"{cat} has low occupancy ({stats['avg_occupancy_pct']}%)  {occ_msg}")
 
     ideal_time_us = sum(r["duration_us"] for r in records if r["block_x"] > 64)
     gpu_busy_pct = min(100, ideal_time_us / total_time_us * 100) if total_time_us else 0
