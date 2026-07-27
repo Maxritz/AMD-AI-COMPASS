@@ -8,10 +8,13 @@ bool GpuDetector::detect() {
 
     // Try HIP first (best GPU info)
     if (query_hip()) {
-        AI_LOG_INFO("GPU detected via HIP: %s (%s, %d CUs)",
-            primary_device().name.c_str(),
-            arch_name(primary_device().arch),
-            primary_device().num_cu);
+        auto& dev = primary_device();
+        AI_LOG_INFO("GPU detected via HIP: %s (%s, %d CUs, Wave%d, %d MiB VRAM)",
+            dev.name.c_str(),
+            arch_name(dev.arch),
+            dev.num_cu,
+            dev.wave_size,
+            (int)(dev.total_global_mem / (1024 * 1024)));
         return true;
     }
 
@@ -81,10 +84,25 @@ bool GpuDetector::query_hip() {
                 info.arch = gfx_to_arch(gfx);
             }
 
-            // RDNA4 WGP = CU/2 (dual CU per WGP)
-            info.num_wgp = info.num_cu / 2;
-            info.simd_per_cu = 4;  // RDNA has 4 SIMDs per CU/WGP
-            info.max_waves_per_simd = 16; // RDNA4 supports 16 waves per SIMD
+            // Architecture-specific values
+            info.num_wgp = info.num_cu / 2;  // Dual CU per WGP on all RDNA
+            info.simd_per_cu = 4;
+            info.max_waves_per_simd = 16;
+
+            switch (info.arch) {
+                case GpuArch::RDNA1:
+                case GpuArch::RDNA2:
+                    info.wave_size = 64;  // Wave64
+                    break;
+                case GpuArch::RDNA3:
+                case GpuArch::RDNA3_5:
+                case GpuArch::RDNA4:
+                    info.wave_size = 32;  // Wave32
+                    break;
+                default:
+                    info.wave_size = 64;
+                    break;
+            }
         }
 
         devices_.push_back(info);

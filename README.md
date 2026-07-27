@@ -89,6 +89,8 @@ All benchmarks on **RX 9070 XT (gfx1201, 16GB VRAM, Wave32)** with **Ryzen 9 590
 | Qwen3.5-4B | NVFP4 | 2.36GB | 6,405 t/s | 149.7 t/s |
 | Laguna XS 33B MoE | IQ4_XS | 16.84GB | 698 t/s | 69.0 t/s |
 | Laguna XS 33B MoE | Q4_K_M | 18.88GB | 557 t/s | 51.6 t/s |
+| GLM-4.7-Flash-APEX (30B MoE) | Q6_K | 17.88GB | 728 t/s | 41.5 t/s |
+| Gemma-4-31B-Fable-5-Distill | Q4_K_M | 17.39GB | 262 t/s | 6.3 t/s |
 
 ### ROCmFP4 Support (New)
 
@@ -125,13 +127,14 @@ cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build .
 ```
 
-For the llama.cpp ROCm build with CPU optimizations:
+For the llama.cpp ROCm build (RDNA4 / RX 9070 XT):
 ```bash
-cd llma.cpp-ROCM-Test
-cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release ^
-  -DGGML_HIP=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_OPENMP=OFF ^
-  -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_AVX_VNNI=ON
-cmake --build build-hip --target llama-bench
+scripts/llama_build_cpu_gpu.ps1
+```
+
+For RDNA2 (RX 6700 XT / ROCm 7.3):
+```bash
+scripts/llama_build_rdna2.ps1
 ```
 
 ### Profile a Model
@@ -140,8 +143,12 @@ cmake --build build-hip --target llama-bench
 # Quick analysis from an existing HIP trace
 python tools/analyze.py hip_trace.csv --output report/
 
-# Full end-to-end benchmark
+# Full end-to-end benchmark (RDNA4 default)
 python tools/run_benchmark.py --model path/to/model.gguf --pp 256 --tg 128
+
+# RDNA2-specific analysis
+python tools/analyze.py trace.csv --arch rdna2 --bench-pp 262 --bench-tg 6.3
+python tools/run_benchmark.py --model model.gguf --arch rdna2 --pp 256 --tg 128
 ```
 
 ### Compare Before/After Optimization
@@ -173,6 +180,7 @@ build/rocprof-compute-viewer.exe output_dir/
 | **rocprof-compute-viewer** | GPU trace visualization (SQTT viewer) | ✅ | ✅ | ✅ | ✅ | [ROCm](https://github.com/ROCm/rocprof-compute-viewer) |
 | **rocprofv3** | Compute profiling CLI | ✅ | ✅ | ✅ | ✅ | [ROCm](https://github.com/ROCm/rocm-systems) |
 | **ROCmFP4** | Native AMD FP4 format (HIP backend, WIP) | ⚠ | ⚠ | ❌ | ❌ | [Ciru ROCmFPX](https://github.com/ciru-ai/ROCmFPX) |
+| **RDNA2 Optimizer** | Wave64 + L2 + occupancy tuning recommendations | ✅ | ✅ | ✅ | ❌ | Custom plugin |
 | **GEAK** | Agent-based workload optimization | ✅ | ⚠ | ⚠ | ❌ | Custom port |
 | **Hyperloom** | Performance tuning framework | ✅ | ⚠ | ⚠ | ❌ | Custom port |
 | **AQLProfile** | Low-level SQ/SX/TA/TD counter access | ✅ | ✅ | ✅ | ⚠ | [ROCm](https://github.com/ROCm/rocm-systems) |
@@ -190,7 +198,7 @@ Auto-detected via `hipGetDeviceProperties` with ADLX fallback:
 | Arch | GFX IP | Example GPU | Tested |
 |------|--------|-------------|--------|
 | RDNA1 | gfx1010–1012 | RX 5700 XT | ❌ |
-| RDNA2 | gfx1030–1035 | RX 6900 XT | ❌ |
+| **RDNA2** | **gfx1030–1035** | **RX 6700 XT** | **✅ separate system (ROCm 7.3, Win11, 5600X/48GB)** |
 | RDNA3 | gfx1100–1103 | RX 7900 XTX | ❌ |
 | RDNA3.5 | gfx1150–1151 | RX 8800 XT | ❌ |
 | **RDNA4** | **gfx1200–1201** | **RX 9070 XT** | ✅ primary target |
@@ -224,7 +232,10 @@ python tools/analyze.py <trace.csv> [options]
 Options:
   -o, --output <dir>    Output directory for reports
   --compare <baseline>  Compare against a baseline trace
-  --cu-count <n>        GPU CU count (default: 32)
+  --cu-count <n>        GPU CU count (default: from arch profile)
+  --arch <arch>         GPU architecture: rdna1|rdna2|rdna3|rdna3_5|rdna4 (default: rdna4)
+  --bench-pp <t/s>      Prompt processing throughput from llama-bench
+  --bench-tg <t/s>      Token generation throughput from llama-bench
   --html                Generate HTML report (default: on)
 ```
 
@@ -257,6 +268,38 @@ Options:
 │            └─────────────────────────┘                   │
 └──────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## RDNA2 Optimization Guide
+
+### Key Differences from RDNA4
+
+| Property | RDNA2 (RX 6700 XT) | RDNA4 (RX 9070 XT) |
+|----------|-------------------|-------------------|
+| GFX IP | gfx1031 | gfx1201 |
+| CUs | 40 | 32 |
+| Wave Size | **64** (Wave64) | **32** (Wave32) |
+| L2 Cache | **4 MB** | **12 MB** |
+| LDS/CU | 64 KB | 128 KB |
+| Memory BW | 384 GB/s (GDDR6) | ~960 GB/s (GDDR6) |
+| Max waves | 2,560 | 1,024 |
+
+### Recommendations for RDNA2
+
+1. **Wave64 MMVQ thread mapping** — change `tid/16` to `tid/32` in `mmvq.cu` for correct start-position calculation. Wave64 needs /32 since each wave has 64 threads.
+2. **Smaller L2 cache** — 4 MB vs 12 MB means larger models (30B+) may be L2-bound. Use smaller K-tiles (MMQ_ITER_K=4) and prefer IQ4_XS over Q4_K_M for better cache utilization.
+3. **Higher occupancy headroom** — 40 CUs × 4 SIMDs × 16 = 2,560 wave slots. Use larger block sizes (256+) to fully utilize available wave slots.
+4. **ROCm 7.3 compatibility** — use `-DAMDGPU_TARGETS=gfx1031` and verify `hipGetDeviceProperties` populates `gcnArchName` correctly. Set `HSA_OVERRIDE_GFX_VERSION=10.3.0` if detection fails.
+5. **Build with:** `scripts/llama_build_rdna2.ps1` (sets gfx1031 target automatically).
+
+### Analysis Command
+```
+python tools/analyze.py trace.csv --arch rdna2 --cu-count 40
+python tools/run_benchmark.py --model model.gguf --pp 256 --tg 128 --arch rdna2
+```
+
+The RDNA2 Optimizer plugin (`list` shows `RDNA2_OPTIMIZER`) auto-activates on gfx103x hardware.
 
 ---
 

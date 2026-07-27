@@ -3,7 +3,7 @@
 AI-COMPASS Analyze  kernel profiling + bottleneck detection + perf report
 
 Usage:
-    python tools/analyze.py trace.csv [--output report_dir] [--compare baseline.csv]
+    python tools/analyze.py trace.csv [--output report_dir] [--compare baseline.csv] [--arch rdna4]
 """
 import csv
 import os
@@ -14,49 +14,120 @@ import argparse
 from collections import defaultdict
 from datetime import datetime
 
-#  Kernel classification 
-# Pattern-based kernel classifier for when HIP names aren't resolvable
+# Architecture profiles
+# Each profile: (cu_count, wave_size, simd_per_cu, waves_per_simd, lds_per_cu, l2_cache_kb)
+ARCH_PROFILES = {
+    "rdna1":  {"cu": 36, "wave": 64, "simd": 4, "waves_per_simd": 16, "lds": 65536, "l2": 4096},
+    "rdna2":  {"cu": 40, "wave": 64, "simd": 4, "waves_per_simd": 16, "lds": 65536, "l2": 4096},
+    "rdna3":  {"cu": 32, "wave": 32, "simd": 4, "waves_per_simd": 16, "lds": 131072, "l2": 6144},
+    "rdna3_5":{"cu": 36, "wave": 32, "simd": 4, "waves_per_simd": 16, "lds": 131072, "l2": 8192},
+    "rdna4":  {"cu": 32, "wave": 32, "simd": 4, "waves_per_simd": 16, "lds": 131072, "l2": 12288},
+}
+
+# RDNA2-specific kernel patterns (different block sizing vs RDNA4)
 # Keys: (block_x, block_y, block_z, min_gx, max_gx, min_smem, max_smem) -> (category, name)
-KERNEL_DB = [
-    # MMVQ K-quant: large shared mem (K tile buffer)
-    ((32, 8, 1, 0, 9999, 50000, 99999), "MMVQ", "mmvq_kq"),
-    # MMVQ small grid, block 128
+KERNEL_DB_RDNA2 = [
+    # MMVQ K-quant: block_y=4 not 8 (RDNA2 prefers fewer threads due to Wave64)
+    ((64, 4, 1, 0, 9999, 50000, 99999), "MMVQ", "mmvq_kq"),
+    # MMVQ: block 128 or 256 typical for Wave64
+    ((256, 1, 1, 1, 100, 0, 100), "MMVQ", "mul_mat_vec_q"),
     ((128, 1, 1, 1, 100, 0, 100), "MMVQ", "mul_mat_vec_q"),
-    # MMVQ small grid, block 32
-    ((32, 1, 1, 1, 100, 0, 100), "MMVQ", "mul_mat_vec_q"),
-    # MMQ K-tile: large grid, block 64, shared mem
+    # MMQ with shared mem
     ((64, 1, 1, 100, 99999, 128, 99999), "MMQ", "mul_mat_q_K"),
-    # MMQ: large grid, block 64, no shared mem
+    ((128, 1, 1, 100, 99999, 128, 99999), "MMQ", "mul_mat_q_K"),
+    # MMQ without shared mem
     ((64, 1, 1, 100, 99999, 0, 100), "MMQ", "mul_mat_q"),
-    # Attention with head-dim block (1024 = head dim for Gemma)
+    # Attention
     ((1024, 1, 1, 1, 99999, 0, 99999), "Attention", "attn_head"),
-    # Flash attention: block 128, grid >= 16
+    # Flash attention (block may be 256 or 128 on RDNA2)
     ((128, 1, 1, 16, 9999, 0, 100), "Attention", "flash_attn"),
-    # Soft max: block 256, small grid
+    ((256, 1, 1, 16, 9999, 0, 100), "Attention", "flash_attn"),
+    # Soft max
     ((256, 1, 1, 1, 50, 0, 100), "Attention", "soft_max"),
-    # Soft max batched: block 256, large grid
+    # Soft max batched
     ((256, 1, 1, 51, 9999, 0, 100), "Attention", "soft_max_batch"),
-    # RMS norm: block 256, grid >= 100, shared mem >= 100
+    # RMS norm
     ((256, 1, 1, 100, 99999, 100, 99999), "Norm", "rms_norm"),
-    # RoPE: block 256
+    # RoPE
     ((256, 1, 1, 1, 99, 0, 100), "RoPE", "rope"),
-    # Element-wise: block 256, small grid
+    # Elementwise
     ((256, 1, 1, 1, 99, 0, 100), "Vector", "elementwise"),
-    # Get rows: block 32x8, grid 100+
+    # Get rows
     ((32, 8, 1, 100, 99999, 0, 100), "Vector", "get_rows"),
-    # Copy: block 32x8, very large grid
+    # Copy
     ((32, 8, 1, 10000, 9999999, 0, 100), "Vector", "cpy"),
-    # Scale: block 1x256
+    # Scale
     ((1, 256, 1, 1, 99, 0, 100), "Vector", "scale"),
-    # Dequantize: block 1x256, large grid
+    # Dequantize
     ((1, 256, 1, 100, 99999, 0, 100), "Quantize", "dequantize"),
-    # Reshape: block 32x2
+    # Reshape
     ((32, 2, 1, 1, 100, 0, 100), "Vector", "reshape"),
-    # Cross-entropy: block 512
+    # Cross entropy
     ((512, 1, 1, 1, 100, 0, 100), "Other", "cross_entropy"),
 ]
 
-def classify_kernel(name, gx=0, gy=0, gz=0, bx=0, by=0, bz=0, smem=0):
+KERNEL_DB_RDNA4 = [
+    # MMVQ K-quant: large shared mem (K tile buffer), RDNA4 uses block 32x8
+    ((32, 8, 1, 0, 9999, 50000, 99999), "MMVQ", "mmvq_kq"),
+    ((32, 1, 1, 1, 100, 0, 100), "MMVQ", "mul_mat_vec_q"),
+    ((128, 1, 1, 1, 100, 0, 100), "MMVQ", "mul_mat_vec_q"),
+    # MMQ K-tile
+    ((64, 1, 1, 100, 99999, 128, 99999), "MMQ", "mul_mat_q_K"),
+    ((64, 1, 1, 100, 99999, 0, 100), "MMQ", "mul_mat_q"),
+    # Attention
+    ((1024, 1, 1, 1, 99999, 0, 99999), "Attention", "attn_head"),
+    ((128, 1, 1, 16, 9999, 0, 100), "Attention", "flash_attn"),
+    ((256, 1, 1, 1, 50, 0, 100), "Attention", "soft_max"),
+    ((256, 1, 1, 51, 9999, 0, 100), "Attention", "soft_max_batch"),
+    # RMS norm
+    ((256, 1, 1, 100, 99999, 100, 99999), "Norm", "rms_norm"),
+    # RoPE
+    ((256, 1, 1, 1, 99, 0, 100), "RoPE", "rope"),
+    # Elementwise
+    ((256, 1, 1, 1, 99, 0, 100), "Vector", "elementwise"),
+    # Get rows
+    ((32, 8, 1, 100, 99999, 0, 100), "Vector", "get_rows"),
+    # Copy
+    ((32, 8, 1, 10000, 9999999, 0, 100), "Vector", "cpy"),
+    # Scale
+    ((1, 256, 1, 1, 99, 0, 100), "Vector", "scale"),
+    # Dequantize
+    ((1, 256, 1, 100, 99999, 0, 100), "Quantize", "dequantize"),
+    # Reshape
+    ((32, 2, 1, 1, 100, 0, 100), "Vector", "reshape"),
+    # Cross entropy
+    ((512, 1, 1, 1, 100, 0, 100), "Other", "cross_entropy"),
+]
+
+# Supported architectures for CLI
+ARCH_NAMES = {"rdna1", "rdna2", "rdna3", "rdna3_5", "rdna4"}
+
+
+def detect_arch_from_gfx(gfx_str):
+    """Detect architecture from gfx string like 'gfx1031' or 'gfx1201'."""
+    if gfx_str.startswith("gfx120") or gfx_str.startswith("gfx121"):
+        return "rdna4"
+    if gfx_str.startswith("gfx115"):
+        return "rdna3_5"
+    if gfx_str.startswith("gfx110"):
+        return "rdna3"
+    if gfx_str.startswith("gfx103"):
+        return "rdna2"
+    if gfx_str.startswith("gfx101"):
+        return "rdna1"
+    # Fallback: try to identify by CU count
+    return "rdna4"
+
+
+def get_kernel_db(arch):
+    """Get the appropriate kernel classification DB for the architecture."""
+    if arch == "rdna2" or arch == "rdna1":
+        return KERNEL_DB_RDNA2
+    return KERNEL_DB_RDNA4
+
+
+def classify_kernel(name, arch="rdna4", gx=0, gy=0, gz=0, bx=0, by=0, bz=0, smem=0):
+    db = get_kernel_db(arch)
     # If name is NOT a kptr_, use name-based classification
     if name and not name.startswith("kptr_"):
         nl = name.lower()
@@ -70,17 +141,24 @@ def classify_kernel(name, gx=0, gy=0, gz=0, bx=0, by=0, bz=0, smem=0):
         if any(k in nl for k in ["quantize", "dequantize"]): return "Quantize"
         if any(k in nl for k in ["get_rows", "add", "mul", "cpy", "scale"]): return "Vector"
     # Else use pattern matching
-    for pattern, cat, _ in KERNEL_DB:
+    for pattern, cat, _ in db:
         pbx, pby, pbz, mn, mx, mns, mxs = pattern
         if (bx == pbx and by == pby and bz == pbz and
             mn <= gx <= mx and mns <= smem <= mxs):
             return cat
-    # Fallback by block dims
-    if bx == 256 and by == 1:
-        if gx > 100: return "Norm"
-        return "Vector"
-    if bx == 32 and by == 8:
-        return "Vector"
+    # Fallback by block dims (arch-aware)
+    if arch in ("rdna1", "rdna2"):
+        if bx == 256 and by == 1:
+            if gx > 100: return "Norm"
+            return "Vector"
+        if bx == 64 and by == 4:
+            return "MMVQ"
+    else:
+        if bx == 256 and by == 1:
+            if gx > 100: return "Norm"
+            return "Vector"
+        if bx == 32 and by == 8:
+            return "MMVQ"
     if bx == 128:
         return "Attention"
     if bx == 1 and by == 256:
@@ -88,80 +166,125 @@ def classify_kernel(name, gx=0, gy=0, gz=0, bx=0, by=0, bz=0, smem=0):
     return "Other"
 
 
-def detect_phase(wall_time_ms, total_tokens):
-    """Heuristic: 1st ~10% of tokens = prompt processing, rest = TG."""
-    tt = total_tokens if total_tokens else 256
-    pp_tokens = max(1, int(tt * 0.10))
-    return pp_tokens, tt - pp_tokens
-
-
-def parse_trace(csv_path):
-    records = []
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            records.append({
-                "dispatch_id": int(row.get("dispatch_id", 0)),
-                "kernel_name": row.get("kernel_name", "unknown"),
-                "grid_x": int(row.get("grid_x", 0)),
-                "grid_y": int(row.get("grid_y", 0)),
-                "grid_z": int(row.get("grid_z", 0)),
-                "block_x": int(row.get("block_x", 0)),
-                "block_y": int(row.get("block_y", 0)),
-                "block_z": int(row.get("block_z", 0)),
-                "shared_mem": int(row.get("shared_mem", 0)),
-                "duration_us": float(row.get("duration_us", 0)),
-            })
-    return records
-
-
-def compute_occupancy(record, cu_count=32, simd_per_cu=4, waves_per_simd=16):
-    """Estimate occupancy from grid/block dimensions."""
-    total_waves = (record["grid_x"] * record["grid_y"] * record["grid_z"] *
-                   record["block_x"] * record["block_y"] * record["block_z"]) // 64
-    max_waves = cu_count * simd_per_cu * waves_per_simd
+def compute_occupancy(record, arch="rdna4"):
+    """Estimate occupancy from grid/block dimensions, architecture-aware."""
+    prof = ARCH_PROFILES.get(arch, ARCH_PROFILES["rdna4"])
+    wave_size = prof["wave"]
+    total_threads = (record["grid_x"] * record["grid_y"] * record["grid_z"] *
+                     record["block_x"] * record["block_y"] * record["block_z"])
+    total_waves = (total_threads + wave_size - 1) // wave_size
+    max_waves = prof["cu"] * prof["simd"] * prof["waves_per_simd"]
     return min(100.0, total_waves / max_waves * 100.0) if max_waves else 0
 
 
-def estimate_arithmetic_intensity(kernel_name, grid, shared_mem):
-    """Rough estimate: flops/byte ratio based on kernel type."""
+def estimate_arithmetic_intensity(kernel_name, grid, shared_mem, arch="rdna4"):
+    """Rough estimate: flops/byte ratio based on kernel type and arch."""
     cat = classify_kernel(kernel_name)
-    # These are heuristic estimates for RDNA4
+    # RDNA2 has lower L2 cache (4 MB vs 12 MB), so memory-bound kernels
+    # may have lower effective intensity
     ratios = {
-        "MMQ": 8.0, "MMVQ": 2.0, "Attention": 4.0, "Norm": 1.0,
-        "RoPE": 0.5, "Activation": 0.3, "MoE": 6.0, "GEMM": 10.0,
-        "Vector": 0.2, "Quantize": 1.5, "Other": 1.0
+        "MMQ": 6.0, "MMVQ": 1.5, "Attention": 3.0, "Norm": 0.8,
+        "RoPE": 0.5, "Activation": 0.3, "MoE": 4.0, "GEMM": 8.0,
+        "Vector": 0.2, "Quantize": 1.2, "Other": 1.0
     }
+    # RDNA4 has larger L2 cache so memory reuse is better
+    if arch == "rdna4" or arch == "rdna3_5":
+        ratios["MMQ"] = 8.0
+        ratios["MMVQ"] = 2.0
+        ratios["Attention"] = 4.0
+        ratios["MoE"] = 6.0
     return ratios.get(cat, 1.0)
 
 
-def analyze_trace(records, cu_count=32):
+def generate_optimization_targets(category_stats, bottlenecks, arch="rdna4"):
+    targets = []
+    prof = ARCH_PROFILES.get(arch, ARCH_PROFILES["rdna4"])
+    is_wave64 = prof["wave"] == 64
+
+    if is_wave64:
+        if "MMVQ" in category_stats and category_stats["MMVQ"]["pct"] > 5:
+            targets.append({
+                "target": "MMVQ",
+                "current_pct": category_stats["MMVQ"]["pct"],
+                "suggestion": (
+                    "RDNA2 Wave64: MMVQ thread mapping requires block_y >= 4 for "
+                    "full occupancy. Check mmvq.cu nwarps tuning  prefer nwarps=4 "
+                    "(256 threads) for Wave64."
+                ),
+            })
+        if "MMQ" in category_stats and category_stats["MMQ"]["pct"] > 15:
+            targets.append({
+                "target": "MMQ",
+                "current_pct": category_stats["MMQ"]["pct"],
+                "suggestion": (
+                    "RDNA2 has 4 MB L2 cache (vs 12 MB RDNA4). MMQ may be L2-bound. "
+                    "Consider smaller K-tiles or increasing MMQ_ITER_K to reduce tile reloads."
+                ),
+            })
+        if "Attention" in category_stats and category_stats["Attention"]["pct"] > 15:
+            targets.append({
+                "target": "Attention",
+                "current_pct": category_stats["Attention"]["pct"],
+                "suggestion": (
+                    "RDNA2 Wave64: flash attention may underutilize SIMDs. "
+                    "Consider group-size tuning for Wave64 alignment."
+                ),
+            })
+    else:
+        if "MMQ" in category_stats and category_stats["MMQ"]["pct"] > 15:
+            targets.append({
+                "target": "MMQ",
+                "current_pct": category_stats["MMQ"]["pct"],
+                "suggestion": "MMQ dominates. Consider K-tile doubling. Check if MMQ_ITER_K is optimal for RDNA4.",
+            })
+        if "MMVQ" in category_stats and category_stats["MMVQ"]["pct"] > 10:
+            targets.append({
+                "target": "MMVQ",
+                "current_pct": category_stats["MMVQ"]["pct"],
+                "suggestion": "MMVQ significant. Check Split-K heuristic and small_k path.",
+            })
+        if "Attention" in category_stats and category_stats["Attention"]["pct"] > 15:
+            targets.append({
+                "target": "Attention",
+                "current_pct": category_stats["Attention"]["pct"],
+                "suggestion": "Attention is a significant fraction. Consider flash attention tuning.",
+            })
+    if "MoE" in category_stats and category_stats["MoE"]["pct"] > 10:
+        targets.append({
+            "target": "MoE",
+            "current_pct": category_stats["MoE"]["pct"],
+            "suggestion": "MoE dispatch overhead. Check ExpertPool async prefetch.",
+        })
+    return targets
+
+
+def analyze_trace(records, arch="rdna4"):
     """Full analysis of a trace, returns structured dict."""
     if not records:
         return {"error": "No records"}
 
+    prof = ARCH_PROFILES.get(arch, ARCH_PROFILES["rdna4"])
     total_kernels = len(records)
     total_time_us = sum(r["duration_us"] for r in records)
     wall_time_ms = total_time_us / 1000
 
-    # Classify kernels (using pattern matching when names are kptr_)
     by_category = defaultdict(list)
     for r in records:
         cat = classify_kernel(r["kernel_name"],
+            arch=arch,
             gx=int(r.get("grid_x", 0)), gy=int(r.get("grid_y", 0)),
             gz=int(r.get("grid_z", 0)), bx=int(r.get("block_x", 0)),
             by=int(r.get("block_y", 0)), bz=int(r.get("block_z", 0)),
             smem=int(r.get("shared_mem", 0)))
         by_category[cat].append(r)
 
-    # Per-category stats
     category_stats = {}
     for cat, recs in sorted(by_category.items(), key=lambda x: -sum(r["duration_us"] for r in x[1])):
         total_cat_us = sum(r["duration_us"] for r in recs)
         count = len(recs)
         avg_us = total_cat_us / count if count else 0
         max_us = max(r["duration_us"] for r in recs)
-        occs = [compute_occupancy(r, cu_count) for r in recs]
+        occs = [compute_occupancy(r, arch) for r in recs]
         avg_occ = sum(occs) / len(occs) if occs else 0
         category_stats[cat] = {
             "count": count,
@@ -172,10 +295,8 @@ def analyze_trace(records, cu_count=32):
             "avg_occupancy_pct": round(avg_occ, 1),
         }
 
-    # Phase detection (heuristic: split into PP and TG)
-    # PP usually has higher occupancy and larger grids
-    pp_cutoff = max(1, total_kernels // 10)  # first ~10% of dispatches
-    pp_kernels = records[:pp_cutoff*2]  # approximate
+    pp_cutoff = max(1, total_kernels // 10)
+    pp_kernels = records[:pp_cutoff*2]
 
     def phase_summary(kernels, label):
         t = sum(k["duration_us"] for k in kernels)
@@ -193,7 +314,6 @@ def analyze_trace(records, cu_count=32):
     tg_kernels = records[pp_cutoff*2:]
     phases.append(phase_summary(tg_kernels, "Token Generation"))
 
-    # Top-10 slowest kernels
     sorted_by_dur = sorted(records, key=lambda r: -r["duration_us"])[:10]
     top_slow = []
     for r in sorted_by_dur:
@@ -202,72 +322,44 @@ def analyze_trace(records, cu_count=32):
             "duration_ms": round(r["duration_us"] / 1000, 3),
             "grid": f"{r['grid_x']}x{r['grid_y']}x{r['grid_z']}",
             "block": f"{r['block_x']}x{r['block_y']}x{r['block_z']}",
-            "category": classify_kernel(r["kernel_name"]),
-            "occupancy_pct": round(compute_occupancy(r, cu_count), 1),
+            "category": classify_kernel(r["kernel_name"], arch=arch),
+            "occupancy_pct": round(compute_occupancy(r, arch), 1),
         })
 
-    # Throughput estimates
-    # PP: prompt processing throughput (tokens/s)  rough estimate from kernel count
     pp_time_ms = sum(k["duration_us"] for k in pp_kernels) / 1000
     tg_time_ms = sum(k["duration_us"] for k in tg_kernels) / 1000
 
-    # Bottleneck detection
     bottlenecks = []
     for cat, stats in category_stats.items():
         if stats["pct"] > 25:
             bottlenecks.append(f"{cat} dominates at {stats['pct']}% of total time")
         if stats["avg_occupancy_pct"] < 30 and stats["pct"] > 5:
-            bottlenecks.append(f"{cat} has low occupancy ({stats['avg_occupancy_pct']}%)  likely occupancy-bound")
+            bottlenecks.append(
+                f"{cat} has low occupancy ({stats['avg_occupancy_pct']}%)  "
+                f"likely occupancy-bound on {arch.upper()} ({prof['wave']}-wave)"
+            )
 
-    # Check GPU utilization (from ADLX metrics if available, else estimate)
     ideal_time_us = sum(r["duration_us"] for r in records if r["block_x"] > 64)
     gpu_busy_pct = min(100, ideal_time_us / total_time_us * 100) if total_time_us else 0
 
     return {
         "trace_file": "",
         "analysis_time": datetime.now().isoformat(),
+        "arch": arch,
+        "architecture_profile": prof,
         "summary": {
             "total_kernels": total_kernels,
             "total_time_ms": round(wall_time_ms, 2),
             "avg_kernel_us": round(total_time_us / total_kernels, 1) if total_kernels else 0,
             "estimated_gpu_busy_pct": round(gpu_busy_pct, 1),
-            "estimated_gpu_utilization_pct": round(gpu_busy_pct * 0.85, 1),  # rough adjustment
+            "estimated_gpu_utilization_pct": round(gpu_busy_pct * 0.85, 1),
         },
         "phases": phases,
         "category_breakdown": category_stats,
         "top_slowest_kernels": top_slow,
         "bottlenecks": bottlenecks,
-        "optimization_targets": generate_optimization_targets(category_stats, bottlenecks),
+        "optimization_targets": generate_optimization_targets(category_stats, bottlenecks, arch),
     }
-
-
-def generate_optimization_targets(category_stats, bottlenecks):
-    targets = []
-    if "MMQ" in category_stats and category_stats["MMQ"]["pct"] > 15:
-        targets.append({
-            "target": "MMQ",
-            "current_pct": category_stats["MMQ"]["pct"],
-            "suggestion": "MMQ dominates. Consider K-tile doubling (already applied). Check if MMQ_ITER_K is optimal for RDNA4.",
-        })
-    if "MMVQ" in category_stats and category_stats["MMVQ"]["pct"] > 10:
-        targets.append({
-            "target": "MMVQ",
-            "current_pct": category_stats["MMVQ"]["pct"],
-            "suggestion": "MMVQ significant. Check Split-K heuristic and small_k path.",
-        })
-    if "Attention" in category_stats and category_stats["Attention"]["pct"] > 15:
-        targets.append({
-            "target": "Attention",
-            "current_pct": category_stats["Attention"]["pct"],
-            "suggestion": "Attention is a significant fraction. Consider flash attention tuning.",
-        })
-    if "MoE" in category_stats and category_stats["MoE"]["pct"] > 10:
-        targets.append({
-            "target": "MoE",
-            "current_pct": category_stats["MoE"]["pct"],
-            "suggestion": "MoE dispatch overhead. Check ExpertPool async prefetch.",
-        })
-    return targets
 
 
 def generate_html_report(analysis, output_path):
@@ -278,6 +370,8 @@ def generate_html_report(analysis, output_path):
     tops = analysis["top_slowest_kernels"]
     bots = analysis["bottlenecks"]
     targets = analysis["optimization_targets"]
+    arch = analysis.get("arch", "rdna4")
+    prof = analysis.get("architecture_profile", {})
 
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>AI-COMPASS Performance Report</title>
@@ -294,6 +388,15 @@ th {{ background: #161b22; }} tr:nth-child(even) {{ background: #161b22; }}
 </style></head><body>
 <h1>[AI] [AI-COMPASS] Performance Report</h1>
 <p>Generated: {analysis["analysis_time"]}</p>
+<div class="card">
+<h2>System</h2>
+<table>
+<tr><td>Architecture</td><td>{arch.upper()}</td></tr>
+<tr><td>CUs</td><td>{prof.get("cu", "?")}</td></tr>
+<tr><td>Wave Size</td><td>{prof.get("wave", "?")}</td></tr>
+<tr><td>L2 Cache</td><td>{prof.get("l2", "?")} KB</td></tr>
+</table>
+</div>
 <div class="card">
 <h2>Summary</h2>
 <table>
@@ -339,12 +442,12 @@ th {{ background: #161b22; }} tr:nth-child(even) {{ background: #161b22; }}
     return output_path
 
 
-def compare_traces(baseline_path, target_path, cu_count=32):
+def compare_traces(baseline_path, target_path, arch="rdna4"):
     """Compare two traces (before/after optimization)."""
     base_recs = parse_trace(baseline_path)
     tgt_recs = parse_trace(target_path)
-    base = analyze_trace(base_recs, cu_count)
-    tgt = analyze_trace(tgt_recs, cu_count)
+    base = analyze_trace(base_recs, arch)
+    tgt = analyze_trace(tgt_recs, arch)
 
     diff = {
         "baseline": baseline_path,
@@ -354,7 +457,6 @@ def compare_traces(baseline_path, target_path, cu_count=32):
         "regressions": {},
     }
 
-    # Compare summary
     bs = base["summary"]
     ts = tgt["summary"]
     for key in ["total_time_ms", "avg_kernel_us", "estimated_gpu_utilization_pct"]:
@@ -374,83 +476,138 @@ def compare_traces(baseline_path, target_path, cu_count=32):
     return diff
 
 
+def parse_trace(csv_path):
+    records = []
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            records.append({
+                "dispatch_id": int(row.get("dispatch_id", 0)),
+                "kernel_name": row.get("kernel_name", "unknown"),
+                "grid_x": int(row.get("grid_x", 0)),
+                "grid_y": int(row.get("grid_y", 0)),
+                "grid_z": int(row.get("grid_z", 0)),
+                "block_x": int(row.get("block_x", 0)),
+                "block_y": int(row.get("block_y", 0)),
+                "block_z": int(row.get("block_z", 0)),
+                "shared_mem": int(row.get("shared_mem", 0)),
+                "duration_us": float(row.get("duration_us", 0)),
+            })
+    return records
+
+
 def main():
     parser = argparse.ArgumentParser(description="AI-COMPASS Analyze  kernel profiling & bottleneck detection")
-    parser.add_argument("trace", help="HIP trace CSV file")
+    parser.add_argument("trace", nargs="?", default=None, help="HIP trace CSV file")
     parser.add_argument("-o", "--output", default="analysis_output", help="Output directory")
     parser.add_argument("--compare", help="Baseline CSV for before/after comparison")
-    parser.add_argument("--cu-count", type=int, default=32, help="GPU CU/WGP count (default: 32 for RX 9070 XT)")
+    parser.add_argument("--arch", default="rdna4", choices=sorted(ARCH_NAMES),
+                        help="GPU architecture (default: rdna4)")
+    parser.add_argument("--cu-count", type=int, default=0,
+                        help="Override CU count (default: from architecture profile)")
     parser.add_argument("--html", action="store_true", default=True, help="Generate HTML report")
+    parser.add_argument("--bench-pp", type=float, default=None,
+                        help="Prompt processing throughput (t/s) from llama-bench")
+    parser.add_argument("--bench-tg", type=float, default=None,
+                        help="Token generation throughput (t/s) from llama-bench")
     args = parser.parse_args()
 
-    os.makedirs(args.output, exist_ok=True)
+    prof = ARCH_PROFILES.get(args.arch, ARCH_PROFILES["rdna4"])
+    cu_count = args.cu_count if args.cu_count > 0 else prof["cu"]
+    override_arch = args.arch
+    # If CU count was overridden, adjust arch inference
+    if args.cu_count > 0 and args.cu_count == 40:
+        override_arch = "rdna2"
 
-    records = parse_trace(args.trace)
-    if not records:
-        print(f"[FAIL] No records found in {args.trace}")
-        return 1
+    if args.trace and os.path.exists(args.trace):
+        os.makedirs(args.output, exist_ok=True)
 
-    print(f"[AI] Analyzing {len(records)} kernel records from {args.trace}...")
+        records = parse_trace(args.trace)
+        if not records:
+            print(f"[FAIL] No records found in {args.trace}")
+            return 1
 
-    analysis = analyze_trace(records, args.cu_count)
-    analysis["trace_file"] = args.trace
+        print(f"[AI] Analyzing {len(records)} kernel records from {args.trace}...")
+        print(f"[AI] Architecture: {override_arch.upper()} ({prof['wave']}-wave, {cu_count} CUs)")
 
-    # Print summary
-    s = analysis["summary"]
-    print(f"\n[DATA] Summary:")
-    print(f"   {s['total_kernels']} kernels | {s['total_time_ms']} ms total")
-    print(f"   Avg kernel: {s['avg_kernel_us']} s | Est. GPU busy: {s['estimated_gpu_busy_pct']}%")
+        analysis = analyze_trace(records, override_arch)
+        analysis["trace_file"] = args.trace
 
-    # Print phases
-    print(f"\n Phases:")
-    for p in analysis["phases"]:
-        print(f"   {p['phase']}: {p['kernel_count']} kernels, {p['total_ms']} ms ({p['pct_of_total']}%)")
+        s = analysis["summary"]
+        print(f"\n[DATA] Summary:")
+        print(f"   {s['total_kernels']} kernels | {s['total_time_ms']} ms total")
+        print(f"   Avg kernel: {s['avg_kernel_us']} s | Est. GPU busy: {s['estimated_gpu_busy_pct']}%")
 
-    # Print category breakdown
-    print(f"\n  Category Breakdown:")
-    for cat, st in sorted(analysis["category_breakdown"].items(), key=lambda x: -x[1]["pct"]):
-        print(f"   {cat:15s} {st['count']:5d} kernels  {st['total_ms']:8.1f} ms  {st['pct']:5.1f}%  occ:{st['avg_occupancy_pct']:5.1f}%")
+        print(f"\n Phases:")
+        for p in analysis["phases"]:
+            print(f"   {p['phase']}: {p['kernel_count']} kernels, {p['total_ms']} ms ({p['pct_of_total']}%)")
 
-    # Print bottlenecks
-    if analysis["bottlenecks"]:
-        print(f"\n[BELL] Bottlenecks:")
-        for b in analysis["bottlenecks"]:
-            print(f"   [WARN] {b}")
+        print(f"\n  Category Breakdown:")
+        for cat, st in sorted(analysis["category_breakdown"].items(), key=lambda x: -x[1]["pct"]):
+            print(f"   {cat:15s} {st['count']:5d} kernels  {st['total_ms']:8.1f} ms  {st['pct']:5.1f}%  occ:{st['avg_occupancy_pct']:5.1f}%")
 
-    # Print optimization targets
-    if analysis["optimization_targets"]:
-        print(f"\n Optimization Targets:")
-        for t in analysis["optimization_targets"]:
-            print(f"   [{t['target']}] ({t['current_pct']}%): {t['suggestion']}")
+        if analysis["bottlenecks"]:
+            print(f"\n[BELL] Bottlenecks:")
+            for b in analysis["bottlenecks"]:
+                print(f"   [WARN] {b}")
 
-    # Save JSON
-    json_path = os.path.join(args.output, "analysis.json")
-    with open(json_path, "w") as f:
-        json.dump(analysis, f, indent=2)
-    print(f"\n JSON report: {json_path}")
+        if analysis["optimization_targets"]:
+            print(f"\n Optimization Targets:")
+            for t in analysis["optimization_targets"]:
+                print(f"   [{t['target']}] ({t['current_pct']}%): {t['suggestion']}")
 
-    # HTML report
-    if args.html:
-        html_path = os.path.join(args.output, "report.html")
-        generate_html_report(analysis, html_path)
-        print(f"[FILE] HTML report: {html_path}")
+        json_path = os.path.join(args.output, "analysis.json")
+        with open(json_path, "w") as f:
+            json.dump(analysis, f, indent=2)
+        print(f"\n JSON report: {json_path}")
 
-    # Compare mode
-    if args.compare:
-        print(f"\n[SYNC] Comparing against baseline: {args.compare}...")
-        diff = compare_traces(args.compare, args.trace, args.cu_count)
-        diff_path = os.path.join(args.output, "comparison.json")
-        with open(diff_path, "w") as f:
-            json.dump(diff, f, indent=2)
-        if diff["improvements"]:
-            print(f"\n[OK] Improvements:")
-            for k, v in diff["improvements"].items():
-                print(f"   {k}: {v}")
-        if diff["regressions"]:
-            print(f"\n[FAIL] Regressions:")
-            for k, v in diff["regressions"].items():
-                print(f"   {k}: {v}")
-        print(f" Comparison: {diff_path}")
+        if args.html:
+            html_path = os.path.join(args.output, "report.html")
+            generate_html_report(analysis, html_path)
+            print(f"[FILE] HTML report: {html_path}")
+
+        if args.compare:
+            print(f"\n[SYNC] Comparing against baseline: {args.compare}...")
+            diff = compare_traces(args.compare, args.trace, override_arch)
+            diff_path = os.path.join(args.output, "comparison.json")
+            with open(diff_path, "w") as f:
+                json.dump(diff, f, indent=2)
+            if diff["improvements"]:
+                print(f"\n[OK] Improvements:")
+                for k, v in diff["improvements"].items():
+                    print(f"   {k}: {v}")
+            if diff["regressions"]:
+                print(f"\n[FAIL] Regressions:")
+                for k, v in diff["regressions"].items():
+                    print(f"   {k}: {v}")
+            print(f" Comparison: {diff_path}")
+
+    else:
+        # No trace file: show architecture profile only
+        print(f"\n[AI] AI-COMPASS Architecture Profile: {override_arch.upper()}")
+        print(f"   Architecture: {override_arch}")
+        for k, v in prof.items():
+            print(f"     {k}: {v}")
+        print()
+
+    # Show benchmark results if provided
+    if args.bench_pp is not None or args.bench_tg is not None:
+        print(f"\n[DATA] llama-bench Results:")
+        if args.bench_pp:
+            print(f"   Prompt Processing: {args.bench_pp:.1f} t/s")
+        if args.bench_tg:
+            print(f"   Token Generation:  {args.bench_tg:.1f} t/s")
+
+        # Estimate memory bandwidth utilization for RDNA2 (6700 XT: ~384 GB/s)
+        if args.bench_tg and override_arch == "rdna2":
+            # RDNA2 memory bandwidth estimate for model size
+            bw_est = args.bench_tg * 17.4  # rough: t/s * model_size_gb
+            print(f"   Est. Mem BW utilized: {bw_est:.0f} GB/s (of ~384 GB/s GDDR6)")
+            pct = bw_est / 384.0 * 100.0
+            print(f"   Mem BW utilization: {pct:.0f}%  model likely bandwidth-bound on RDNA2")
+        elif args.bench_tg and override_arch == "rdna4":
+            bw_est = args.bench_tg * 17.4
+            print(f"   Est. Mem BW utilized: {bw_est:.0f} GB/s (of ~960 GB/s GDDR6)")
 
     return 0
 

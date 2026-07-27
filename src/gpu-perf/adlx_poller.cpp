@@ -14,6 +14,7 @@ namespace aicompass {
 
 static ADLXHelper g_ADLXHelp;
 static IADLXGPUPtr g_gpu;
+static adlx_int g_vram_total_mb = 0;
 
 bool AdlxGpuPoller::init() {
     if (!load_adlx()) {
@@ -49,7 +50,22 @@ bool AdlxGpuPoller::init() {
 
     const char* gpuName = nullptr;
     g_gpu->Name(&gpuName);
-    AI_LOG_INFO("ADLX GPU metrics initialized: %s", gpuName ? gpuName : "unknown");
+
+    IADLXGPU1Ptr gpu1 = {0};
+    g_gpu->QueryInterface(IADLXGPU1::IID(), (void**)&gpu1);
+    if (gpu1) {
+        adlx_int vram = 0;
+        if (ADLX_SUCCEEDED(gpu1->VRAMSize(&vram)))
+            g_vram_total_mb = vram;
+    }
+    if (g_vram_total_mb == 0) {
+        adlx_int vram = 0;
+        if (ADLX_SUCCEEDED(g_gpu->VRAMSize(&vram)))
+            g_vram_total_mb = vram;
+    }
+
+    AI_LOG_INFO("ADLX GPU metrics initialized: %s (%d MiB VRAM)",
+        gpuName ? gpuName : "unknown", g_vram_total_mb);
     initialized_ = true;
     return true;
 }
@@ -108,7 +124,8 @@ void AdlxGpuPoller::poll_loop() {
                 sample.gpu_power_w = dval;
             if (ADLX_SUCCEEDED(metrics->GPUVRAM(&ival)))
                 sample.gpu_vram_usage_mb = (double)ival;
-            sample.gpu_vram_total_mb = 16384; // RX 9070 XT has 16GB VRAM
+            sample.gpu_vram_total_mb = g_vram_total_mb > 0
+                ? (double)g_vram_total_mb : 16384.0;
 
             last_sample_ = sample;
             if (callback_) callback_(sample);

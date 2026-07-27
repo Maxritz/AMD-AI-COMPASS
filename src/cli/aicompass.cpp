@@ -13,6 +13,7 @@
 #include "aicompass/plugins/hyperloom_plugin.h"
 #include "aicompass/plugins/magpie_plugin.h"
 #include "aicompass/plugins/intellikit_plugin.h"
+#include "aicompass/plugins/rdna2_optimizer.h"
 
 using namespace aicompass;
 
@@ -21,6 +22,7 @@ static void register_plugins() {
     PluginRegistry::instance().register_plugin(std::make_unique<HyperloomPlugin>());
     PluginRegistry::instance().register_plugin(std::make_unique<MagpiePlugin>());
     PluginRegistry::instance().register_plugin(std::make_unique<IntellikitPlugin>());
+    PluginRegistry::instance().register_plugin(std::make_unique<RDNA2OptimizerPlugin>());
 }
 
 static void print_banner() {

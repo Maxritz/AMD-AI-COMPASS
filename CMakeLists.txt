@@ -13,6 +13,7 @@ option(AI_COMPASS_USE_GPU_PERF_API "Use GPUPerfAPI for counters" ON)
 # Core library
 file(GLOB_RECURSE CORE_SRC
     src/core/src/*.cpp
+    src/core/src/plugins/*.cpp
 )
 add_library(ai_compass_core ${CORE_SRC})
 target_include_directories(ai_compass_core
