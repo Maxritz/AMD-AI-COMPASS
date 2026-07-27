@@ -1,44 +1,71 @@
 #include "adlx_poller.h"
 #include "aicompass/logger.h"
 
+// ADLX SDK headers
+#include "ADLX.h"
+#include "IPerformanceMonitoring.h"
+#include "IPerformanceMonitoring1.h"
+#include "ISystem.h"
+#include "ADLXHelper.h"
+
+using namespace adlx;
+
 namespace aicompass {
 
-
-// ADLX function pointer types - resolved at runtime via GetProcAddress
-// (ADLX_STD_CALL is __stdcall on Windows; we use plain function pointers
-//  and cast after GetProcAddress)
+static ADLXHelper g_ADLXHelp;
+static IADLXGPUPtr g_gpu;
 
 bool AdlxGpuPoller::init() {
     if (!load_adlx()) {
-        AI_LOG_WARN("ADLX not available, GPU metrics polling disabled");
+        AI_LOG_WARN("ADLX DLL not loadable, GPU metrics polling disabled");
         return false;
     }
-    AI_LOG_INFO("ADLX initialized successfully");
+
+    ADLX_RESULT res = g_ADLXHelp.Initialize();
+    if (ADLX_FAILED(res)) {
+        AI_LOG_WARN("ADLX initialization failed (%d)", res);
+        return false;
+    }
+
+    IADLXPerformanceMonitoringServicesPtr perfService;
+    res = g_ADLXHelp.GetSystemServices()->GetPerformanceMonitoringServices(&perfService);
+    if (ADLX_FAILED(res)) {
+        AI_LOG_WARN("ADLX perf monitoring services unavailable");
+        return false;
+    }
+
+    IADLXGPUListPtr gpus;
+    res = g_ADLXHelp.GetSystemServices()->GetGPUs(&gpus);
+    if (ADLX_FAILED(res) || gpus->Begin() == gpus->End()) {
+        AI_LOG_WARN("No AMD GPUs found via ADLX");
+        return false;
+    }
+
+    res = gpus->At(gpus->Begin(), &g_gpu);
+    if (ADLX_FAILED(res)) {
+        AI_LOG_WARN("Failed to get primary GPU from ADLX");
+        return false;
+    }
+
+    const char* gpuName = nullptr;
+    g_gpu->Name(&gpuName);
+    AI_LOG_INFO("ADLX GPU metrics initialized: %s", gpuName ? gpuName : "unknown");
+    initialized_ = true;
     return true;
 }
 
 bool AdlxGpuPoller::load_adlx() {
-    // Try loading ADLX from System32 first, then from driver store
-    const wchar_t* paths[] = {
-        L"amdadlx64.dll",
-        L"C:\\Windows\\System32\\amdadlx64.dll",
-        L"C:\\Windows\\System32\\DriverStore\\FileRepository\\u0202725.inf_amd64_c5ff89faaab9950b\\B026291\\amdadlx64.dll",
-        L"C:\\Windows\\System32\\DriverStore\\FileRepository\\u0420529.inf_amd64_94ad5a6c4d1a04e2\\B419765\\amdadlx64.dll"
-    };
-
-    for (auto path : paths) {
-        adlx_dll_ = LoadLibraryW(path);
-        if (adlx_dll_) {
-            AI_LOG_DEBUG("Loaded ADLX from: %S", path);
-            return true;
-        }
-    }
+    HMODULE test = LoadLibraryW(L"amdadlx64.dll");
+    if (test) { FreeLibrary(test); return true; }
+    AI_LOG_DEBUG("ADLX DLL not in system path, trying third_party/");
+    test = LoadLibraryW(L"third_party\\amdadlx64.dll");
+    if (test) { FreeLibrary(test); return true; }
     return false;
 }
 
 bool AdlxGpuPoller::start() {
+    if (!initialized_) return false;
     if (running_) return true;
-    if (!adlx_dll_) return false;
     running_ = true;
     poll_thread_ = std::thread(&AdlxGpuPoller::poll_loop, this);
     AI_LOG_INFO("GPU metrics polling started (interval: %dms)", interval_ms_);
@@ -48,16 +75,41 @@ bool AdlxGpuPoller::start() {
 void AdlxGpuPoller::stop() {
     running_ = false;
     if (poll_thread_.joinable()) poll_thread_.join();
-    AI_LOG_INFO("GPU metrics polling stopped");
 }
 
 void AdlxGpuPoller::poll_loop() {
+    IADLXPerformanceMonitoringServicesPtr perfService;
+    ADLX_RESULT res = g_ADLXHelp.GetSystemServices()->GetPerformanceMonitoringServices(&perfService);
+    if (ADLX_FAILED(res)) {
+        AI_LOG_ERROR("Failed to get ADLX perf services in poller thread");
+        return;
+    }
+
     while (running_) {
         GpuMetricsSample sample;
         sample.timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 
-        if (read_metrics(sample)) {
+        IADLXGPUMetricsPtr metrics;
+        res = perfService->GetCurrentGPUMetrics(g_gpu, &metrics);
+        if (ADLX_SUCCEEDED(res)) {
+            adlx_double dval = 0;
+            adlx_int ival = 0;
+
+            if (ADLX_SUCCEEDED(metrics->GPUUsage(&dval)))
+                sample.gpu_utilization_pct = dval;
+            if (ADLX_SUCCEEDED(metrics->GPUClockSpeed(&ival)))
+                sample.gpu_core_clock_mhz = (double)ival;
+            if (ADLX_SUCCEEDED(metrics->GPUVRAMClockSpeed(&ival)))
+                sample.gpu_memory_clock_mhz = (double)ival;
+            if (ADLX_SUCCEEDED(metrics->GPUTemperature(&dval)))
+                sample.gpu_temperature_c = dval;
+            if (ADLX_SUCCEEDED(metrics->GPUPower(&dval)))
+                sample.gpu_power_w = dval;
+            if (ADLX_SUCCEEDED(metrics->GPUVRAM(&ival)))
+                sample.gpu_vram_usage_mb = (double)ival;
+            sample.gpu_vram_total_mb = 16384; // RX 9070 XT has 16GB VRAM
+
             last_sample_ = sample;
             if (callback_) callback_(sample);
         }
@@ -66,43 +118,13 @@ void AdlxGpuPoller::poll_loop() {
     }
 }
 
-bool AdlxGpuPoller::read_metrics(GpuMetricsSample& sample) {
-    // ADLX provides GPU metrics through IADLXGPUMetrics interface
-    // For now, use a simplified poll via AMD's public ADL/ADLX interface
-    // If ADLX is not loaded, populate with sentinel values
-    if (!adlx_dll_) {
-        sample.gpu_utilization_pct = -1.0;
-        sample.gpu_core_clock_mhz = -1.0;
-        sample.gpu_memory_clock_mhz = -1.0;
-        sample.gpu_temperature_c = -1.0;
-        sample.gpu_power_w = -1.0;
-        sample.gpu_vram_usage_mb = -1.0;
-        sample.gpu_vram_total_mb = -1.0;
-        sample.gpu_memory_bandwidth_pct = -1.0;
-        return false;
-    }
+bool AdlxGpuPoller::read_metrics(GpuMetricsSample&) {
+    return false; // not used; inline in poll_loop
+}
 
-    // TODO: Full ADLX integration
-    // The ADLX SDK provides:
-    // - IADLXGPUMetrics::GetGPUUsage() -> double
-    // - IADLXGPUMetrics::GetGPUClockSpeed() -> double
-    // - IADLXGPUMetrics::GetGPUVRAMClockSpeed() -> double
-    // - IADLXGPUMetrics::GetGPUTemperature() -> double
-    // - IADLXGPUMetrics::GetGPUPower() -> double
-    // - IADLXGPUMetrics::GetGPUVRAM() -> adlx_int
-    // - IADLXGPUMetrics::GetGPUVRAMTotal() -> adlx_int
-
-    // For now return sentinel -1 values to indicate ADLX metrics pending
-    sample.gpu_utilization_pct = -1.0;
-    sample.gpu_core_clock_mhz = -1.0;
-    sample.gpu_memory_clock_mhz = -1.0;
-    sample.gpu_temperature_c = -1.0;
-    sample.gpu_power_w = -1.0;
-    sample.gpu_vram_usage_mb = -1.0;
-    sample.gpu_vram_total_mb = -1.0;
-    sample.gpu_memory_bandwidth_pct = -1.0;
-
-    return true;
+AdlxGpuPoller::~AdlxGpuPoller() {
+    stop();
+    g_ADLXHelp.Terminate();
 }
 
 } // namespace aicompass

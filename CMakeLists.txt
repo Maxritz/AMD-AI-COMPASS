@@ -19,6 +19,8 @@ target_include_directories(ai_compass_core
     PUBLIC
         src/core/include
         src/output
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ADLX-SDK/SDK/ADLXHelper/Windows/Cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ADLX-SDK/SDK/Include
 )
 target_link_libraries(ai_compass_core PUBLIC)
 
@@ -34,10 +36,14 @@ if(AI_COMPASS_BUILD_HIP_TRACER)
     add_library(ai_hip_tracer SHARED
         src/hip-tracer/dll_main.cpp
         src/gpu-perf/adlx_poller.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ADLX-SDK/SDK/ADLXHelper/Windows/Cpp/ADLXHelper.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ADLX-SDK/SDK/Platform/Windows/WinAPIs.cpp
     )
     target_include_directories(ai_hip_tracer PRIVATE
         src/core/include
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ADLX-SDK/SDK/ADLXHelper/Windows/Cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ADLX-SDK/SDK/Include
     )
     target_link_libraries(ai_hip_tracer PRIVATE ai_compass_core)
     set_target_properties(ai_hip_tracer PROPERTIES

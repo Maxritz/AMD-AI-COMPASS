@@ -6,6 +6,7 @@
 #include <functional>
 #include <chrono>
 #include <vector>
+#include <memory>
 
 #include "aicompass/types.h"
 
@@ -15,8 +16,8 @@ class AdlxGpuPoller {
 public:
     using MetricCallback = std::function<void(const GpuMetricsSample&)>;
 
-    AdlxGpuPoller() : running_(false), interval_ms_(100) {}
-    ~AdlxGpuPoller() { stop(); }
+    AdlxGpuPoller() : running_(false), interval_ms_(100), initialized_(false) {}
+    ~AdlxGpuPoller();
 
     bool init();
     void set_interval(int ms) { interval_ms_ = ms; }
@@ -24,7 +25,7 @@ public:
     bool start();
     void stop();
     bool is_running() const { return running_; }
-
+    bool is_initialized() const { return initialized_; }
     const GpuMetricsSample& last_sample() const { return last_sample_; }
 
 private:
@@ -33,16 +34,12 @@ private:
     bool read_metrics(GpuMetricsSample& sample);
 
     std::atomic<bool> running_;
+    std::atomic<bool> initialized_;
     std::thread poll_thread_;
     int interval_ms_;
     MetricCallback callback_;
     GpuMetricsSample last_sample_;
-
-    // ADLX handle
-    HMODULE adlx_dll_ = nullptr;
-    void* adlx_instance_ = nullptr;
-    void* gpu_metrics_interface_ = nullptr;
-    void* gpu_ = nullptr;
+    void* gpu_handle_ = nullptr; // IADLXGPUPtr stored as void* to avoid ADLX headers in header
 };
 
 } // namespace aicompass

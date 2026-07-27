@@ -9,7 +9,19 @@
 #include "aicompass/plugin.h"
 #include "aicompass/pipeline.h"
 
+#include "aicompass/plugins/geak_plugin.h"
+#include "aicompass/plugins/hyperloom_plugin.h"
+#include "aicompass/plugins/magpie_plugin.h"
+#include "aicompass/plugins/intellikit_plugin.h"
+
 using namespace aicompass;
+
+static void register_plugins() {
+    PluginRegistry::instance().register_plugin(std::make_unique<GeakPlugin>());
+    PluginRegistry::instance().register_plugin(std::make_unique<HyperloomPlugin>());
+    PluginRegistry::instance().register_plugin(std::make_unique<MagpiePlugin>());
+    PluginRegistry::instance().register_plugin(std::make_unique<IntellikitPlugin>());
+}
 
 static void print_banner() {
     printf(R"(
@@ -42,6 +54,7 @@ static void print_usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
     print_banner();
+    register_plugins();
 
     if (argc < 2) {
         print_usage(argv[0]);
