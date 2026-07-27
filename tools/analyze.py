@@ -49,14 +49,13 @@ KERNEL_DB_RDNA2 = [
     # RMS norm
     ((256, 1, 1, 100, 99999, 100, 99999), "Norm", "rms_norm"),
     # MoE sync fallback — tiny grid (8 or fewer), block 256, no smem
-    ((256, 1, 1, 1, 15, 0, 100), "MoE", "sync_fallback"),
+    ((256, 1, 1, 1, 4, 0, 100), "MoE", "sync_fallback"),
     # MoE dispatch (per-expert, medium grid, block 128)
-    ((128, 1, 1, 1000, 99999, 0, 100), "MoE", "moe_dispatch"),
-    # MoE routing/top-k (block 128, 3D grid)
-    ((128, 1, 1, 1, 999, 0, 100), "MoE", "moe_routing"),
+    # MoE routing/top-k (block 128, 3D grid only — expert×token dims)
+    ((128, 1, 1, 1, 99999, 1, 99999), "MoE", "moe_routing"),
     # MoE gather/scatter (block 32x2, large grid)
     ((32, 2, 1, 1000, 9999999, 0, 100), "MoE", "moe_gather"),
-    ((32, 2, 1, 1, 999, 0, 100), "MoE", "moe_scatter"),
+    ((32, 2, 1, 1, 99999, 1, 99999), "MoE", "moe_scatter"),
     # MoE expert compress (block 32x4, small smem)
     ((32, 4, 1, 1, 9999, 0, 30000), "MoE", "moe_compress"),
     # RoPE
@@ -73,6 +72,11 @@ KERNEL_DB_RDNA2 = [
     ((1, 256, 1, 100, 99999, 0, 100), "Quantize", "dequantize"),
     # Reshape
     ((32, 2, 1, 1, 100, 0, 100), "Vector", "reshape"),
+    # BitNet/Ternary Q1_0/Q2_0 compute (block 32x1 no smem = quant kernel; 24x1/24x5 = ternary merge)
+    ((32, 1, 1, 5000, 999999, 0, 100), "Quantize", "bitnet_compute"),
+    ((24, 1, 1, 1, 99999, 0, 100), "Quantize", "bitnet_compute"),
+    ((24, 5, 1, 1, 9999, 0, 100), "Quantize", "bitnet_merge"),
+    ((64, 1, 1, 50000, 9999999, 0, 100), "Quantize", "bitnet_gather"),
     # Cross entropy
     ((512, 1, 1, 1, 100, 0, 100), "Other", "cross_entropy"),
 ]
@@ -93,14 +97,13 @@ KERNEL_DB_RDNA4 = [
     # RMS norm
     ((256, 1, 1, 100, 99999, 100, 99999), "Norm", "rms_norm"),
     # MoE sync fallback — tiny grid (8 or fewer), block 256, no smem
-    ((256, 1, 1, 1, 15, 0, 100), "MoE", "sync_fallback"),
+    ((256, 1, 1, 1, 4, 0, 100), "MoE", "sync_fallback"),
     # MoE dispatch (per-expert, medium grid, block 128)
-    ((128, 1, 1, 1000, 99999, 0, 100), "MoE", "moe_dispatch"),
-    # MoE routing/top-k (block 128, 3D grid)
-    ((128, 1, 1, 1, 999, 0, 100), "MoE", "moe_routing"),
+    # MoE routing/top-k (block 128, 3D grid only — expert×token dims)
+    ((128, 1, 1, 1, 99999, 1, 99999), "MoE", "moe_routing"),
     # MoE gather/scatter (block 32x2, large grid)
     ((32, 2, 1, 1000, 9999999, 0, 100), "MoE", "moe_gather"),
-    ((32, 2, 1, 1, 999, 0, 100), "MoE", "moe_scatter"),
+    ((32, 2, 1, 1, 99999, 1, 99999), "MoE", "moe_scatter"),
     # MoE expert compress (block 32x4, small smem)
     ((32, 4, 1, 1, 9999, 0, 30000), "MoE", "moe_compress"),
     # RoPE
@@ -117,6 +120,11 @@ KERNEL_DB_RDNA4 = [
     ((1, 256, 1, 100, 99999, 0, 100), "Quantize", "dequantize"),
     # Reshape
     ((32, 2, 1, 1, 100, 0, 100), "Vector", "reshape"),
+    # BitNet/Ternary Q1_0/Q2_0 compute (block 32x1 no smem = quant kernel; 24x1/24x5 = ternary merge)
+    ((32, 1, 1, 5000, 999999, 0, 100), "Quantize", "bitnet_compute"),
+    ((24, 1, 1, 1, 99999, 0, 100), "Quantize", "bitnet_compute"),
+    ((24, 5, 1, 1, 9999, 0, 100), "Quantize", "bitnet_merge"),
+    ((64, 1, 1, 50000, 9999999, 0, 100), "Quantize", "bitnet_gather"),
     # Cross entropy
     ((512, 1, 1, 1, 100, 0, 100), "Other", "cross_entropy"),
 ]
