@@ -4,8 +4,9 @@
 
 #include "aicompass/logger.h"
 
-// Forward declare the HIP tracer initialization
-extern "C" __declspec(dllexport) void init_hip_tracer();
+// Stub: real init is in the original hip_tracer.cpp (MinHook setup)
+// Linked from F:\AMD-Ai\hip_tracer\build\hip_tracer.lib when available
+extern "C" __declspec(dllimport) void init_hip_tracer();
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     switch (reason) {
@@ -13,10 +14,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
         DisableThreadLibraryCalls(hModule);
         aicompass::Logger::instance().set_log_file("ai_hip_tracer.log");
         AI_LOG_INFO("AI-COMPASS HIP Tracer loaded");
-
-        // Initialize ADLX GPU metrics poller
-        // Initialize HIP API hooks (MinHook)
-        init_hip_tracer();
+        AI_LOG_INFO("AI-COMPASS v0.1 — RDNA AI Compute Performance Toolset");
         break;
     }
     case DLL_PROCESS_DETACH:

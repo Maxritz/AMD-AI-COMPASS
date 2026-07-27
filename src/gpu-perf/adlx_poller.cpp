@@ -3,17 +3,10 @@
 
 namespace aicompass {
 
-// ADLX function pointer types
-typedef void* (ADLX_STD_CALL* ADLX_GET_VER_PROC)();
-typedef int (ADLX_STD_CALL* ADLX_INIT_PROC)();
-typedef int (ADLX_STD_CALL* ADLX_TERM_PROC)();
-typedef int (ADLX_STD_CALL* ADLX_GET_SYS_SVC_PROC)(void**);
-typedef int (ADLX_STD_CALL* ADLX_GET_GPUS_PROC)(void*, void**);
-typedef int (ADLX_STD_CALL* ADLX_GPU_LIST_SIZE_PROC)(void*, int*);
-typedef int (ADLX_STD_CALL* ADLX_GPU_LIST_AT_PROC)(void*, int, void**);
-typedef int (ADLX_STD_CALL* ADLX_GET_METRICS_PROC)(void*, void**);
-typedef int (ADLX_STD_CALL* ADLX_METRICS_GET_PROC)(void*, double*);
-typedef int (ADLX_STD_CALL* ADLX_METRICS_GET_INT_PROC)(void*, int*);
+
+// ADLX function pointer types - resolved at runtime via GetProcAddress
+// (ADLX_STD_CALL is __stdcall on Windows; we use plain function pointers
+//  and cast after GetProcAddress)
 
 bool AdlxGpuPoller::init() {
     if (!load_adlx()) {
