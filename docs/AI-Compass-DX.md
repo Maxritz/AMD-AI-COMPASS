@@ -1,18 +1,84 @@
-# AI-Compass-DX
+# AI-Compass Unified Toolkit
 
-DirectX AI development toolkit for building, testing, and debugging AI applications that use DirectX 12 and DirectML.
+Multi-backend AI development toolkit for building, testing, and debugging AI applications across HIP (ROCm), Vulkan, DirectX 12, and WinML (DirectML) compute backends.
 
 ## Overview
 
-AI-Compass-DX provides a comprehensive workflow for DirectX AI development, including:
+AI-Compass provides a unified workflow for multi-backend AI development, including:
 
-1. **Build verification** - Ensures DirectX 12 backends compile correctly
-2. **Coherence testing** - Validates model output is semantically correct (not garbled)
-3. **Debug layer validation** - Checks D3D12 and DirectML debug layer availability
-4. **GPU capture setup** - Configures PIX and Visual Studio Graphics Debugger for frame capture
-5. **DRED support** - Enables Device Removed Extended Data for crash debugging
+1. **Build verification** - Ensures all backend compute paths compile correctly
+2. **Coherence testing** - Validates model output is semantically correct (not garbled) across all backends
+3. **Debug layer validation** - Checks D3D12, DirectML, Vulkan, and HIP debug layer availability
+4. **GPU capture setup** - Configures PIX, RenderDoc, and other tools for frame capture
+5. **DRED support** - Enables Device Removed Extended Data for crash debugging (DX12/WinML)
 6. **Model validation** - Validates GGUF, ONNX, and custom model formats
-7. **Unit test execution** - Runs ctest suite
+7. **Cross-backend comparison** - Compares outputs across all available backends
+8. **Unit test execution** - Runs ctest suite for each backend
+
+## Supported Backends
+
+| Backend | Description | Key Features |
+|---------|-------------|--------------|
+| HIP/ROCm | AMD GPU compute via HIP runtime | ROCm 7.x support, rocwmma v2+, RDNA4 optimizations |
+| Vulkan | Cross-platform GPU compute via Vulkan | Vulkan SDK, GLSL compute shaders, RenderDoc capture |
+| DirectX 12 | Microsoft GPU compute via D3D12 | DirectML, D3D12 debug layers, DRED, PIX capture |
+| WinML | Windows ML via DirectML | ONNX model support, Windows 10/11 integration |
+
+## Unified Scripts
+
+### `toolkit-unified.ps1` - Unified Multi-Backend Toolkit
+
+The primary unified entry point for building and testing AI applications across all backends.
+
+```powershell
+# Full test on all backends
+.\scripts\toolkit-unified.ps1 -Backend all -Action test -ModelPath "model.gguf"
+
+# Build all available backends
+.\scripts\toolkit-unified.ps1 -Backend all -Action build
+
+# Run coherence comparison across all backends
+.\scripts\toolkit-unified.ps1 -Backend all -Action coherence -ModelPath "model.gguf" -Prompt "Hello"
+
+# Debug mode with DRED on DX12 backend
+.\scripts\toolkit-unified.ps1 -Backend dx12 -Action debug -ModelPath "model.gguf" -EnableDRED
+
+# Validate system for all backends
+.\scripts\toolkit-unified.ps1 -Backend all -Action validate
+
+# GPU capture on all backends
+.\scripts\toolkit-unified.ps1 -Backend all -Action capture -ModelPath "model.gguf"
+```
+
+### `validate-system.ps1` - System Validation
+
+Validates that all AI compute backends are properly installed and configured.
+
+```powershell
+# Basic system validation
+.\scripts\validate-system.ps1
+
+# Detailed validation with version information
+.\scripts\validate-system.ps1 -Detailed
+
+# Attempt to fix common configuration issues
+.\scripts\validate-system.ps1 -Fix
+```
+
+### `validate-model.ps1` - Model Validation
+
+Validates AI models across all available backends and compares outputs.
+
+```powershell
+# Validate model on all backends
+.\scripts\validate-model.ps1 -ModelPath "model.gguf"
+
+# Validate on specific backends only
+.\scripts\validate-model.ps1 -ModelPath "model.gguf" -Backends "hip,vulkan"
+
+# Custom prompt and output directory
+.\scripts\validate-model.ps1 -ModelPath "model.gguf" -Prompt "Explain quantum computing" -OutputDir ".\results\"
+```
 
 ## Scripts
 

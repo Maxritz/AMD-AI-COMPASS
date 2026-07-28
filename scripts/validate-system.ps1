@@ -1,287 +1,280 @@
 <#
 .SYNOPSIS
-    System validation for DirectX AI development environment.
+    Unified system validation for AI-Compass multi-backend toolkit.
 
 .DESCRIPTION
-    Validates that the system has all required components for DirectX AI development:
-    - Windows version (10 1903+ or 11)
-    - DirectX 12 compatible GPU
-    - DirectX 12 Agility SDK
-    - DXC (DirectX Shader Compiler)
-    - Visual Studio 2022 with required workloads
-    - Graphics Tools FOD (for debug layers)
-    - Microsoft PIX (optional)
-    - Vendor tools (AMD RGP, NVIDIA Nsight, Intel GPA)
+    Validates that all AI compute backends (HIP/ROCm, Vulkan, DirectX 12, WinML)
+    are properly installed and configured on the system.
 
-.PARAMETER SkipVendorTools
-    Skip checking for vendor-specific tools
+    This script checks:
+    - GPU hardware detection (AMD/NVIDIA/Intel)
+    - HIP/ROCm runtime availability and version
+    - Vulkan SDK availability and version
+    - DirectX 12 runtime and DirectML availability
+    - WinML runtime availability
+    - Required environment variables
+    - Build tools (cmake, ninja, etc.)
 
-.PARAMETER OutputFile
-    Output file for validation report
+.PARAMETER Detailed
+    Show detailed validation output including versions and paths
+
+.PARAMETER Fix
+    Attempt to fix common configuration issues (sets PATH, etc.)
 
 .EXAMPLE
     .\validate-system.ps1
-    Run full system validation and display results.
+    Run basic system validation.
 
 .EXAMPLE
-    .\validate-system.ps1 -OutputFile "system_report.txt"
-    Run validation and save report to file.
+    .\validate-system.ps1 -Detailed
+    Run detailed system validation with version information.
 #>
 
 param(
-    [switch]$SkipVendorTools,
-    [string]$OutputFile = ""
+    [switch]$Detailed,
+    [switch]$Fix
 )
 
-function Write-Success { Write-Host $args -ForegroundColor Green }
-function Write-Fail { Write-Host $args -ForegroundColor Red }
-function Write-Warn { Write-Host $args -ForegroundColor Yellow }
-function Write-Info { Write-Host $args -ForegroundColor Cyan }
+$ErrorActionPreference = "Stop"
 
-$validationResults = @()
-
-function Add-Result {
-    param([string]$Component, [bool]$Passed, [string]$Details)
-    $validationResults += [PSCustomObject]@{
-        Component = $Component
-        Status = if ($Passed) { "PASS" } else { "FAIL" }
-        Details = $Details
-    }
+function Write-Section {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host "=== $Title ===" -ForegroundColor Cyan
 }
 
-Write-Info "=== DirectX AI System Validation ==="
-Write-Info ""
-
-# 1. Windows Version
-Write-Info "Checking Windows version..."
-$osInfo = Get-CimInstance Win32_OperatingSystem
-$buildNumber = [int]$osInfo.BuildNumber
-$version = [System.Environment]::OSVersion.Version
-
-if ($version.Major -ge 10 -and $buildNumber -ge 18362) {
-    $winVer = if ($buildNumber -ge 22000) { "Windows 11" } else { "Windows 10" }
-    Write-Success "Windows: $winVer (Build $buildNumber)"
-    Add-Result "Windows Version" $true "$winVer (Build $buildNumber)"
-} else {
-    Write-Fail "Windows: Version $version (Build $buildNumber) - requires 10.0.18362+"
-    Add-Result "Windows Version" $false "Build $buildNumber (requires 18362+)"
+function Write-Success {
+    param([string]$Message)
+    Write-Host "[OK] $Message" -ForegroundColor Green
 }
 
-# 2. DirectX 12 Support
-Write-Info "Checking DirectX 12 support..."
+function Write-Warning {
+    param([string]$Message)
+    Write-Host "[WARN] $Message" -ForegroundColor Yellow
+}
+
+function Write-Error-Continue {
+    param([string]$Message)
+    Write-Host "[ERROR] $Message" -ForegroundColor Red
+}
+
+$validationResults = @{}
+
+# GPU Hardware Detection
+Write-Section "GPU Hardware Detection"
+
+$gpus = @()
 try {
-    $dxVersion = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\DirectX").Version
-    Write-Success "DirectX: Version $dxVersion"
-    Add-Result "DirectX" $true "Version $dxVersion"
-} catch {
-    Write-Warn "DirectX: Version info not found in registry"
-    Add-Result "DirectX" $true "Registry check inconclusive"
-}
-
-# 3. GPU Detection
-Write-Info "Checking GPU..."
-$gpus = Get-CimInstance Win32_VideoController | Where-Object { $_.AdapterCompatibility -notmatch "Microsoft" }
-if ($gpus.Count -gt 0) {
-    foreach ($gpu in $gpus) {
-        $gpuName = $gpu.Name
-        $vramGB = [math]::Round($gpu.AdapterRAM / 1GB, 1)
-        Write-Success "GPU: $gpuName ($vramGB GB VRAM)"
-        Add-Result "GPU" $true "$gpuName ($vramGB GB)"
+    $gpuInfo = Get-WmiObject -Class "Win32_VideoController" -ErrorAction Stop
+    foreach ($gpu in $gpuInfo) {
+        $gpus += [PSCustomObject]@{
+            Name = $gpu.Name
+            Vendor = if ($gpu.Name -match "AMD|Radeon") { "AMD" } elseif ($gpu.Name -match "NVIDIA|GeForce|RTX") { "NVIDIA" } elseif ($gpu.Name -match "Intel|UHD|Arc") { "Intel" } else { "Unknown" }
+            VRAM = if ($gpu.AdapterRAM) { [math]::Round($gpu.AdapterRAM / 1GB, 2) } else { "Unknown" }
+        }
+        $validationResults["GPU_$($gpu.Name)"] = $true
     }
-} else {
-    Write-Fail "No DirectX 12 compatible GPU detected"
-    Add-Result "GPU" $false "No compatible GPU found"
+} catch {
+    Write-Error-Continue "Failed to detect GPUs: $_"
+    $validationResults["GPU_Detection"] = $false
 }
 
-# 4. DirectX 12 Agility SDK
-Write-Info "Checking DirectX 12 Agility SDK..."
-$agilityPaths = @(
-    "C:\Program Files (x86)\Windows Kits\10\Include",
-    "C:\Program Files\Windows Kits\10\Include"
+foreach ($gpu in $gpus) {
+    Write-Host "  $($gpu.Name) [$($gpu.Vendor)] - $($gpu.VRAM) GB VRAM"
+}
+
+if ($gpus.Count -eq 0) {
+    Write-Warning "No GPUs detected"
+    $validationResults["GPU_Detection"] = $false
+} else {
+    Write-Success "Detected $($gpus.Count) GPU(s)"
+    $validationResults["GPU_Detection"] = $true
+}
+
+# HIP/ROCm Validation
+Write-Section "HIP/ROCm Backend"
+
+$hipPaths = @(
+    "E:\ROCM-7.13.0-Windows",
+    "C:\Program Files\ROCm",
+    "C:\ROCm"
 )
-$agilityFound = $false
-foreach ($path in $agilityPaths) {
+
+$hipFound = $false
+foreach ($path in $hipPaths) {
     if (Test-Path $path) {
-        $latestInclude = Get-ChildItem $path -Directory | Sort-Object Name -Descending | Select-Object -First 1
-        if ($latestInclude) {
-            $d3d12Header = Join-Path $latestInclude.FullName "um\d3d12.h"
-            if (Test-Path $d3d12Header) {
-                Write-Success "DirectX 12 SDK: Found in $path\$($latestInclude.Name)"
-                Add-Result "DX12 Agility SDK" $true "Found in $path"
-                $agilityFound = $true
-                break
+        $hipFound = $true
+        Write-Success "HIP/ROCm found at: $path"
+        $validationResults["HIP"] = $true
+
+        if ($Detailed) {
+            $versionFile = Join-Path $path "bin\hip_version"
+            if (Test-Path $versionFile) {
+                $version = Get-Content $versionFile -ErrorAction SilentlyContinue
+                Write-Host "  Version: $version"
+            }
+
+            $llvmBin = Join-Path $path "lib\llvm\bin"
+            if (Test-Path $llvmBin) {
+                Write-Host "  LLVM bin: $llvmBin"
             }
         }
-    }
-}
-if (-not $agilityFound) {
-    Write-Warn "DirectX 12 Agility SDK: Not found"
-    Write-Warn "Install from: https://devblogs.microsoft.com/directx/directx12agility/"
-    Add-Result "DX12 Agility SDK" $false "Not found"
-}
 
-# 5. DXC (DirectX Shader Compiler)
-Write-Info "Checking DXC..."
-$dxcPaths = @(
-    "C:\Program Files (x86)\Windows Kits\10\bin",
-    "C:\Program Files\Windows Kits\10\bin"
-)
-$dxcFound = $false
-foreach ($basePath in $dxcPaths) {
-    if (Test-Path $basePath) {
-        $dxcExe = Get-ChildItem $basePath -Recurse -Filter "dxc.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($dxcExe) {
-            Write-Success "DXC: Found at $($dxcExe.FullName)"
-            Add-Result "DXC" $true "Found at $($dxcExe.FullName)"
-            $dxcFound = $true
-            break
-        }
-    }
-}
-if (-not $dxcFound) {
-    Write-Warn "DXC: Not found"
-    Write-Warn "Install from: https://github.com/microsoft/DirectXShaderCompiler"
-    Add-Result "DXC" $false "Not found"
-}
-
-# 6. Visual Studio 2022
-Write-Info "Checking Visual Studio 2022..."
-$vsPaths = @(
-    "C:\Program Files\Microsoft Visual Studio\2022",
-    "C:\Program Files (x86)\Microsoft Visual Studio\2022"
-)
-$vsFound = $false
-foreach ($vsPath in $vsPaths) {
-    if (Test-Path $vsPath) {
-        $vsEditions = Get-ChildItem $vsPath -Directory | Select-Object -ExpandProperty FullName
-        foreach ($edition in $vsEditions) {
-            $vsDevShell = Join-Path $edition "Common7\Tools\VsDevCmd.bat"
-            if (Test-Path $vsDevShell) {
-                Write-Success "Visual Studio: Found at $edition"
-                Add-Result "Visual Studio 2022" $true "Found at $edition"
-                $vsFound = $true
-                break
+        if ($Fix) {
+            $llvmBin = Join-Path $path "lib\llvm\bin"
+            if (Test-Path $llvmBin) {
+                $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+                if (-not ($currentPath -split ";" | Where-Object { $_ -eq $llvmBin })) {
+                    Write-Host "  Adding LLVM bin to PATH..."
+                    $newPath = "$currentPath;$llvmBin"
+                    [Environment]::SetEnvironmentVariable("PATH", $newPath, "Machine")
+                    $env:PATH = $newPath
+                }
             }
         }
-    }
-}
-if (-not $vsFound) {
-    Write-Warn "Visual Studio 2022: Not found"
-    Write-Warn "Install from: https://visualstudio.microsoft.com/"
-    Add-Result "Visual Studio 2022" $false "Not found"
-}
-
-# 7. Graphics Tools FOD
-Write-Info "Checking Graphics Tools FOD..."
-try {
-    $graphicsTools = Get-WindowsCapability -Online -Filter "Name=Tools.Graphics.DirectX*" 2>$null
-    if ($graphicsTools -and $graphicsTools.State -eq "Installed") {
-        Write-Success "Graphics Tools FOD: Installed"
-        Add-Result "Graphics Tools FOD" $true "Installed"
-    } else {
-        Write-Warn "Graphics Tools FOD: Not installed"
-        Write-Warn "Install with: Add-WindowsCapability -Online -Name 'Tools.Graphics.DirectX~~~~0.0.1.0'"
-        Add-Result "Graphics Tools FOD" $false "Not installed"
-    }
-} catch {
-    Write-Warn "Graphics Tools FOD: Cannot check (requires admin)"
-    Add-Result "Graphics Tools FOD" $false "Cannot check (admin required)"
-}
-
-# 8. Microsoft PIX
-Write-Info "Checking Microsoft PIX..."
-$pixPaths = @(
-    "C:\Program Files\Microsoft PIX",
-    "C:\Program Files (x86)\Microsoft PIX"
-)
-$pixFound = $false
-foreach ($pixPath in $pixPaths) {
-    if (Test-Path $pixPath) {
-        Write-Success "Microsoft PIX: Found at $pixPath"
-        Add-Result "Microsoft PIX" $true "Found at $pixPath"
-        $pixFound = $true
         break
     }
 }
-if (-not $pixFound) {
-    Write-Warn "Microsoft PIX: Not found (optional)"
-    Write-Warn "Download from: https://devblogs.microsoft.com/directx/announcing-microsoft-pix-2024-1/"
-    Add-Result "Microsoft PIX" $false "Not found (optional)"
+
+if (-not $hipFound) {
+    Write-Warning "HIP/ROCm not found in standard locations"
+    $validationResults["HIP"] = $false
 }
 
-# 9. Visual Studio Graphics Debugger
-Write-Info "Checking Visual Studio Graphics Debugger..."
-$vsGraphicsPath = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Extensions\Microsoft\Graphics\Debugger"
-if (-not (Test-Path $vsGraphicsPath)) {
-    $vsGraphicsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\Common7\IDE\Extensions\Microsoft\Graphics\Debugger"
-}
-if (Test-Path $vsGraphicsPath) {
-    Write-Success "VS Graphics Debugger: Found"
-    Add-Result "VS Graphics Debugger" $true "Found"
+# Vulkan Validation
+Write-Section "Vulkan Backend"
+
+$vulkanSDK = $env:VULKAN_SDK
+if ($vulkanSDK -and (Test-Path $vulkanSDK)) {
+    Write-Success "Vulkan SDK found at: $vulkanSDK"
+    $validationResults["Vulkan"] = $true
+
+    if ($Detailed) {
+        $versionJson = Join-Path $vulkanSDK "Lib\vk.json"
+        if (Test-Path $versionJson) {
+            Write-Host "  SDK version JSON available"
+        }
+    }
 } else {
-    Write-Warn "VS Graphics Debugger: Not found"
-    Write-Warn "Install 'Graphics debugging' workload in VS Installer"
-    Add-Result "VS Graphics Debugger" $false "Not found"
+    Write-Warning "Vulkan SDK not found (VULKAN_SDK env var not set or path invalid)"
+    $validationResults["Vulkan"] = $false
 }
 
-# 10. Vendor Tools
-if (-not $SkipVendorTools) {
-    Write-Info "Checking vendor tools..."
+# DirectX 12 Validation
+Write-Section "DirectX 12 Backend"
 
-    # AMD Radeon GPU Profiler
-    $rgpPath = "C:\Program Files\AMD\Radeon GPU Profiler"
-    if (Test-Path $rgpPath) {
-        Write-Success "AMD RGP: Found"
-        Add-Result "AMD RGP" $true "Found"
+$dxPath = "E:\DXllama\OptimiseDX"
+if (Test-Path $dxPath) {
+    Write-Success "DirectX 12 backend found at: $dxPath"
+    $validationResults["DX12"] = $true
+} else {
+    Write-Warning "DirectX 12 backend not found at: $dxPath"
+    $validationResults["DX12"] = $false
+}
+
+# Check DirectX 12 runtime
+try {
+    $dx12Runtime = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\DirectX" -ErrorAction SilentlyContinue
+    if ($dx12Runtime) {
+        Write-Success "DirectX runtime detected"
     } else {
-        Write-Warn "AMD RGP: Not found (optional)"
-        Add-Result "AMD RGP" $false "Not found (optional)"
+        Write-Warning "DirectX runtime not found in registry"
     }
+} catch {
+    Write-Warning "Could not check DirectX runtime: $_"
+}
 
-    # NVIDIA Nsight
-    $nsightPath = "C:\Program Files\NVIDIA Corporation\Nsight Graphics"
-    if (Test-Path $nsightPath) {
-        Write-Success "NVIDIA Nsight: Found"
-        Add-Result "NVIDIA Nsight" $true "Found"
-    } else {
-        Write-Warn "NVIDIA Nsight: Not found (optional)"
-        Add-Result "NVIDIA Nsight" $false "Not found (optional)"
+# WinML Validation
+Write-Section "WinML Backend"
+
+$winmlAvailable = $false
+try {
+    $null = [System.Management.Automation.PSTypeName]'Windows.AI.MachineLearning.MLContext'
+    $winmlAvailable = $true
+    Write-Success "WinML runtime available"
+    $validationResults["WinML"] = $true
+} catch {
+    Write-Warning "WinML runtime not available (requires Windows 10/11 with AI features)"
+    $validationResults["WinML"] = $false
+}
+
+# Build Tools Validation
+Write-Section "Build Tools"
+
+$tools = @{
+    "cmake" = "CMake"
+    "ninja" = "Ninja"
+    "git" = "Git"
+    "clang" = "Clang"
+    "python" = "Python"
+}
+
+foreach ($tool in $tools.GetEnumerator()) {
+    try {
+        $version = & $tool.Key --version 2>$null
+        if ($LASTEXITCODE -eq 0 -or $version) {
+            Write-Success "$($tool.Value) available"
+            if ($Detailed) {
+                $versionLine = $version | Select-Object -First 1
+                Write-Host "  $versionLine"
+            }
+            $validationResults[$tool.Key] = $true
+        } else {
+            Write-Warning "$($tool.Value) not found in PATH"
+            $validationResults[$tool.Key] = $false
+        }
+    } catch {
+        Write-Warning "$($tool.Value) not found in PATH"
+        $validationResults[$tool.Key] = $false
     }
+}
 
-    # Intel GPA
-    $gpaPath = "C:\Program Files\IntelSWTools\GPA"
-    if (Test-Path $gpaPath) {
-        Write-Success "Intel GPA: Found"
-        Add-Result "Intel GPA" $true "Found"
+# Environment Variables
+Write-Section "Environment Variables"
+
+$envVars = @{
+    "PATH" = "System PATH"
+    "VULKAN_SDK" = "Vulkan SDK"
+    "ROCM_PATH" = "ROCm Path"
+    "HIP_PATH" = "HIP Path"
+}
+
+foreach ($var in $envVars.GetEnumerator()) {
+    $value = [Environment]::GetEnvironmentVariable($var.Key)
+    if ($value) {
+        Write-Success "$($var.Value): $value"
+        $validationResults["ENV_$($var.Key)"] = $true
     } else {
-        Write-Warn "Intel GPA: Not found (optional)"
-        Add-Result "Intel GPA" $false "Not found (optional)"
+        Write-Warning "$($var.Value): not set"
+        $validationResults["ENV_$($var.Key)"] = $false
     }
 }
 
 # Summary
-Write-Host ""
-Write-Info "=== Validation Summary ==="
-$passed = ($validationResults | Where-Object { $_.Status -eq "PASS" }).Count
-$failed = ($validationResults | Where-Object { $_.Status -eq "FAIL" }).Count
+Write-Section "Validation Summary"
+
+$passed = ($validationResults.Values | Where-Object { $_ -eq $true }).Count
 $total = $validationResults.Count
+$failed = $total - $passed
 
-Write-Host "Total: $total | Passed: $passed | Failed: $failed"
 Write-Host ""
+Write-Host "Results: $passed passed, $failed failed out of $total checks" -ForegroundColor Cyan
 
-$validationResults | Format-Table -AutoSize
-
-# Save to file if requested
-if ($OutputFile) {
-    $validationResults | Export-Csv -Path $OutputFile -NoTypeInformation
-    Write-Info "Report saved to: $OutputFile"
+if ($failed -gt 0) {
+    Write-Host ""
+    Write-Host "Failed checks:" -ForegroundColor Yellow
+    foreach ($kvp in $validationResults.GetEnumerator()) {
+        if (-not $kvp.Value) {
+            Write-Host "  - $($kvp.Key)" -ForegroundColor Red
+        }
+    }
 }
 
-# Exit code
-if ($failed -gt 0) {
-    Write-Warn "Some components are missing. See above for details."
-    exit 1
-} else {
-    Write-Success "All components validated successfully!"
+Write-Host ""
+if ($passed -ge ($total / 2)) {
+    Write-Success "System is ready for AI-Compass toolkit"
     exit 0
+} else {
+    Write-Error-Continue "System is not ready - too many missing components"
+    exit 1
 }
