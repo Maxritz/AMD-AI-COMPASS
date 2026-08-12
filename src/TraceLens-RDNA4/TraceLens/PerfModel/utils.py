@@ -1,0 +1,150 @@
+###############################################################################
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+"""
+Utils. for perf. model.
+"""
+
+
+def optional_int(value, default=None):
+    """Parse *value* as int, returning *default* when conversion fails."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def optional_float(value, default=0.0):
+    """Parse *value* as float, returning *default* when conversion fails."""
+    if value in ("", "None", None):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def add_simulation_time_columns(
+    dict_metrics,
+    simulated_time,
+    gflops,
+    bytes_moved,
+    busy_kernel_time,
+):
+    """
+    Add simulated time columns when using Origami
+    """
+    if not simulated_time:
+        return
+    dict_metrics["Origami Time (µs)"] = simulated_time
+    dict_metrics["Origami TFLOPS/s"] = (
+        (gflops / 1e3) / (simulated_time / 1e6) if simulated_time > 0 else float("nan")
+    )
+    if bytes_moved is not None:
+        dict_metrics["Origami TB/s"] = (
+            (bytes_moved / 1e12) / (simulated_time / 1e6)
+            if simulated_time > 0
+            else float("nan")
+        )
+    else:
+        dict_metrics["Origami TB/s"] = float("nan")
+    dict_metrics["Pct Origami"] = (
+        (simulated_time / busy_kernel_time) * 100
+        if busy_kernel_time > 0
+        else float("nan")
+    )
+
+
+def name2bpe(name):
+    """
+    This function maps a data type name to the number of bytes per element.
+    Args:
+        name (str): The name of the data type.
+    Returns:
+        int: The number of bytes per element.
+    """
+    dict_bpe2dtype = {
+        8: ["double", "long int"],
+        4: ["float", "scalar", "int"],
+        2: ["c10::half", "c10::bfloat16"],
+        1: [
+            "c10::float8_e4m3fnuz",
+            "c10::float8_e4m3fn",
+            "c10::float8_e5m2",
+            "c10::float8_e8m0fnu",
+            "unsigned char",
+            "signed char",
+            "fp8",
+            # Float4_e2m1fn_x2 packs two FP4 values into one byte. Trace tensor
+            # shapes already reflect the packed layout (K_packed = K/2), so we
+            # use bpe=1 for the packed-pair element and let callers apply the
+            # ×2 K-unpacking explicitly when modelling FLOPs.
+            "c10::float4_e2m1fn_x2",
+            "fp4",
+        ],
+    }
+    dict_dtype2bpe = {
+        dtype: bpe for bpe, dtypes in dict_bpe2dtype.items() for dtype in dtypes
+    }
+    if name is None:
+        return None
+    return dict_dtype2bpe.get(name.lower(), None)
+
+
+def simulation_dtype_map(dtype):
+    """
+    This function maps a PyTorch data type to a simulation data type.
+    Args:
+        dtype (str): The name of the pytorch data type.
+    Returns:
+        str: The name of the PyTorch data type.
+    """
+    dict_dtype2simulation = {
+        "fp32": "float",
+        "fp64": "double",
+        "fp16": "c10::half",
+        "bf16": "c10::bfloat16",
+        "fp8": "c10::float8_e4m3fnuz",
+    }
+    return dict_dtype2simulation.get(dtype.lower(), None)
+
+
+def torch_dtype_map(dtype):
+    """
+    This function maps a PyTorch data type to a simulation data type.
+    Args:
+        dtype (str): The name of the PyTorch data type.
+    Returns:
+        str: The name of the simulation data type.
+    """
+    dict_dtype2simulation = {
+        "float": "fp32",
+        "double": "fp64",
+        "c10::half": "fp16",
+        "c10::bfloat16": "bf16",
+        "c10::float8_e4m3fnuz": "fp8",
+        "unsigned char": "fp8",
+        "fp8": "fp8",
+        "fp4": "fp4",
+        "mxfp4": "fp4",
+        "c10::float4_e2m1fn_x2": "fp4",
+        "c10::float8_e4m3fn": "fp8",
+    }
+    return dict_dtype2simulation.get(dtype.lower(), None)
+
+
+def parse_bool(input):
+    if isinstance(input, bool):
+        return input
+    if input is None:
+        return False
+    if isinstance(input, str):
+        value = input.strip().lower()
+        if value in {"true", "1"}:
+            return True
+        if value in {"false", "0", ""}:
+            return False
+    return bool(input)

@@ -1,0 +1,53 @@
+# Benchmark Docker Image Mapping
+# Format: framework -> gpu_arch -> docker_image
+#
+# GPU Architecture Identifiers:
+#   AMD CDNA: gfx942 (MI300X), gfx950 (MI355X)
+#   AMD RDNA4: gfx1201 (RX 9070 series)
+#   NVIDIA: sm_80 (A100), sm_90 (H100/H200), sm_100 (B200)
+#
+# Usage:
+#   ImageSelector automatically selects the appropriate image based on detected GPU.
+#   If the architecture is not found, an error will be raised.
+
+vllm:
+  # AMD GPUs
+  gfx942: "vllm/vllm-openai-rocm:v0.23.0"
+  gfx950: "vllm/vllm-openai-rocm:v0.23.0"
+  gfx1201: "vllm/vllm-openai-rocm:v0.23.0"  # RDNA4 (Windows ROCm 7.3+)
+  gfx1030: "vllm/vllm-openai-rocm:v0.23.0"  # RDNA2 (RX 6000 series, ROCm 6.x)
+  # NVIDIA GPUs
+  sm_80: "vllm/vllm-openai:v0.23.0"
+  sm_90: "vllm/vllm-openai:v0.23.0"
+  sm_100: "vllm/vllm-openai:v0.23.0"
+
+sglang:
+  # AMD GPUs
+  gfx942: "lmsysorg/sglang:v0.5.12-rocm720-mi30x"
+  gfx950: "lmsysorg/sglang:v0.5.12-rocm720-mi35x"
+  gfx1201: "lmsysorg/sglang:v0.5.12-rocm720-mi35x"  # RDNA4 uses same image
+  gfx1030: "lmsysorg/sglang:v0.5.12-rocm720-mi35x"  # RDNA2 uses same image
+  # NVIDIA GPUs
+  sm_80: "lmsysorg/sglang:v0.5.12-cu130-amd64-runtime"
+  sm_90: "lmsysorg/sglang:v0.5.12-cu130-amd64-runtime"
+  sm_100: "lmsysorg/sglang:v0.5.12-cu130-amd64-runtime"
+
+# Atom exposes an OpenAI-compatible HTTP server (atom.entrypoints.openai_server)
+# that is wire-compatible with vLLM, so the bench client reuses --backend vllm.
+# Pin a specific tag via --docker-image when reproducibility matters.
+#
+# Atom is AMD-only: there is no NVIDIA/CUDA atom build, so no sm_* entries are
+# listed. Requesting atom on an NVIDIA arch raises an error in ImageSelector
+# rather than silently falling back to a vLLM image that cannot run the atom
+# server.
+atom:
+  # AMD GPUs
+  gfx942: "rocm/atom:latest"
+  gfx950: "rocm/atom:latest"
+  gfx1201: "rocm/atom:latest"  # RDNA4 (Windows ROCm 7.3+)
+  gfx1030: "rocm/atom:latest"  # RDNA2 (RX 6000 series)
+
+# NOTE: xDiT is intentionally NOT listed here. It is a server-less (scriptable)
+# diffusion workload that runs natively via the `xdit` CLI (no Docker image), so
+# this file stays a pure Docker-image mapping. BenchmarkConfig enforces
+# run_mode=local for framework=xdit instead.

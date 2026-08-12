@@ -1,0 +1,1073 @@
+###############################################################################
+# Copyright (c) 2025 - 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+import contextlib
+import json
+import logging
+import os
+import re
+import glob
+import sys
+import tempfile
+from collections import defaultdict
+
+try:
+    from enum import StrEnum
+except ImportError:
+    try:
+        from backports.strenum import StrEnum
+    # fallback for Python 3.10
+    except ImportError:
+        from strenum import StrEnum
+from typing import List, Dict, Callable, Iterable, Tuple, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# Benign native XLA logs (id > INT_MAX, from packed HLO instruction ids in xprof
+# 2.20.1). Emitted to fd 2 before absl init, so only filterable at the fd level.
+_NATIVE_LOG_NOISE = re.compile(
+    r"Instruction with id > INT_MAX"
+    r"|not intended behavior and might indicate a bug in the HLO proto serialization"
+    r"|hlo_instruction\.cc"
+)
+
+
+@contextlib.contextmanager
+def suppress_native_hlo_logs():
+    """Filter benign native XLA ``id > INT_MAX`` stderr during a call.
+
+    Set ``TRACELENS_VERBOSE_NATIVE_LOGS=1`` to disable filtering.
+    """
+    if os.environ.get("TRACELENS_VERBOSE_NATIVE_LOGS"):
+        yield
+        return
+
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    tmp = tempfile.TemporaryFile(mode="w+b")
+    try:
+        os.dup2(tmp.fileno(), 2)
+        yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+        tmp.seek(0)
+        for raw in tmp.read().splitlines(keepends=True):
+            try:
+                line = raw.decode("utf-8", "replace")
+            except Exception:
+                os.write(2, raw)
+                continue
+            if not _NATIVE_LOG_NOISE.search(line):
+                os.write(2, raw)
+        tmp.close()
+
+
+# generic data loader class for json, json.gz, or tensorboard pb files
+# tensorboard pb files are useful for Jax in particular because the json.gz traces produced by jax can have incorrect timestamps and missing information
+class DataLoader:
+    @staticmethod
+    def load_data(filename_path: str, save_preprocessed: bool = False) -> dict:
+        if filename_path.endswith("pb"):
+            try:
+                from xprof.convert import raw_to_tool_data as convert
+
+                converter_lib = "xprof"
+            except ImportError:
+                from tensorboard_plugin_profile.convert import (
+                    raw_to_tool_data as convert,
+                )
+
+                converter_lib = "tensorboard-plugin-profile"
+                logger.warning(
+                    "xprof not available, falling back to tensorboard-plugin-profile "
+                    "for trace conversion. Install xprof for JAX 0.8+ support."
+                )
+
+            with suppress_native_hlo_logs():
+                data, _ = convert.xspace_to_tool_data(
+                    [filename_path], "trace_viewer@^", {}
+                )
+            if data is None:
+                raise RuntimeError(
+                    f"Trace conversion using '{converter_lib}' returned None for "
+                    f"{filename_path}. Ensure the file exists and the output directory "
+                    "is writable (cache files may need to be written)."
+                )
+            data = data.decode("utf-8")  # we get bytes back from the call above
+        elif filename_path.endswith("json.gz"):
+            import gzip
+
+            with gzip.open(filename_path, "r") as fin:
+                data = fin.read()  # Keep as bytes for orjson
+        elif filename_path.endswith("json"):
+            with open(filename_path, "rb") as fin:  # Read as bytes for orjson
+                data = fin.read()
+        else:
+            raise ValueError("Unknown file type", filename_path)
+        if save_preprocessed:
+            data_str = data if isinstance(data, str) else data.decode("utf-8")
+            with open(filename_path.replace("pb", "processed.json"), "w") as writefile:
+                writefile.write(data_str)
+
+        # Use orjson for faster parsing (23% faster than stdlib json)
+        # Falls back to json if orjson not available
+        try:
+            import orjson
+
+            return orjson.loads(data)
+        except ImportError:
+            logger.warning(
+                "orjson not available, falling back to standard json. "
+                "Install orjson for faster JSON parsing: pip install orjson"
+            )
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
+            return json.loads(data)
+
+
+class JaxProfileProcessor:
+    gemm_columns = ["Batch", "M", "N", "K", "Beta", "Type"]
+
+    # Substrings used to detect parseable HLO graph-viewer text lines.
+    # The legacy list only covered float types; integer/bool lines were skipped and
+    # later showed up as "Missing hlo_op" when the profiler trace referenced them.
+    _HLO_LINE_ELEMENT_TYPE_HINTS_LEGACY = [
+        "get-tuple-element",
+        "bf16",
+        "f8",
+        "f16",
+        "f32",
+        "f64",
+    ]
+    _HLO_LINE_ELEMENT_TYPE_HINTS = _HLO_LINE_ELEMENT_TYPE_HINTS_LEGACY + [
+        "s32",
+        "s64",
+        "u32",
+        "u64",
+        "pred",
+    ]
+
+    @staticmethod
+    def _should_parse_hlo_graph_line(line: str) -> bool:
+        """Return True if a graph-viewer text line should be parsed into hlo_ops."""
+        line_processed = line.strip()
+        if not line_processed or line_processed.startswith("HloModule "):
+            return False
+        if line_processed.startswith("ROOT"):
+            return False
+        if "metadata" in line_processed and not re.search(r"\)$", line_processed):
+            return True
+        return any(
+            hint in line_processed
+            for hint in JaxProfileProcessor._HLO_LINE_ELEMENT_TYPE_HINTS
+        )
+
+    @staticmethod
+    def process_xla_file(xla_file_name):
+        hlo_ops = {}
+        with open(xla_file_name, "r") as f:
+            for line in f:
+                JaxProfileProcessor.process_line(hlo_ops, line)
+        return hlo_ops
+
+    @staticmethod
+    def process_protobuf_file(protobuf_file_name, module_name):
+        try:
+            from xprof.convert import raw_to_tool_data as convert
+        except ImportError:
+            from tensorboard_plugin_profile.convert import (
+                raw_to_tool_data as convert,
+            )
+
+        dir_name = os.path.dirname(os.path.abspath(protobuf_file_name)) + "/"
+        hlo_filename = glob.glob(dir_name + os.path.sep + module_name + "*hlo_proto.pb")
+        if len(hlo_filename) != 1:
+            with suppress_native_hlo_logs():
+                convert.xspace_to_tool_names([protobuf_file_name])
+        hlo_filename = glob.glob(dir_name + os.path.sep + module_name + "*hlo_proto.pb")
+        if len(hlo_filename) > 1:
+            logger.warning(f"Multiple matching hlo_filenames: {hlo_filename}")
+        elif len(hlo_filename) == 0:
+            logger.warning(
+                f"No matching hlo_filenames for module '{module_name}' in {dir_name}. "
+                "HLO metadata will be unavailable."
+            )
+            return {}
+
+        module_name = os.path.splitext(
+            os.path.splitext(os.path.basename(hlo_filename[0]))[0]
+        )[0]
+
+        hlo_ops = {}
+        graph_viewer_options = {
+            "node_name": "",
+            "module_name": module_name,
+            "graph_width": 2,
+            "show_metadata": True,
+            "merge_fusion": True,
+            "type": "long_txt",
+        }
+        params = {"graph_viewer_options": graph_viewer_options}
+        with suppress_native_hlo_logs():
+            data, _ = convert.xspace_to_tool_data([dir_name], "graph_viewer^", params)
+        data = data.decode("utf-8").split("\n")
+        for line in data:
+            JaxProfileProcessor.process_line(hlo_ops, line)
+        JaxProfileProcessor._resolve_operand_references(hlo_ops)
+        return hlo_ops
+
+    @staticmethod
+    def _resolve_operand_references(hlo_ops: dict):
+        """Resolve operand references that lack inline type info.
+
+        Some graph viewer backends (e.g. xprof >= 2.20.0) emit operands as bare
+        references like ``%bitcast.39.0`` instead of ``bf16[...] %bitcast.39.0``.
+        When the referenced op exists in *hlo_ops*, substitute its output type so
+        downstream consumers (parse_operands, parse_conv_metadata) see the expected
+        shape strings.
+        """
+        for op_data in hlo_ops.values():
+            operands = op_data.get("operands")
+            if not isinstance(operands, list):
+                continue
+            resolved = []
+            for operand in operands:
+                if isinstance(operand, str) and operand.startswith("%"):
+                    ref_data = hlo_ops.get(operand)
+                    if ref_data and "output" in ref_data:
+                        resolved.append(ref_data["output"])
+                        continue
+                    logger.warning(
+                        "Unable to resolve HLO operand reference '%s'; "
+                        "HLO metadata for this operand may be incomplete.",
+                        operand,
+                    )
+                resolved.append(operand)
+            op_data["operands"] = resolved
+
+    @staticmethod
+    def process_line(hlo_ops: dict, line: str):
+        line_processed = line.strip()
+        if not JaxProfileProcessor._should_parse_hlo_graph_line(line_processed):
+            return False
+        k, v = JaxProfileProcessor.get_dict(hlo_ops, line_processed)
+        hlo_ops[k] = v
+        return True
+
+    # Async collectives in HLO text use *-start/*-done names; runtime traces may
+    # use numbered aliases (e.g. reduce-scatter.12 -> reduce-scatter-start).
+    _ASYNC_COLLECTIVE_FAMILIES = ("all-to-all", "reduce-scatter", "all-gather")
+
+    @staticmethod
+    def _normalize_hlo_op_key(hlo_op: str) -> str:
+        return hlo_op if hlo_op.startswith("%") else f"%{hlo_op}"
+
+    @staticmethod
+    def _collective_start_keys(module_ops: dict, family: str) -> list:
+        start_keys = sorted(k for k in module_ops if k.startswith(f"%{family}-start"))
+        if start_keys:
+            return start_keys
+        return sorted(k for k in module_ops if k.startswith(f"%{family}-done"))
+
+    @classmethod
+    def build_collective_hlo_aliases(cls, module_ops: dict, trace_hlo_ops) -> dict:
+        """Map numbered runtime collective tags to parsed HLO dump keys."""
+        aliases = {}
+        normalized_ops = {cls._normalize_hlo_op_key(op) for op in trace_hlo_ops}
+
+        for family in cls._ASYNC_COLLECTIVE_FAMILIES:
+            numbered = []
+            for op_key in normalized_ops:
+                if op_key in module_ops:
+                    continue
+                bare = op_key.lstrip("%")
+                prefix = f"{family}."
+                if not bare.startswith(prefix):
+                    continue
+                suffix = bare[len(prefix) :]
+                if suffix.isdigit():
+                    numbered.append((int(suffix), op_key))
+
+            if not numbered:
+                continue
+
+            start_keys = cls._collective_start_keys(module_ops, family)
+            if not start_keys:
+                continue
+
+            numbered.sort()
+            if len(start_keys) == 1:
+                for _, op_key in numbered:
+                    aliases[op_key] = start_keys[0]
+            else:
+                for idx, (_, op_key) in enumerate(numbered):
+                    aliases[op_key] = start_keys[min(idx, len(start_keys) - 1)]
+
+        return aliases
+
+    @classmethod
+    def resolve_hlo_op_key(cls, hlo_op: str, module_ops: dict, aliases=None):
+        """Resolve a trace hlo_op to a key present in module_ops."""
+        key = cls._normalize_hlo_op_key(hlo_op)
+        if key in module_ops:
+            return key
+        if aliases and key in aliases and aliases[key] in module_ops:
+            return aliases[key]
+
+        bare = key.lstrip("%")
+        match = re.match(
+            r"^(all-to-all|reduce-scatter|all-gather)\.(\d+)$",
+            bare,
+        )
+        if match:
+            start_keys = cls._collective_start_keys(module_ops, match.group(1))
+            if start_keys:
+                return start_keys[0]
+        return None
+
+    @staticmethod
+    def get_operands(operands):
+        operands = re.sub(r"^.*?\(", "", operands)
+        operands = re.sub(r"\).*?$", "", operands)
+        operands_m = re.findall(r"[bfs][0-9\[\]\{,a-z]*}", operands)
+        if operands_m:
+            return operands_m
+        return operands.split(",")
+
+    @staticmethod
+    def get_dict(hlo_ops: dict, line):
+        dict_line = {}
+        line = re.sub(r"\),", ")", line)
+        line = re.sub(r", ", ",", line)
+        line = re.sub(r" %", "%", line)
+        backend_config = re.search(
+            r"backend_config=\{[a-zA-Z_=\"\(\)\/ @.,:\[\]\{\}0-9-]*", line
+        )
+        metadata = re.search(r"metadata=\{[a-zA-Z_=\"\(\)\/ @.0-9-]*", line)
+        custom_call_target = re.search(
+            r"custom_call_target=\"[a-zA-Z_=\"\(\)\/ @.$0-9-]*", line
+        )
+        replica_groups = re.search(
+            r"replica_groups=(?P<replica_string>(?:\{(?:\{[0-9]+(?:,[0-9]+)*\}(?:,\{[0-9]+(?:,[0-9]+)*\})*)\}|\[[0-9]+(?:,[0-9]+)*\]<=\[[0-9]+(?:,[0-9]+)*\])(?:T\([0-9,]+\)\s+dimensions=\{[0-9,]*\})?)",
+            line,
+        )
+        line = line.split(" ")
+        key = line[0]
+        dict_line["output"] = line[2]
+        dict_line["operands"] = operands = JaxProfileProcessor.get_operands(line[3])
+        dict_line["computation"] = "rest"
+        if metadata is not None:
+            dict_line["metadata"] = metadata[0]
+        if backend_config is not None:
+            dict_line["backend_config"] = backend_config[0]
+        if custom_call_target is not None:
+            gemm_keys = ["matmul", "cublas"]
+            dict_line["custom_call_target"] = custom_call_target[0]
+            if any(k in dict_line["custom_call_target"] for k in gemm_keys):
+                if "f8" in str(custom_call_target[0]):
+                    dict_line["type"] = "fp8"
+                    dict_line["computation"] = "gemm"
+                else:
+                    gemm_type = JaxProfileProcessor.get_operand_type(
+                        hlo_ops, operands[0]
+                    )
+                    if not all(
+                        JaxProfileProcessor.get_operand_type(hlo_ops, o) == gemm_type
+                        for o in operands[1:]
+                    ):
+                        raise Exception("Input operand type mismatch", line)
+                    dict_line["type"] = gemm_type
+                    dict_line["computation"] = "gemm"
+        if replica_groups is not None:
+            dict_line["replica_groups"] = replica_groups["replica_string"]
+
+        return (key, dict_line)
+
+    @staticmethod
+    def get_operand_type(hlo_ops: dict, operand: str) -> str:
+        if "fusion," in operand:
+            operand = operand.strip("fusion,")
+        dtypes = ["bf16", "f16", "f32", "f8", "fp8"]
+        # if the operand is a slice of something else, then the type might be at the beginning of the operand name
+        for t in dtypes:
+            if operand.startswith(t):
+                return t
+        # otherwise look it up
+        output = hlo_ops[operand]["output"]
+        for t in dtypes:
+            if output.startswith(t):
+                return t
+        return None
+
+    @staticmethod
+    def process_gemm_ops(hlo_ops: dict):
+        def get_sizes(str_size):
+            match = re.search(r".*\[(.*)\]", str_size)
+            if match is not None:
+                m = match.group(1)
+                s = m.split(",")
+                if len(s) > 3:
+                    raise ValueError("tensor size is more than 3?", str_size)
+                return s
+
+            else:
+                raise ValueError(str_size)
+
+        dtypes = ["bf16", "f16", "f32", "f8", "fp8"]
+        gemm_dict = {}
+        for opname, op in hlo_ops.items():
+            if "gemm" in op["computation"].lower():
+                if "backend_config" not in op:
+                    raise ValueError("Gemm backend config information mnissing!", op)
+                backend_config = op["backend_config"]
+                epilogue_bias = (
+                    json.loads(backend_config[len("backend_config=") :])[
+                        "gemm_backend_config"
+                    ]["epilogue"]
+                    == "BIAS"
+                )
+                beta = (
+                    re.search(r"\"beta\":[01],", backend_config)[0]
+                    .split(":")[1]
+                    .split(",")[0]
+                )
+                lhs_dim = (
+                    re.search(
+                        r"\"lhs_contracting_dimensions\":\[[\"012]*\]", backend_config
+                    )[0]
+                    .split(":")[1]
+                    .split('"')[1]
+                )
+                rhs_dim = (
+                    re.search(
+                        r"\"rhs_contracting_dimensions\":\[[\"012]*\]", backend_config
+                    )[0]
+                    .split(":")[1]
+                    .split('"')[1]
+                )
+                outputs = op["output"]
+                if outputs.startswith("("):
+                    if not outputs.endswith(")"):
+                        raise ValueError("Mistmatched parens in outputs in ", outputs)
+                    # Extract all tensor tokens from the tuple using regex so that
+                    # scalars (e.g. f32[]) and workspace buffers (e.g. s8[N]{0})
+                    # don't corrupt the split. Handles damax_output=true tuples like
+                    # (f8e5m2[M,N]{1,0}, f32[], s8[W]{0}).
+                    inner = outputs[1:-1]
+                    tokens = re.findall(
+                        r"[a-z0-9]+\[[^\]]*\]\{[^}]*\}|[a-z0-9]+\[[^\]]*\]", inner
+                    )
+                    tensor_tokens = [
+                        t
+                        for t in tokens
+                        if any(t.startswith(d) for d in dtypes) and not t.endswith("[]")
+                    ]
+                    if len(tensor_tokens) == 0:
+                        raise ValueError("Did not find wide output ", op)
+                    # Take the first tensor output; for FP8 GEMMs this is the result.
+                    sizes_string = [
+                        tensor_tokens[0],
+                        next(d for d in dtypes if tensor_tokens[0].startswith(d)),
+                    ]
+                else:
+                    sizes_string = outputs
+                operand_list = []
+                for opid in op["operands"]:
+                    if (
+                        "[" in opid
+                        and "]" in opid
+                        and not opid.split("[")[1].startswith("]")
+                    ):
+                        # pb format, shapes in operand list; exclude scalars e.g. f32[]
+                        operand_list.append(opid)
+                    elif "[" not in opid:
+                        # Strip /*index=N*/ prefix that appears in some FP8 operand refs
+                        hlo_key = re.sub(r"^/\*index=\d+\*/", "", opid).strip()
+                        if hlo_key not in hlo_ops:
+                            continue
+                        output = hlo_ops[hlo_key]["output"]
+                        if any(
+                            output.startswith(d) for d in dtypes + ["f8"]
+                        ) and not output.endswith("[]"):
+                            operand_list.append(hlo_ops[hlo_key]["output"])
+                if int(beta) == 1 and len(operand_list) < 3:
+                    print(
+                        "Bias is set, however onLy two operands found!", op
+                    )  # Warning?
+                if len(operand_list) > 4 or len(operand_list) == 0:
+                    raise ValueError("Invalid operand list", op, operand_list)
+                if len(operand_list) == 4 and not epilogue_bias:
+                    raise ValueError(
+                        "Found 4 operands, however beta and bias epilogue is nto set!",
+                        op,
+                        operand_list,
+                    )
+                c_order = re.search(r"\{[012,]*", sizes_string[0])[0].split("{")[1]
+                c = get_sizes(sizes_string[0])
+                a = get_sizes(operand_list[0])
+                b = get_sizes(operand_list[1])
+                batch = 1
+                if a[int(lhs_dim)] != b[int(rhs_dim)]:
+                    raise ValueError(
+                        "contracting dimension not matching", backend_config
+                    )
+                k = a[int(lhs_dim)]
+                a.remove(k)
+                b.remove(k)
+                if len(c) > 2:
+                    batch = c[0]
+                    a.remove(batch)
+                    b.remove(batch)
+                if "0,1" in c_order:
+                    n = b[0] if len(b) > 0 else 1
+                    m = a[0] if len(a) > 0 else 1
+                else:
+                    n = a[0] if len(a) > 0 else 1
+                    m = b[0] if len(b) > 0 else 1
+                gemm_dict[opname] = {
+                    "Batch": int(batch),
+                    "M": int(m),
+                    "N": int(n),
+                    "K": int(k),
+                    "Beta": int(beta),
+                    "Type": op["type"],
+                    "Computation": "gemm",
+                }
+        return gemm_dict
+
+
+# Trace event utilities to help with traces in the Google Trace Event format
+# https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview?tab=t.0
+# This trace event format includes both Pytorch and Jax traces (and anything that can be viewed in Perfetto)
+#
+# Shared by TraceEventUtils and JaxOpKeys; cannot use TraceEventUtils.CommunicationKeys
+# inside the nested JaxOpKeys class (outer class name is not bound yet during nested exec).
+COMMUNICATION_KEYS = ["rccl", "nccl"]
+
+# (kernel-name regex fragment, canonical collective name for inference)
+DEFAULT_CUSTOM_COLLECTIVE_PATTERNS: List[Tuple[str, str]] = [
+    (r"cross_device_reduce", "allreduce"),
+]
+
+DEFAULT_COMMUNICATION_REGEXES: List[re.Pattern] = [
+    re.compile(p, re.IGNORECASE) for p in COMMUNICATION_KEYS
+]
+
+DEFAULT_CUSTOM_COLLECTIVE_REGEXES: List[re.Pattern] = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern, _ in DEFAULT_CUSTOM_COLLECTIVE_PATTERNS
+]
+
+
+class TraceEventUtils:
+    class JaxOpKeys:
+
+        # keywords for splitting jax events
+        GemmKeys = ["Cijk", "gemm", "nvjet", "cublasLt"]
+        FABwdKeys = [
+            "FmhaBwd",
+            "flash_bprop",
+            "ck_fused_attn::dk_dv_reduce_thd",
+            "fmha_bwd",  # _ZN5aiter*fmha_bwd*
+        ]
+        FAFwdKeys = [
+            "FmhaFwd",
+            "flash_fprop",
+            "fmha_fwd",  # _ZN5aiter*fmha_fwd*
+        ]
+        FAV3Keys = ["kernel_func"]  # find a more precise way to do this
+        # "FillBuffer" was historically here but matches XLA buffer-init
+        # fusions that sit inside TE custom calls (issue #423); the
+        # metadata-aware fallback in JaxAnalyses.breakdown_compute_events
+        # now re-routes those by hlo_op instead.
+        ConvKeys = ["conv_", "conv.", "conv-"]
+        # "te_fused_attn" catches te_fused_attn_{forward,backward}_ffi
+        # XLA custom-call host events (issue #422 reproducer).
+        TEKeys = ["transformer_engine", "te_fused_attn"]
+        CommunicationKeys = COMMUNICATION_KEYS  # use the generic version until we can't
+        ClassCategories = {
+            "GEMM": GemmKeys,
+            "FA BWD": FABwdKeys,
+            "FA FWD": FAFwdKeys,
+            "FA V3": FAV3Keys,
+            "Conv": ConvKeys,
+            "TE": TEKeys,
+            "Communication rccl/nccl": CommunicationKeys,
+        }
+        UncategorizedEventKey = "Uncategorized Events"
+
+    class TraceKeys(StrEnum):
+        PID = "pid"
+        TID = "tid"
+        Phase = "ph"
+        Args = "args"
+        Name = "name"
+        TimeStamp = "ts"
+        Duration = "dur"
+        Category = "cat"
+        TimeEnd = "t_end"
+        UID = "UID"
+
+    class TracePhases(StrEnum):
+        DurationBegin = "B"
+        DurationEnd = "E"
+        Complete = "X"
+        Counter = "C"
+        Sample = "P"
+        Metadata = "M"
+
+    class MetadataFields(StrEnum):
+        ProcessName = "process_name"
+        ProcessLabels = "process_labels"
+        ProcessSort = "process_sort_index"
+        ThreadName = "thread_name"
+        ThreadSort = "thread_sort_index"
+
+    class ArgNames(StrEnum):
+        Name = "name"
+        SortIndex = "sort_index"
+        StreamIndex = "stream_index"
+        Labels = "labels"
+
+    class GpuEventCategories(StrEnum):
+        Kernel = "kernel"
+        MemSet = "gpu_memset"
+        MemCpy = "gpu_memcpy"
+
+    class CpuEventCategories(StrEnum):
+        Kernel = "cpu_op"
+        Runtime = "cuda_runtime"
+        Driver = "cuda_driver"
+
+    class JaxSpecialThreads(StrEnum):
+        FrameworkCallStack = "Framework Name Scope"
+        FrameworkOps = "Framework Ops"
+        XlaModules = "XLA Modules"
+        XlaOps = "XLA Ops"
+        pyXla = "py_xla"
+        SourceCode = "Source Code"
+        Steps = "Steps"
+        StreamPrefix = "Stream #"
+
+    class JaxKernelEventArgs(StrEnum):
+        hlo_module = "hlo module"
+        hlo_op = "hlo_op"
+        name = "name"  # name hierarchy, not always the same as the stack we see in framework ops
+        correlation_id = "correlation_id"  # can link to CPU threads
+        group_id = "group_id"
+
+    @staticmethod
+    def split_by_field(
+        events: List[dict], field: str, defaultKey: str = None
+    ) -> Dict[str, List]:
+        grouped = defaultdict(list)
+        for event in events:
+            grouped[event.get(field, defaultKey)].append(event)
+        return dict(grouped)
+
+    # Splits metadata and non-metadata events
+    # Merges metadata events into a dictionary hierarchy per process
+    # Process
+    # None: {process_name, process_sort_index}
+    # Thread_id: {thread_name, thread_sort_index} for each Thread_id
+    # non metadata is just a list of events
+    @staticmethod
+    def split_event_list(
+        events: List[dict],
+    ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
+        def get_metadata_val(x: dict) -> str:
+            arg_labels = {
+                TraceEventUtils.MetadataFields.ProcessName: TraceEventUtils.ArgNames.Name,
+                TraceEventUtils.MetadataFields.ProcessLabels: TraceEventUtils.ArgNames.Labels,
+                TraceEventUtils.MetadataFields.ProcessSort: TraceEventUtils.ArgNames.SortIndex,
+                TraceEventUtils.MetadataFields.ThreadName: TraceEventUtils.ArgNames.Name,
+                TraceEventUtils.MetadataFields.ThreadSort: TraceEventUtils.ArgNames.SortIndex,
+            }
+            key = x[TraceEventUtils.TraceKeys.Name]
+            return (key, x[TraceEventUtils.TraceKeys.Args][arg_labels[key]])
+
+        # Use defaultdict to avoid sorting and groupby complexity
+        metadata = defaultdict(lambda: defaultdict(dict))
+        rest = list[dict]()
+
+        for event in events:
+            if (
+                event[TraceEventUtils.TraceKeys.Phase]
+                != TraceEventUtils.TracePhases.Metadata
+            ):
+                rest.append(event)
+            else:
+                pid = event[TraceEventUtils.TraceKeys.PID]
+                tid = event.get(TraceEventUtils.TraceKeys.TID)
+                metadata_key, metadata_value = get_metadata_val(event)
+                metadata[pid][tid][metadata_key] = metadata_value
+
+        # Convert defaultdicts to regular dicts for return
+        return ({pid: dict(tid_dict) for pid, tid_dict in metadata.items()}, rest)
+
+    @staticmethod
+    def get_metadata(events: List[dict]) -> Dict[str, Dict[str, str]]:
+        return TraceEventUtils.split_event_list(events)[0]
+
+    @staticmethod
+    def non_metadata_events(events: List[dict]) -> List[Dict[str, Dict[str, str]]]:
+        return TraceEventUtils.split_event_list(events)[1]
+
+    @staticmethod
+    def default_categorizer(event: dict) -> str:
+        return event["cat"]
+
+    # TODO separate util class for Jax
+    # returns a curried function to categorizes events based on the
+    # metadata extracted from the events list
+    @staticmethod
+    def prepare_event_categorizer(events: list[dict]) -> Callable[[dict], str]:
+        metadata = TraceEventUtils.get_metadata(events)
+        return lambda event: TraceEventUtils.get_event_category(metadata, event)
+
+    # TODO separate util class for Jax
+    @staticmethod
+    def get_event_category(metadata: dict, event: dict):
+        if (
+            event.get(TraceEventUtils.TraceKeys.Phase)
+            == TraceEventUtils.TracePhases.Metadata
+        ):
+            return "metadata"
+        elif (
+            TraceEventUtils.TraceKeys.PID in event
+            and TraceEventUtils.TraceKeys.TID in event
+        ):
+            pid = event[TraceEventUtils.TraceKeys.PID]
+            tid = event[TraceEventUtils.TraceKeys.TID]
+            ThreadName = metadata[pid][tid][TraceEventUtils.MetadataFields.ThreadName]
+            if ThreadName == TraceEventUtils.JaxSpecialThreads.FrameworkCallStack:
+                return "cpu_op"
+            elif TraceEventUtils.JaxSpecialThreads.pyXla in ThreadName:
+                return "cpu_op"
+            elif ThreadName == TraceEventUtils.JaxSpecialThreads.XlaOps:
+                return "python function"
+            elif ThreadName.startswith("Stream"):
+                name = event[TraceEventUtils.TraceKeys.Name]
+                if any(name.lower().startswith(x) for x in ["copy", "memcpy"]):
+                    return "memcpy"
+                if any(name.lower().startswith(x) for x in ["memset"]):
+                    return "memset"
+                return "kernel"
+        return "Unknown"
+
+    @staticmethod
+    def split_events_by_pid_tid(events: List[dict]) -> Dict[str, Dict[str, List[Dict]]]:
+        event_dict = {}
+        for event in TraceEventUtils.non_metadata_events(events):
+            pid = event.get(TraceEventUtils.TraceKeys.PID)
+            tid = event.get(TraceEventUtils.TraceKeys.TID)
+            if pid in event_dict:
+                pid_events = event_dict[pid]
+            else:
+                pid_events = event_dict[pid] = {}
+            if tid in pid_events:
+                pid_events[tid].append(event)
+            else:
+                pid_events[tid] = [event]
+        return event_dict
+
+    @staticmethod
+    def sort_events_by_timestamp_duration(events: List[dict]) -> None:
+        events.sort(
+            key=lambda x: (
+                x.get(TraceEventUtils.TraceKeys.TimeStamp),
+                x.get(TraceEventUtils.TraceKeys.Duration),
+            )
+        )
+
+    @staticmethod
+    def find_thread_by_item_in_metadata(
+        metadata: dict[int, dict], select_item: Callable[[int], bool]
+    ) -> int:
+        return next(
+            TraceEventUtils.find_threads_by_item_in_metadata(metadata, select_item)
+        )
+
+    @staticmethod
+    def find_threads_by_item_in_metadata(
+        metadata: dict[int, dict], select_item: Callable[[int], bool]
+    ) -> Iterable[int]:
+        return map(lambda x: x[0], filter(select_item, metadata.items()))
+
+    @staticmethod
+    def compute_event_end_times(events: List[dict]) -> None:
+        for event in events:
+            TraceEventUtils.compute_single_event_end_time(event)
+
+    @staticmethod
+    def compute_single_event_end_time(event: dict) -> None:
+        if (
+            TraceEventUtils.TraceKeys.TimeStamp in event
+            and TraceEventUtils.TraceKeys.Duration in event
+            and TraceEventUtils.TraceKeys.TimeEnd not in event
+        ):
+            event[TraceEventUtils.TraceKeys.TimeEnd] = (
+                event[TraceEventUtils.TraceKeys.TimeStamp]
+                + event[TraceEventUtils.TraceKeys.Duration]
+            )
+
+    @staticmethod
+    def get_communication_regexes(
+        custom_collective_patterns: Optional[List[Tuple[str, str]]] = None,
+    ) -> List[re.Pattern]:
+        """Return compiled patterns for NCCL/RCCL plus optional custom collectives.
+
+        When *custom_collective_patterns* is ``None``, returns the built-in defaults from
+        ``DEFAULT_COMMUNICATION_REGEXES + DEFAULT_CUSTOM_COLLECTIVE_REGEXES``.
+        Pass an explicit list (possibly empty) to override the set while keeping NCCL/RCCL markers.
+        """
+        if custom_collective_patterns is None:
+            return DEFAULT_COMMUNICATION_REGEXES + DEFAULT_CUSTOM_COLLECTIVE_REGEXES
+        return DEFAULT_COMMUNICATION_REGEXES + [
+            re.compile(pattern, re.IGNORECASE)
+            for pattern, _ in custom_collective_patterns
+        ]
+
+    @staticmethod
+    def build_collective_filter_and_inference_rules(
+        custom_collective_patterns: Optional[List[Tuple[str, str]]] = None,
+    ) -> Tuple[List[re.Pattern], List[Tuple[re.Pattern, str]]]:
+        """Compile NCCL/RCCL/custom kernel match patterns and collective inference rules.
+
+        Same *custom_collective_patterns* semantics as
+        :meth:`get_communication_regexes`: ``None`` uses
+        ``DEFAULT_CUSTOM_COLLECTIVE_PATTERNS``; otherwise the given list
+        replaces that default set (use ``[]`` for no custom kernels).
+        """
+        effective = (
+            custom_collective_patterns
+            if custom_collective_patterns is not None
+            else DEFAULT_CUSTOM_COLLECTIVE_PATTERNS
+        )
+        filter_patterns = TraceEventUtils.get_communication_regexes(
+            custom_collective_patterns=effective
+        )
+        inference_rules = [
+            (re.compile(pattern, re.IGNORECASE), collective)
+            for pattern, collective in effective
+        ]
+        return filter_patterns, inference_rules
+
+    @staticmethod
+    def is_communication_string(text: str) -> bool:
+        """Return True if *text* matches NCCL/RCCL or default custom collective patterns.
+
+        Uses substring search (``Pattern.search``), not start-anchored ``match``,
+        so demangled names like ``void rcclGenericKernel<...>(...)`` match.
+        Custom kernels use the same defaults as :meth:`get_communication_regexes`.
+        """
+        if not text:
+            return False
+        return any(x.search(text) for x in TraceEventUtils.get_communication_regexes())
+
+    # ROCm 7.1 / older Primus images label memory copies and fills as cat=kernel
+    # with rocclr-internal names (MEMORY_COPY_*, __amd_rocclr_copyBuffer*,
+    # __amd_rocclr_fillBuffer*). ROCm 7.2 corrected this to cat=gpu_memcpy /
+    # cat=gpu_memset matching the CUDA convention. These patterns rebucket
+    # legacy traces so cross-version reports compare like-for-like.
+    _ROCM_LEGACY_MEMCPY_NAMES = re.compile(
+        r"^("
+        r"MEMORY_COPY_(HOST_TO_DEVICE|DEVICE_TO_HOST|DEVICE_TO_DEVICE)"
+        r"|__amd_rocclr_copyBuffer(Rect)?(Aligned)?"
+        r")(\.kd)?$"
+    )
+    _ROCM_LEGACY_MEMSET_NAMES = re.compile(
+        r"^__amd_rocclr_fillBuffer(Aligned)?(\.kd)?$"
+    )
+
+    @staticmethod
+    def is_rocm_legacy_memcpy(text: str) -> bool:
+        """Return True if *text* is a rocclr legacy copy kernel name (ROCm 7.1)."""
+        return bool(text and TraceEventUtils._ROCM_LEGACY_MEMCPY_NAMES.match(text))
+
+    @staticmethod
+    def is_rocm_legacy_memset(text: str) -> bool:
+        """Return True if *text* is a rocclr legacy fill kernel name (ROCm 7.1)."""
+        return bool(text and TraceEventUtils._ROCM_LEGACY_MEMSET_NAMES.match(text))
+
+
+class RocprofParser:
+    """Parser for rocprofiler-sdk JSON format (rocprofv3)"""
+
+    @staticmethod
+    def load_rocprof_data(filepath: str) -> dict:
+        """Load and validate rocprofv3 JSON file"""
+        data = DataLoader.load_data(filepath)
+        if "rocprofiler-sdk-tool" not in data:
+            raise ValueError(
+                f"Not a valid rocprofv3 file: missing 'rocprofiler-sdk-tool' key"
+            )
+        return data
+
+    @staticmethod
+    def extract_kernel_events(rocprof_data: dict) -> List[dict]:
+        """
+        Extract kernel execution events from rocprof data
+        Returns list of standardized kernel events with:
+        - name: kernel name
+        - kernel_id: kernel ID from rocprof
+        - ts: timestamp (nanoseconds)
+        - dur: duration (nanoseconds)
+        - grid: grid dimensions (x, y, z)
+        - block: block/workgroup dimensions (x, y, z)
+        - stream: stream ID
+        - dispatch_id: dispatch identifier
+        - agent_id: agent/GPU identifier
+        """
+        tool_data = rocprof_data["rocprofiler-sdk-tool"][0]
+        kernel_dispatches = tool_data["buffer_records"].get("kernel_dispatch", [])
+        kernel_symbols = {
+            k["kernel_id"]: k for k in tool_data.get("kernel_symbols", [])
+        }
+
+        kernel_events = []
+        for dispatch in kernel_dispatches:
+            dispatch_info = dispatch.get("dispatch_info", {})
+            kernel_id = dispatch_info.get("kernel_id")
+
+            # Get kernel name from kernel_symbols
+            kernel_symbol = kernel_symbols.get(kernel_id, {})
+            kernel_name = (
+                kernel_symbol.get("truncated_kernel_name")
+                or kernel_symbol.get("formatted_kernel_name")
+                or kernel_symbol.get("kernel_name", f"unknown_kernel_{kernel_id}")
+            )
+
+            # Extract timing
+            start_ts = dispatch.get("start_timestamp", 0)
+            end_ts = dispatch.get("end_timestamp", 0)
+            duration = end_ts - start_ts
+
+            # Extract grid and workgroup dimensions
+            grid_size = dispatch_info.get("grid_size", {})
+            workgroup_size = dispatch_info.get("workgroup_size", {})
+
+            event = {
+                "name": kernel_name,
+                "kernel_id": kernel_id,
+                "ts": start_ts,  # nanoseconds
+                "dur": duration,  # nanoseconds
+                "grid": (
+                    grid_size.get("x", 1),
+                    grid_size.get("y", 1),
+                    grid_size.get("z", 1),
+                ),
+                "block": (
+                    workgroup_size.get("x", 1),
+                    workgroup_size.get("y", 1),
+                    workgroup_size.get("z", 1),
+                ),
+                "stream": dispatch.get("stream_id", {}).get("handle", 0),
+                "dispatch_id": dispatch_info.get("dispatch_id", 0),
+                "agent_id": dispatch_info.get("agent_id", {}).get("handle", 0),
+                "correlation_id": dispatch.get("correlation_id", {}),
+                "thread_id": dispatch.get("thread_id", 0),
+            }
+            kernel_events.append(event)
+
+        return kernel_events
+
+    @staticmethod
+    def extract_memory_events(rocprof_data: dict) -> List[dict]:
+        """Extract memory copy/set operations"""
+        tool_data = rocprof_data["rocprofiler-sdk-tool"][0]
+        memory_copies = tool_data["buffer_records"].get("memory_copy", [])
+
+        memory_events = []
+        for mem_op in memory_copies:
+            event = {
+                "ts": mem_op.get("start_timestamp", 0),
+                "dur": mem_op.get("end_timestamp", 0)
+                - mem_op.get("start_timestamp", 0),
+                "kind": mem_op.get("kind", "unknown"),
+                "operation": mem_op.get("operation", "unknown"),
+                "stream": mem_op.get("stream_id", {}).get("handle", 0),
+            }
+            memory_events.append(event)
+
+        return memory_events
+
+    @staticmethod
+    def extract_api_events(rocprof_data: dict) -> List[dict]:
+        """Extract HIP/HSA API calls if available"""
+        tool_data = rocprof_data["rocprofiler-sdk-tool"][0]
+
+        api_events = []
+        # Combine HIP and HSA API calls
+        for api_type in ["hip_api", "hsa_api"]:
+            api_calls = tool_data["buffer_records"].get(api_type, [])
+            for api_call in api_calls:
+                event = {
+                    "type": api_type,
+                    "ts": api_call.get("start_timestamp", 0),
+                    "dur": api_call.get("end_timestamp", 0)
+                    - api_call.get("start_timestamp", 0),
+                    "operation": api_call.get("operation", "unknown"),
+                    "thread_id": api_call.get("thread_id", 0),
+                }
+                api_events.append(event)
+
+        return api_events
+
+    @staticmethod
+    def get_metadata(rocprof_data: dict) -> dict:
+        """Extract run metadata (pid, timestamps, agents)"""
+        tool_data = rocprof_data["rocprofiler-sdk-tool"][0]
+        metadata = tool_data.get("metadata", {})
+
+        return {
+            "pid": metadata.get("pid", 0),
+            "init_time": metadata.get("init_time", 0),
+            "fini_time": metadata.get("fini_time", 0),
+            "hostname": metadata.get("node", {}).get("hostname", "unknown"),
+            "agents": tool_data.get("agents", []),
+            "command": metadata.get("command", []),
+        }
+
+
+class PftraceParser:
+    """Parser for Perfetto-style trace JSON (traceEvents format)."""
+
+    @staticmethod
+    def load_pftrace_data(filepath: str) -> dict:
+        """
+        Load and validate Perfetto-style trace JSON (.json or .json.gz).
+
+        Args:
+            filepath: Path to trace file (must end with .json or .json.gz).
+
+        Returns:
+            Dict with at least "traceEvents" key (list of events).
+
+        Raises:
+            ValueError: If file is not .json/.json.gz or missing traceEvents.
+        """
+        if not filepath.endswith(".json") and not filepath.endswith(".json.gz"):
+            raise ValueError(
+                "PftraceParser expects .json or .json.gz input; "
+                f"got {filepath}. For .pftrace, convert to JSON first (e.g. traceconv json input.pftrace output.json)."
+            )
+        data = DataLoader.load_data(filepath)
+        if "traceEvents" not in data:
+            raise ValueError(
+                "Not a valid Perfetto-style trace: missing 'traceEvents' key"
+            )
+        if not isinstance(data["traceEvents"], list):
+            raise ValueError("'traceEvents' must be a list")
+        return data
+
+    @staticmethod
+    def get_events(pftrace_data: dict) -> List[dict]:
+        """Return the traceEvents list from loaded pftrace data."""
+        return pftrace_data.get("traceEvents", [])

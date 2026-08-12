@@ -1,0 +1,36 @@
+# Composable Kernel GEMM Add Analyze — Accordo Correctness Backend
+# =================================================================
+# Prereq:
+#   git clone https://github.com/ROCm/composable_kernel.git
+#   export CK_HOME=/path/to/composable_kernel
+#   Rebuild with debug info: cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ... && make test_gemm_add_xdl -j8
+#   pip install -e ".[accordo]"  # from the Magpie checkout
+# Note:
+#   CK binaries must be compiled with debug info (-g / RelWithDebInfo) so Accordo
+#   can extract kernel arguments via kernelDB. Release builds will fail with
+#   "Failed to auto-extract kernel arguments".
+#   First run builds the Accordo interception library (~2-3 min one-time cost).
+# Usage:
+#   python -m Magpie analyze --kernel-config examples/ck_gemm_add_accordo.yaml
+
+# Single kernel configuration for analyze mode
+kernel:
+  id: "ck_gemm_add"
+  type: hip
+  source_files:
+    - "${CK_HOME}/test/gemm_add/test_gemm_add.cpp"
+  testcase_command: "bin/test_gemm_add_xdl"
+  working_dir: "${CK_HOME}/build"
+
+# Override correctness backend to Accordo HSA-level validation.
+# timeout_seconds defaults from the task-level timeout.
+# working_directory defaults from the kernel's working_dir.
+correctness:
+  backend: accordo
+  accordo:
+    # Run: python -c "from accordo import list_available_kernels; print(*list_available_kernels('bin/test_gemm_add_xdl'), sep='\n')"
+    # to discover the exact kernel name from the binary.
+    kernel_name: "DeviceGemmMultipleD_Xdl_CShuffle"
+    reference_binary: "bin/test_gemm_add_xdl"
+    optimized_binary: "bin/test_gemm_add_xdl"
+    atol: 1.0e-4

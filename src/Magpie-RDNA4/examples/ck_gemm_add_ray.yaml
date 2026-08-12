@@ -1,0 +1,33 @@
+# Composable Kernel GEMM Add — Ray Remote Analyze Example
+# ========================================================
+# Dispatches the CK GEMM Add analyze task to a Ray GPU worker node.
+# The presence of ``ray_config`` automatically sets environment to "ray".
+#
+# Prereq:
+#   - A running Ray cluster with GPU worker nodes
+#   - CK prebuilt on the worker node (export CK_HOME=/path/to/composable_kernel)
+#   - Shared NFS storage accessible from worker nodes
+#
+# Usage (standard CLI — same as local, just a different YAML):
+#   python -m Magpie analyze --kernel-config examples/ck_gemm_add_ray.yaml --no-perf
+#
+# Compare with the local version:
+#   python -m Magpie analyze --kernel-config examples/ck_gemm_add.yaml --no-perf
+#
+# To force local execution even with ray_config present:
+#   python -m Magpie analyze --kernel-config examples/ck_gemm_add_ray.yaml -e local
+
+kernel:
+  id: "ck_gemm_add"
+  type: hip
+  source_files:
+    - "${CK_HOME}/test/gemm_add/test_gemm_add.cpp"
+  testcase_command: "bin/test_gemm_add"
+  working_dir: "${CK_HOME}/build"
+
+# Ray cluster settings
+ray_config:
+  cluster_address: "auto"
+  shared_storage_path: "/shared_nfs/haoli"
+  # entrypoint_num_cpus: 16
+  # install_magpie: false

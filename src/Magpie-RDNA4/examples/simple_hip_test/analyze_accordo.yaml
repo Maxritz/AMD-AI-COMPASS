@@ -1,0 +1,31 @@
+# Simple vector_add — Accordo Correctness Backend
+# ================================================
+# Prereq:
+#   cd examples/simple_hip_test && hipcc -g -O2 -o vector_add vector_add.hip
+#   pip install -e ".[accordo]"  # from the Magpie checkout
+# Note:
+#   Binaries must be compiled with -g so Accordo can extract kernel arguments.
+#   First run builds the Accordo interception library (~2-3 min one-time cost).
+# Usage:
+#   python -m Magpie analyze --kernel-config examples/simple_hip_test/analyze_accordo.yaml
+
+# Single kernel configuration for analyze mode
+kernel:
+  id: "vector_add"
+  type: hip
+  source_files:
+    - "./vector_add.hip"
+  testcase_command: "./vector_add"
+  working_dir: "examples/simple_hip_test"
+
+# Override the correctness backend to Accordo.
+# timeout_seconds defaults from the task-level timeout.
+# working_directory defaults from the kernel's working_dir.
+# The Accordo CLI runs from the result workspace directory.
+correctness:
+  backend: accordo
+  accordo:
+    kernel_name: "vector_add(float const*, float const*, float*, int)"
+    reference_binary: "./vector_add"
+    optimized_binary: "./vector_add"
+    atol: 1.0e-6

@@ -1,0 +1,214 @@
+# Magpie Framework Configuration
+# ========================================
+# This is the framework configuration file.
+# Kernel-specific configurations are separate (see kernel_config.yaml.example)
+
+# =============================================================================
+# GPU Configuration
+# =============================================================================
+# This section is the SINGLE source of truth for all GPU-related settings.
+# Used by: scheduler, hardware controller, profiler
+gpu:
+  # List of GPU device IDs to use (null = all available GPUs)
+  device_ids: null           # e.g., [0, 1, 2, 3] for specific GPUs, n
+  
+  # Whether to apply operations in parallel (faster for multi-GPU)
+  parallel: true
+  
+  # Hardware control settings (power/frequency management)
+  hardware:
+    # Enable hardware control
+    enabled: true
+    
+    # Reset clocks after benchmark
+    reset_after_benchmark: true
+    
+    # Default configuration applied to all GPUs (unless overridden per-GPU)
+    default:
+      # Power configuration (requires root/sudo)
+      power:
+        limit_watts: null      # Power limit in watts (null = don't change)
+        
+      # Frequency configuration
+      frequency:
+        # For NVIDIA: lock clocks to range (min, max) in MHz
+        gpu_clock_mhz: null    # e.g., [1500, 1500] to lock at 1500 MHz
+        mem_clock_mhz: null    # e.g., [1215, 1215] to lock memory clock
+        # For AMD: clock levels (0-7, where 7 is highest)
+        gpu_clock_level: null  # e.g., 7 for maximum performance
+        mem_clock_level: null  # e.g., 3 for specific level
+    
+    # Per-GPU configurations (overrides default for specific GPUs)
+    # Example:
+    # per_gpu:
+    #   0:  # GPU 0 specific settings
+    #     power:
+    #       limit_watts: 300
+    #     frequency:
+    #       gpu_clock_mhz: [1800, 1800]
+    #   1:  # GPU 1 specific settings
+    #     power:
+    #       limit_watts: 250
+    per_gpu: {}
+
+# =============================================================================
+# Scheduler
+# =============================================================================
+scheduler:
+  # Maximum number of parallel workers (processes) for task execution
+  max_workers: 8
+  
+  # Execution environment: local, container
+  environment: local
+
+  docker_image: null
+
+# =============================================================================
+# Output Settings
+# =============================================================================
+output:
+  directory: ./results
+  format: json  # json, csv,
+
+# =============================================================================
+# Logging
+# =============================================================================
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR
+  file: null   # Set path for file logging
+
+# =============================================================================
+# Correctness
+# =============================================================================
+correctness:
+  # Backend: "testcase" (default) or "accordo"
+  # "testcase" uses testcase_command exit codes (current default behaviour).
+  # "accordo" uses IntelliKit Accordo HSA-level kernel output validation.
+  # backend: testcase
+
+  # IntelliKit Accordo settings (AMD GPU)
+  # Captures kernel output buffers and compares reference vs. optimized.
+  # Activate by setting: backend: accordo
+  accordo:
+    atol: 1.0e-6               # Absolute tolerance (np.allclose)
+    rtol: 1.0e-5               # Relative tolerance (torch.allclose-style default)
+    equal_nan: false           # Treat NaN as equal when comparing
+    timeout_seconds: 30        # Timeout per snapshot capture
+
+# =============================================================================
+# Compiling
+# =============================================================================
+compiling:
+  # Enable default compilation when no compile_command is provided
+  # If false (default), compilation is skipped for pre-compiled kernels
+  # If true, will attempt to compile using hipcc/nvcc based on kernel type
+  enable_default_compile: false
+
+# =============================================================================
+# Performance Profiling
+# =============================================================================
+performance:
+  # Timeout for profiling operations (seconds)
+  timeout_seconds: 600
+
+  # Backend selection for AMD GPUs: "rocprof_compute" (default) or "metrix"
+  # When unset, auto-selects based on kernel type (HIP -> rocprof_compute)
+  # backend: rocprof_compute
+
+  # rocprof-compute settings (AMD GPU)
+  # Two-stage profiler: profile (collect data) + analyze (generate metrics)
+  rocprof_compute:
+    # Directory to save profiling workloads (relative to kernel working_dir)
+    workload_dir: "./workloads"
+
+    # Generate rocprof-compute roofline data. When false, Magpie passes --no-roof.
+    roofline: false
+    profile_args: []
+    analyze_args: []
+
+    # Additional arguments both for profile and analyze
+    # Using reduced set for faster profiling:
+    #   1: System Info
+    #   2: System Speed-of-Light (FLOPS, utilization, bandwidth)
+    #   5: Command Processor (CPC/CPF)
+    #  10: Compute Units - Instruction Mix
+    #  11: Compute Units - Compute Pipeline
+    #  12: Local Data Share (LDS)
+    #  14: Scalar L1 Data Cache
+    #  16: Vector L1 Data Cache
+    #  17: L2 Cache
+    metric_blocks: ["1", "2", "5", "10", "11", "12", "14", "16", "17"]
+
+    # Output format for analyze stage
+    output_format: "csv"
+    
+  # ncu settings (NVIDIA GPU)
+  # Additional arguments passed to ncu
+  ncu:
+    args: ["--target-processes", "all"]
+    metrics: []
+
+  # IntelliKit Metrix settings (AMD GPU)
+  # Human-readable GPU metrics via rocprofv3
+  # Activate by setting: backend: metrix
+  metrix:
+    profile: null               # Preset: "quick", "memory", "compute", or null for all
+    metrics: []                # Specific metrics, e.g. ["memory.l2_hit_rate"]
+    kernel_filter: null         # Regex to filter kernel names
+    num_replays: 1             # Number of profiling runs for statistics
+    timeout_seconds: 600       # Timeout per profiling run
+
+
+compare:
+  # Per-backend weights (rocprof-compute for AMD, ncu for NVIDIA)
+  perf_weights_rocprof:
+    MFMA_FLOPs_BF16: 0.35
+    MFMA_FLOPs_F16: 0.35
+    MFMA_FLOPs_F32: 0.25
+    VALU_FLOPs: 0.10
+    LDS_BW: 0.15
+    LDS_Conflicts: 0.10
+    HBM_Read_BW: 0.10
+    HBM_Write_BW: 0.10
+    L2_BW: 0.05
+    Wavefront_Occ: 0.05
+    MFMA_Util: 0.10
+    VALU_Util: 0.05
+    duration_ns_total: 0.20
+  perf_weights_ncu:
+    # Example NCU metrics (customize based on your profile output)
+    sm__throughput.avg.pct_of_peak_sustained_elapsed: 0.40
+    l1tex__throughput.avg.pct_of_peak_sustained_elapsed: 0.10
+    lts__throughput.avg.pct_of_peak_sustained_elapsed: 0.10
+    dram__throughput.avg.pct_of_peak_sustained_elapsed: 0.20
+    duration_ns_total: 0.20
+  perf_weights_metrix:
+    memory.hbm_bandwidth_utilization: 0.20
+    memory.l2_hit_rate: 0.15
+    memory.l1_hit_rate: 0.10
+    memory.coalescing_efficiency: 0.10
+    compute.hbm_arithmetic_intensity: 0.15
+    duration_ns_total: 0.30
+
+benchmark:
+  # Path to separate image mapping configuration file
+  image_config: "./benchmark_images.yaml"
+  
+  # Path to InferenceX installation
+  # If not configured or path doesn't exist, InferenceX will be auto-cloned from:
+  # https://github.com/SemiAnalysisAI/InferenceX.git
+  inferencex_path: ""
+  
+  # Default timeout for benchmark tasks
+  timeout_seconds: 3600
+    
+  # Profiler configuration
+  profiler:
+    # PyTorch Profiler (default enabled)
+    torch_profiler:
+      enabled: true
+      
+    # System-level Profiler (rocprof-compute / ncu)
+    system_profiler:
+      enabled: false
+      profile_args: []  # Additional arguments for profiler command

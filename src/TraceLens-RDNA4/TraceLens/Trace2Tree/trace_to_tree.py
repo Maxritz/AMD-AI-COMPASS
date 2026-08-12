@@ -1,0 +1,1272 @@
+###############################################################################
+# Copyright (c) 2024 - 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+
+import logging
+import re
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from typing import Any, Callable, Dict, Optional
+
+from ..util import JaxProfileProcessor, TraceEventUtils
+
+logger = logging.getLogger(__name__)
+
+
+class BaseTraceToTree(ABC):
+    def __init__(
+        self,
+        events_data,
+        prune_nongpu_paths=True,
+        compute_end_times=True,
+        linking_key: str = None,
+        event_to_category: Callable[[dict], str] = None,
+        trace_metadata: Optional[Dict[str, Any]] = None,
+    ):
+
+        self.events = [
+            {**data, TraceEventUtils.TraceKeys.UID: i}
+            for i, data in enumerate(events_data)
+        ]
+        self.trace_metadata = dict(trace_metadata or {})
+        self.events_by_uid = {
+            event[TraceEventUtils.TraceKeys.UID]: event for event in self.events
+        }
+
+        if compute_end_times:
+            self._compute_event_end_times()
+        if linking_key is not None:
+            self.linking_key = linking_key
+        else:
+            self._set_linking_key()
+
+        if event_to_category is not None:
+            self.event_to_category = event_to_category
+        else:
+            self.event_to_category = self.default_categorizer()
+
+        self.cpu_root_nodes = []
+        self.prune_nongpu_paths = prune_nongpu_paths
+        self.name2event_uids = defaultdict(list)
+
+    @abstractmethod
+    def default_categorizer(self, event: dict = None) -> Callable[[dict], str]:
+        """
+        Return the default event categorizer for this trace format.
+        """
+        pass
+
+    @abstractmethod
+    def build_tree(
+        self,
+        add_python_func=False,
+        link_fwd_bwd=True,
+        metadata_events=None,
+        pb_file_name=None,
+        **kwargs,
+    ) -> None:
+        """
+        Constructs a tree structure from the provided trace data.
+
+        This abstract method should be implemented by subclasses to define
+        the logic for building a tree representation based on trace information.
+        """
+        pass
+
+    @abstractmethod
+    def _set_linking_key(self):
+        """
+        Set the linking key for the trace events.
+
+        """
+        pass
+
+    @abstractmethod
+    def add_gpu_ops_to_tree(self):
+        """
+        Add gpu operation to the tree
+
+        """
+        pass
+
+    def _is_nn_module_event(self, event: Dict[str, Any]) -> bool:
+        return self.event_to_category(event) == "python_function" and event.get(
+            TraceEventUtils.TraceKeys.Name, ""
+        ).startswith("nn.Module:")
+
+    def _nn_module_stack_name_for_event(self, event: Dict[str, Any]) -> str:
+        """Label pushed onto nn_module_stack for nn.Module python_function events."""
+        return event[TraceEventUtils.TraceKeys.Name]
+
+    def build_host_call_stack_tree(self, add_python_func=False):
+        # 1. Filter and sort events based on their start timestamps.
+        #    - Include only CPU, CUDA runtime, and optionally Python function events.
+        # 2. Iterate through the sorted events and maintain a stack to track the current call hierarchy.
+        #    - Pop events from the stack if they end before the current event starts to find the parent.
+        #    - Set the parent of the current event as the top of the stack if the stack is not empty.
+        #    - Push the current event onto the stack.
+        #    - For CPU operations:
+        #      - Mark as a root node if it is the first CPU operation in the stack.
+        #      - Increment the count of CPU operations in the stack.
+        def event_filter(event):
+            cat = self.event_to_category(event)
+            event["cat"] = cat
+            is_cpu_or_cuda_event = cat in {"cpu_op", "cuda_runtime", "cuda_driver"}
+            is_python_event = cat == "python_function"
+            return is_cpu_or_cuda_event or (add_python_func and is_python_event)
+
+        print(f"Building CPU op tree with add_python_func={add_python_func}")
+
+        self.add_python_func = add_python_func
+        list_events = filter(event_filter, self.events)
+
+        events_sorted = sorted(
+            list_events,
+            key=lambda e: e[TraceEventUtils.TraceKeys.TimeStamp],
+        )
+        dict_pidtid2stack = defaultdict(list)
+        dict_pidtid2num_cpu_ops = defaultdict(int)
+        dict_pidtid2nn_module_stack = defaultdict(list)
+
+        for event in events_sorted:
+            event["tree"] = True
+            self.name2event_uids[event[TraceEventUtils.TraceKeys.Name]].append(
+                event[TraceEventUtils.TraceKeys.UID]
+            )
+
+            pid = event.get(TraceEventUtils.TraceKeys.PID)
+            tid = event.get(TraceEventUtils.TraceKeys.TID)
+            stack_key = (pid, tid)
+            stack = dict_pidtid2stack[stack_key]
+            nn_module_stack = dict_pidtid2nn_module_stack[stack_key]
+
+            # Pop stack entries that have already ended before this event starts.
+            while stack and (
+                event[TraceEventUtils.TraceKeys.TimeStamp]
+                >= stack[-1][TraceEventUtils.TraceKeys.TimeEnd]
+            ):
+                popped_event = stack.pop()
+                if self.event_to_category(popped_event) == "cpu_op":
+                    dict_pidtid2num_cpu_ops[stack_key] -= 1
+                if self._is_nn_module_event(popped_event):
+                    nn_module_stack.pop()
+
+            # Handle "event bleed": the event starts inside the stack top
+            # but ends after it.  If the overlap (stack[-1].t_end - event.ts)
+            # is < 1 us, this is a tiny timing overlap (e.g. hipLaunchKernel
+            # starting a few hundred ns before a sibling cpu_op finishes).
+            # Pop the sibling and attach the event under the same parent.
+            # Larger bleeds (>= 1 us) are discarded — these are typically
+            # python_function instrumentation artifacts (e.g. PyCapsule
+            # built-ins whose duration includes GPU sync time).
+            if stack and (
+                event[TraceEventUtils.TraceKeys.TimeEnd]
+                > stack[-1][TraceEventUtils.TraceKeys.TimeEnd]
+            ):
+                overlap_us = (
+                    stack[-1][TraceEventUtils.TraceKeys.TimeEnd]
+                    - event[TraceEventUtils.TraceKeys.TimeStamp]
+                )
+                overlap_tolerance_us = 1.0
+                if overlap_us < overlap_tolerance_us and len(stack) >= 2:
+                    popped_event = stack.pop()
+                    if self.event_to_category(popped_event) == "cpu_op":
+                        dict_pidtid2num_cpu_ops[stack_key] -= 1
+                    if self._is_nn_module_event(popped_event):
+                        nn_module_stack.pop()
+                else:
+                    continue
+
+            # Set nn_module_stack for the current event (copy to avoid reference issues)
+            if nn_module_stack:
+                event["nn_module_stack"] = list(nn_module_stack)
+            else:
+                event["nn_module_stack"] = ["root"]
+
+            if stack:
+                parent = stack[-1]
+                parent.setdefault("children", []).append(
+                    event[TraceEventUtils.TraceKeys.UID]
+                )
+                event["parent"] = parent[TraceEventUtils.TraceKeys.UID]
+
+            stack.append(event)
+
+            # Push onto nn_module_stack if this is an nn.Module event
+            if self._is_nn_module_event(event):
+                nn_module_stack.append(self._nn_module_stack_name_for_event(event))
+
+            if self.event_to_category(event) == "cpu_op":
+                if dict_pidtid2num_cpu_ops[stack_key] == 0:
+                    event["cpu_op_root"] = True
+                    self.cpu_root_nodes.append(event[TraceEventUtils.TraceKeys.UID])
+                dict_pidtid2num_cpu_ops[stack_key] += 1
+
+    def label_non_gpu_paths(self):
+        # 1. Iterate through non GPU nodes and chck the gpu_events list
+        # 2. If the gpu_events list is empty, mark the node as non_gpu_path
+        for event in self.events:
+            # Skip GPU events
+            if self.event_to_category(event) in {"kernel", "gpu_memset", "gpu_memcpy"}:
+                continue
+            # Now, we are dealing with non-GPU events
+            if "gpu_events" not in event:
+                event["non_gpu_path"] = True
+
+    def get_UID2event(self, UID):
+        return self.events_by_uid[UID]
+
+    def get_parent_event(self, event):
+        if event.get("parent") is None:
+            return None
+        return self.get_UID2event(event["parent"])
+
+    def get_children_events(self, event):
+        if "children" not in event:
+            return []
+        return [self.get_UID2event(child_UID) for child_UID in event["children"]]
+
+    def _compute_event_end_times(self) -> None:
+        TraceEventUtils.compute_event_end_times(self.events)
+
+    def _annotate_gpu_events_with_stream_index(self):
+        """
+        This function preprocesses the GPU events in the perf_analyzer object.
+        """
+        # 1. we create a dict stream -> events
+        dict_stream2events = {}
+        for event in self.events:
+            stream = event.get("args", {}).get("stream", None)
+            if stream is not None:
+                if stream not in dict_stream2events:
+                    dict_stream2events[stream] = []
+                dict_stream2events[stream].append(event)
+
+        # 2. we sort the events in each stream by their timestamp
+        for stream, events in dict_stream2events.items():
+            dict_stream2events[stream] = sorted(
+                events,
+                key=lambda x: x[TraceEventUtils.TraceKeys.TimeStamp],
+            )
+
+        # 3. we create a dict stream, index -> event
+        #    and we set the stream index in the event
+        dict_stream_index2event = {}
+        for stream, events in dict_stream2events.items():
+            for i, event in enumerate(events):
+                dict_stream_index2event[(stream, i)] = event
+                event[TraceEventUtils.TraceKeys.Args][
+                    TraceEventUtils.ArgNames.StreamIndex
+                ] = i
+        # now we set this dict in the perf_analyzer
+        self.dict_stream_index2event = dict_stream_index2event
+
+    def _preprocess_and_index_events(self) -> None:
+        # 1. Create a dictionary to map the linking id to the start and end ac2g events
+        # 2. Create a dictionary to map the event key (by default (pid, tid)), and linking id to the actual event
+        # 3. Create a dictionary to map the sequence number to the list of event uids
+        # 4. Create a dictionary to map the python id to the event uid
+        # This is done to quickly link events based on various keys
+
+        self.ac2g_event_map = {"start": {}, "end": {}}
+        self.pid_tid_event_map = {}
+        self.seq_num2event_uids_map = {}  # from seq id to list uids
+        self.dict_pythonID2UID = {}
+
+        for event in self.events:
+            # Process ac2g events
+            if self.event_to_category(event) == "ac2g":
+                if event["ph"] == "s":
+                    self.ac2g_event_map["start"][event["id"]] = event
+                elif event["ph"] == "f":
+                    self.ac2g_event_map["end"][event["id"]] = event
+                continue
+
+            # Process PID-TID-linking key events
+            pid = event.get(TraceEventUtils.TraceKeys.PID)
+            tid = event.get(TraceEventUtils.TraceKeys.TID)
+            link_id = event.get(TraceEventUtils.TraceKeys.Args, {}).get(
+                self.linking_key
+            )
+            if None not in [pid, tid, link_id]:
+                self.pid_tid_event_map[(pid, tid, link_id)] = event
+
+            # Process sequence number events
+            seq_num = event.get(TraceEventUtils.TraceKeys.Args, {}).get(
+                "Sequence number"
+            )
+            if seq_num is not None:
+                self.seq_num2event_uids_map.setdefault(seq_num, []).append(
+                    event[TraceEventUtils.TraceKeys.UID]
+                )
+
+            # Process python_function events
+            if self.event_to_category(event) == "python_function":
+                self.dict_pythonID2UID[
+                    event[TraceEventUtils.TraceKeys.Args]["Python id"]
+                ] = event[TraceEventUtils.TraceKeys.UID]
+
+
+class JaxTraceToTree(BaseTraceToTree):
+    def __init__(
+        self,
+        events_data,
+        prune_nongpu_paths=True,
+        compute_end_times=True,
+        linking_key: str = None,
+        event_to_category: Callable[
+            [dict], str
+        ] = TraceEventUtils.prepare_event_categorizer,
+        trace_metadata: Optional[Dict[str, Any]] = None,
+    ):
+
+        super().__init__(
+            events_data,
+            prune_nongpu_paths=prune_nongpu_paths,
+            compute_end_times=compute_end_times,
+            linking_key=linking_key,
+            event_to_category=event_to_category,
+            trace_metadata=trace_metadata,
+        )
+        self._preprocess_and_index_events()
+        self._annotate_gpu_events_with_stream_index()
+
+        self.linking_key_to_uid_map = defaultdict(list)
+        self.hlo_ops = defaultdict(list)
+        self.hlo_op_aliases = {}
+        self._warned_missing_hlo_ops = set()
+        self.metadata = dict
+
+    def default_categorizer(self, event=None):
+        """
+        Returns the category of the given event dictionary using the TraceEventUtils.prepare_event_categorizer method.
+
+        Args:
+            event (dict): The event data to categorize.
+
+        Returns:
+            str: The category assigned to the event.
+        """
+        return TraceEventUtils.prepare_event_categorizer
+
+    def _set_linking_key(self) -> None:
+        """
+        Sets the linking key attribute to 'correlation_id'.
+
+        This method assigns the string 'correlation_id' to the instance variable
+        `linking_key`, which is used to link or correlate traces within the tree structure.
+        """
+        self.linking_key = "correlation_id"
+
+    @staticmethod
+    def _is_gpu_event(event: dict) -> bool:
+        """Return True if event's process_name contains /device:GPU."""
+        proc = event.get("process", {})
+        proc_name = (
+            proc.get("process_name", "") if isinstance(proc, dict) else str(proc)
+        )
+        return "/device:GPU" in proc_name
+
+    def add_gpu_ops_to_tree(self) -> None:
+        """
+        Associates GPU operation events with their corresponding parent events in the event tree.
+
+        Iterates through all events and, for those identified as GPU events (process_name contains
+        "/device:GPU"), checks if the event has a parent. If so, it sets the 'gpu_events' field of
+        the event and its ancestors to include the unique identifier (UID) of the GPU event. This
+        allows for tracking GPU operations across the event hierarchy.
+
+        Assumes that each event is a dictionary containing at least 'process', 'parent', and UID
+        fields, and that TraceEventUtils.TraceKeys.UID provides the key for the UID.
+
+        Returns:
+            None
+        """
+        for event in self.events:
+            if not self._is_gpu_event(event):
+                continue
+            # set the parents['gpu_events'] to the corresponding gpu event
+            if "parent" in event.keys():
+                corresponding_gpu_event = event
+                event["gpu_events"] = [
+                    corresponding_gpu_event[TraceEventUtils.TraceKeys.UID]
+                ]
+                while self.get_parent_event(event):
+                    parent = self.get_parent_event(event)
+                    parent.setdefault("gpu_events", []).append(
+                        corresponding_gpu_event[TraceEventUtils.TraceKeys.UID]
+                    )
+                    event = parent
+
+    def build_tree(
+        self,
+        add_python_func=False,
+        link_fwd_bwd=True,
+        metadata_events: Dict[str, Dict[str, str]] = None,
+        pb_file_name: str = None,
+        **kwargs,
+    ) -> None:
+        """
+        Builds a hierarchical tree structure from trace metadata and protobuf file.
+
+        This method sets up the necessary metadata, processes HLO operations from the protobuf file,
+        creates internal mappings, links CPU and GPU operations, and constructs the host call stack tree.
+        Optionally, it can include Python function calls in the tree. GPU operations are added to the tree,
+        and if pruning of non-GPU paths is enabled, those paths are labeled accordingly.
+
+        Args:
+            metadata_events (Dict): Metadata information required for building the tree.
+            pb_file_name (str): Path to the protobuf file containing HLO operations.
+            add_python_func (bool, optional): If True, includes Python function calls in the tree. Defaults to False.
+
+        Returns:
+            None
+        """
+        if metadata_events is None:
+            metadata_events = kwargs.pop("metadata_events", {})
+        if pb_file_name is None:
+            pb_file_name = kwargs.pop("pb_file_name", None)
+        self._set_metadata(metadata_events)
+        self._set_hlo_ops(pb_file_name)
+        self._create_linking_key_to_uid_map()
+        self._link_cpu_gpu()
+        print(f"Building tree with add_python_func={add_python_func}")
+        self.build_host_call_stack_tree(add_python_func)
+        self.add_gpu_ops_to_tree()
+        if self.prune_nongpu_paths:
+            self.label_non_gpu_paths()
+
+        self._categorize_gpu_kernel_ops()
+
+    # Kernel-name FA labels are authoritative; do not replace with TE via hlo_op.
+    _FA_KERNEL_NAME_CATEGORIES = frozenset({"FA BWD", "FA FWD", "FA V3"})
+
+    def _categorize_gpu_kernel_ops(self) -> None:
+        """
+        Categorizes GPU kernel operations in the event list based on their names and HLO operation types.
+
+        Iterates through each event in `self.events` identified as a GPU event (process_name contains
+        "/device:GPU"). For events categorized as 'kernel', attempts to assign a GPU kernel operation
+        category by matching the event's name and, if available, its 'hlo_op' argument against
+        predefined category filters in `TraceEventUtils.JaxOpKeys.ClassCategories`. If no category is
+        matched, assigns a default 'Uncategorized/XLA' category.
+
+        When the kernel name matches an FA category (FA FWD / FA BWD / FA V3), that label is kept
+        even if ``hlo_op`` would match TE (e.g. ``te_fused_attn_forward_ffi`` inside Transformer Engine).
+
+        Modifies:
+            Each relevant event in `self.events` by adding or updating the 'gpu_kernel_op_cat' key.
+        """
+
+        for event in self.events:
+            if not self._is_gpu_event(event):
+                continue
+            if event.get("cat") != "kernel":
+                continue
+            name = event.get("name", "")
+            name_category = None
+
+            for (
+                category,
+                filters,
+            ) in TraceEventUtils.JaxOpKeys.ClassCategories.items():
+                if any(f in name for f in filters):
+                    name_category = category
+                    break
+
+            gpu_kernel_op_cat_not_found = name_category is None
+            if name_category is not None:
+                event["gpu_kernel_op_cat"] = name_category
+
+            args = event.get("args")
+            if args and "hlo_op" in args:
+                hlo_op = args.get("hlo_op")
+                if hlo_op and name_category not in self._FA_KERNEL_NAME_CATEGORIES:
+                    for (
+                        category,
+                        filters,
+                    ) in TraceEventUtils.JaxOpKeys.ClassCategories.items():
+                        if any(f in hlo_op for f in filters):
+                            event["gpu_kernel_op_cat"] = category
+                            gpu_kernel_op_cat_not_found = False
+                            break
+
+            # if still not found, set to Uncategorized/XLA
+            if gpu_kernel_op_cat_not_found:
+                event["gpu_kernel_op_cat"] = (
+                    TraceEventUtils.JaxOpKeys.UncategorizedEventKey + "/XLA"
+                )
+
+    def _set_metadata(self, metadata: Dict) -> None:
+        """
+        Sets the metadata for the current object and updates each event in `self.events`
+        with corresponding process and thread information.
+
+        Args:
+            metadata (Dict): A dictionary containing process and thread metadata,
+                indexed by process ID (`pid`) and thread ID (`tid`).
+
+        Side Effects:
+            - Assigns the provided metadata to `self.metadata`.
+            - For each event in `self.events`, adds 'process' and 'thread' keys
+              with values from the metadata dictionary.
+        """
+        self.metadata = metadata
+        for event in self.events:
+            pid = event.get("pid")
+            tid = event.get("tid")
+            event["process"] = self.metadata.get(pid, {}).get(None, {})
+            event["thread"] = self.metadata.get(pid, {}).get(tid, {})
+
+    def _set_hlo_ops(self, pb_file_name: str) -> None:
+        """
+        Processes events to extract unique HLO modules and populates the `hlo_ops` dictionary
+        with operations parsed from the specified protobuf file.
+
+        Args:
+            pb_file_name (str): The path to the protobuf file containing HLO operation definitions.
+
+        Side Effects:
+            Updates the `self.hlo_ops` dictionary with keys as unique HLO module names found in events,
+            and values as the result of processing the protobuf file for each module.
+        """
+        hlo_module_list = []
+        for event in self.events:
+            if "args" in event.keys():
+                if "hlo_module" in event.get("args").keys():
+                    hlo_module = event.get("args").get("hlo_module")
+                    if hlo_module not in hlo_module_list:
+                        hlo_module_list.append(hlo_module)
+                        self.hlo_ops[hlo_module] = (
+                            JaxProfileProcessor.process_protobuf_file(
+                                pb_file_name, hlo_module
+                            )
+                        )
+        self._build_hlo_op_alias_maps()
+
+    def _build_hlo_op_alias_maps(self) -> None:
+        """Build per-module aliases for runtime vs HLO-dump collective names."""
+        trace_ops_by_module = defaultdict(set)
+        for event in self.events:
+            args = event.get("args") or {}
+            hlo_module = args.get("hlo_module")
+            hlo_op = args.get("hlo_op")
+            if hlo_module and hlo_op:
+                trace_ops_by_module[hlo_module].add(
+                    JaxProfileProcessor._normalize_hlo_op_key(hlo_op)
+                )
+
+        self.hlo_op_aliases = {}
+        for hlo_module, trace_ops in trace_ops_by_module.items():
+            module_ops = self.hlo_ops.get(hlo_module)
+            if not module_ops:
+                continue
+            self.hlo_op_aliases[hlo_module] = (
+                JaxProfileProcessor.build_collective_hlo_aliases(module_ops, trace_ops)
+            )
+
+    def _lookup_hlo_metadata(self, hlo_module: str, hlo_op: str) -> Optional[dict]:
+        module_ops = self.hlo_ops.get(hlo_module, {})
+        aliases = self.hlo_op_aliases.get(hlo_module, {})
+        resolved_key = JaxProfileProcessor.resolve_hlo_op_key(
+            hlo_op, module_ops, aliases
+        )
+        if resolved_key is None:
+            return None
+        return module_ops.get(resolved_key)
+
+    def _create_linking_key_to_uid_map(self) -> None:
+        """
+        Populates the linking_key_to_uid_map with mappings from a specified linking key
+        found in the 'args' field of each event to the corresponding event UID.
+
+        Iterates over all events, and for each event that contains the linking key in its
+        'args' dictionary, appends the event's UID to the list associated with that key
+        in linking_key_to_uid_map.
+
+        Returns:
+            None
+        """
+        for uid, event in enumerate(self.events):
+            if "args" in event.keys():
+                if self.linking_key in event.get("args").keys():
+                    key = event.get("args").get(self.linking_key)
+                    self.linking_key_to_uid_map[key].append(uid)
+
+    def _link_cpu_gpu(self) -> None:
+        """
+        Links CPU and GPU events based on a shared linking key, establishing parent-child relationships
+        between corresponding events. For each CPU event (identified by PID 701) that contains the linking key,
+        finds associated GPU events and updates their hierarchical structure in the event tree.
+
+        - Adds GPU event UIDs as children to the CPU event.
+        - Marks both CPU and GPU events as part of the tree.
+        - Sets the CPU event as the parent of the GPU event.
+        - Appends the CPU event UID to the list of root nodes.
+        - If GPU event contains HLO operation metadata, attaches it to the event; otherwise, logs missing metadata.
+
+        Assumes the existence of:
+        - self.events: List of event dictionaries.
+        - self.linking_key: Key used to link CPU and GPU events.
+        - self.linking_key_to_uid_map: Mapping from linking key to event UIDs.
+        - self.events_by_uid: Mapping from UID to event dictionary.
+        - self.cpu_root_nodes: List to collect root CPU event UIDs.
+        - self.hlo_ops: Dictionary containing HLO operation metadata.
+        """
+        for event in self.events:
+            if "args" in event.keys():
+                if self.linking_key in event.get("args").keys():
+                    if event[TraceEventUtils.TraceKeys.PID] == 701:
+                        key = event.get("args").get(self.linking_key)
+                        linking_uids = self.linking_key_to_uid_map[key]
+                        uid = event[TraceEventUtils.TraceKeys.UID]
+                        for linking_uid in linking_uids:
+                            if linking_uid != uid:
+                                GPU_event = self.events_by_uid[linking_uid]
+                                event.setdefault("children", []).append(linking_uid)
+                                event["tree"] = True
+                                GPU_event["parent"] = uid
+                                GPU_event["tree"] = True
+                                self.cpu_root_nodes.append(uid)
+                                if "hlo_op" in GPU_event.get("args").keys():
+                                    hlo_op = "%" + GPU_event.get("args").get("hlo_op")
+                                    hlo_module = GPU_event.get("args").get("hlo_module")
+                                    metadata = self._lookup_hlo_metadata(
+                                        hlo_module, hlo_op
+                                    )
+                                    if metadata is not None:
+                                        GPU_event["metadata"] = metadata
+                                    else:
+                                        warn_key = (hlo_module, hlo_op)
+                                        if warn_key not in self._warned_missing_hlo_ops:
+                                            self._warned_missing_hlo_ops.add(warn_key)
+                                            logger.warning(f"Missing hlo_op: {hlo_op}")
+                                            logger.warning(
+                                                "in hlo_module: "
+                                                f"{GPU_event['args']['hlo_module']}"
+                                            )
+
+
+class TraceToTree(BaseTraceToTree):
+    """Chrome-trace (PyTorch) tree with CUDA runtime / driver linking and host stack."""
+
+    def __init__(
+        self,
+        events_data,
+        prune_nongpu_paths=True,
+        compute_end_times=True,
+        linking_key: str = None,
+        event_to_category: Callable[[dict], str] = TraceEventUtils.default_categorizer,
+        trace_metadata: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            events_data,
+            prune_nongpu_paths=prune_nongpu_paths,
+            compute_end_times=compute_end_times,
+            linking_key=linking_key,
+            event_to_category=event_to_category,
+            trace_metadata=trace_metadata,
+        )
+        self.metadata = TraceEventUtils.get_metadata(self.events)
+        self._preprocess_and_index_events()
+        self._annotate_gpu_events_with_stream_index()
+
+    @staticmethod
+    def default_categorizer(event: dict) -> str:
+        return event["cat"]
+
+    def _set_linking_key(self):
+        Name = TraceEventUtils.TraceKeys.Name
+        Args = TraceEventUtils.TraceKeys.Args
+        launch_event = next(
+            (
+                event
+                for event in self.events
+                if event.get("cat") in ["cuda_runtime", "cuda_driver"]
+                and "launch" in event.get(Name, "").lower()
+            ),
+            None,
+        )
+        self.linking_key = (
+            "correlation"
+            if launch_event is not None and "correlation" in launch_event[Args]
+            else "External id"
+        )
+
+    def _preprocess_and_index_events(self) -> None:
+        # 1. Create a dictionary to map the linking id to the start and end ac2g events
+        # 2. Create a dictionary to map the event key (by default (pid, tid)), and linking id to the actual event
+        # 3. Create a dictionary to map the sequence number to the list of event uids
+        # This is done to quickly link events based on various keys
+
+        self.ac2g_event_map = {"start": {}, "end": {}}
+        self.pid_tid_event_map = {}
+        self.seq_num2event_uids_map = {}  # from seq id to list uids
+        self.runtime_event_uids = (
+            []
+        )  # UIDs of cuda_runtime/cuda_driver events for fast add_gpu_ops_to_tree
+        # Index: linking_key value -> list of GPU events (for _get_graph_gpu_events, avoids O(N) scan per graph launch)
+        self.linking_id_to_gpu_events = defaultdict(list)
+        # self.dict_pythonID2UID = {}  # Commented out: never read, only written
+
+        UID = TraceEventUtils.TraceKeys.UID
+        PID = TraceEventUtils.TraceKeys.PID
+        TID = TraceEventUtils.TraceKeys.TID
+        Args = TraceEventUtils.TraceKeys.Args
+        runtime_cats = {"cuda_runtime", "cuda_driver"}
+        gpu_cats = {"kernel", "gpu_memset", "gpu_memcpy"}
+
+        for event in self.events:
+            cat = event.get("cat")
+            event["cat"] = cat  # ensure key present for lambda e: e["cat"] fast path
+
+            if cat in runtime_cats:
+                self.runtime_event_uids.append(event[UID])
+
+            # Process ac2g events
+            if cat == "ac2g":
+                if event["ph"] == "s":
+                    self.ac2g_event_map["start"][event["id"]] = event
+                elif event["ph"] == "f":
+                    self.ac2g_event_map["end"][event["id"]] = event
+                continue
+
+            # Cache args dict once for remaining operations
+            args = event.get(Args)
+            if args is None:
+                continue
+
+            # Index GPU events by linking_key for fast _get_graph_gpu_events (graph launch lookup)
+            if cat in gpu_cats:
+                link_id = args.get(self.linking_key)
+                if link_id is not None:
+                    self.linking_id_to_gpu_events[link_id].append(event)
+
+            # Process PID-TID-linking key events
+            pid = event.get(PID)
+            tid = event.get(TID)
+            link_id = args.get(self.linking_key)
+            if None not in [pid, tid, link_id]:
+                self.pid_tid_event_map[(pid, tid, link_id)] = event
+
+            # Process sequence number events
+            seq_num = args.get("Sequence number")
+            if seq_num is not None:
+                self.seq_num2event_uids_map.setdefault(seq_num, []).append(event[UID])
+
+    def _nn_module_stack_name_for_event(self, event: Dict[str, Any]) -> str:
+        name = event.get(TraceEventUtils.TraceKeys.Name, "")
+        return re.sub(r"_\d+$", "", name)
+
+    def add_gpu_ops_to_tree(self):
+        UID = TraceEventUtils.TraceKeys.UID
+        Name = TraceEventUtils.TraceKeys.Name
+        events_by_uid = self.events_by_uid
+        name2event_uids = self.name2event_uids
+        graph_launch_names = {"cudaGraphLaunch", "hipGraphLaunch"}
+        for runtime_uid in self.runtime_event_uids:
+            runtime_event = events_by_uid[runtime_uid]
+            if runtime_event["name"] in graph_launch_names:
+                corresponding_gpu_events = self._get_graph_gpu_events(runtime_event)
+            else:
+                gpu_evt = self._find_corresponding_output_event(runtime_event)
+                corresponding_gpu_events = [gpu_evt] if gpu_evt else []
+            for gpu_evt in corresponding_gpu_events:
+                gpu_evt_uid = gpu_evt[UID]
+                runtime_event.setdefault("children", []).append(gpu_evt_uid)
+                gpu_evt["parent"] = runtime_uid
+                gpu_evt["tree"] = True
+                name2event_uids[gpu_evt[Name]].append(gpu_evt_uid)
+                runtime_event.setdefault("gpu_events", []).append(gpu_evt_uid)
+
+                # Walk parent chain to propagate gpu_events
+                parent_uid = runtime_event.get("parent")
+                while parent_uid is not None:
+                    parent = events_by_uid[parent_uid]
+                    parent.setdefault("gpu_events", []).append(gpu_evt_uid)
+                    parent_uid = parent.get("parent")
+
+    def build_tree(
+        self,
+        add_python_func=False,
+        link_fwd_bwd=True,
+        metadata_events=None,
+        pb_file_name=None,
+        **kwargs,
+    ) -> None:
+        print(f"Building tree with add_python_func={add_python_func}")
+        self.build_host_call_stack_tree(add_python_func)
+        self.add_gpu_ops_to_tree()
+
+        if self.prune_nongpu_paths:
+            self.label_non_gpu_paths()
+
+        if link_fwd_bwd:
+            self.link_all_fwd_bwd_events()
+
+    def get_gpu_events(self, event):
+        """
+        Get GPU events (kernels, memcpy, memset) launched by this event.
+
+        Args:
+            event: The event to get GPU events for
+
+        Returns:
+            List of GPU event dictionaries
+        """
+        if "gpu_events" not in event:
+            return []
+        return [self.get_UID2event(gpu_uid) for gpu_uid in event["gpu_events"]]
+
+    def get_node_by_ext_id_pid_tid(self, ext_id, pid, tid):
+        for event in self.events:
+            if (
+                event.get(TraceEventUtils.TraceKeys.Args, {}).get("External id")
+                == ext_id
+                and event.get(TraceEventUtils.TraceKeys.PID) == pid
+                and event.get(TraceEventUtils.TraceKeys.TID) == tid
+            ):
+                return event
+        return None
+
+    def apply_annotation(self, name_filters=[]) -> None:
+        events = self.events
+        annotation_events = [
+            e for e in events if "user_annotation" in (e.get("cat") or "")
+        ]
+        annotation_events.sort(key=lambda x: x.get("ts", 0))
+        filtered_events = []
+        for i in name_filters:
+            filtered_events += [e for e in events if e.get("name", "").startswith(i)]
+        for e in filtered_events:
+            annotation = "NA"
+            for ann in annotation_events:
+                if (
+                    ann["ts"] <= e["ts"]
+                    and (e["ts"] + e["dur"]) < ann["ts"] + ann["dur"]
+                ):
+                    annotation = ann.get("name")
+                    break
+            self.events[e[TraceEventUtils.TraceKeys.UID]]["annotation"] = annotation
+
+    def traverse_subtree_and_print(
+        self,
+        node: Dict[str, Any],
+        prune_non_gpu: bool = True,
+        cpu_op_fields: tuple[str, ...] = (),
+        include_bwd: bool = False,
+    ) -> None:
+        """
+        Initiates traversal of a subtree of profiling events and prints them in a hierarchical call stack format.
+
+        Args:
+            node (Dict[str, Any]): The root node of the subtree.
+            prune_non_gpu (bool): If True, prunes events that do not lead to GPU events.
+            cpu_op_fields (tuple[str, ...]): Optional tuple to specify printing additional details for CPU operations.
+                It will be some subset of ['Input Dims', 'Input type', 'Input Strides', 'Concrete Inputs'].
+            include_bwd (bool): If True, also prints backward events linked via bwd_events for each forward op.
+
+        Prints:
+            A structured representation of the subtree with details about each event.
+        """
+        self._traverse_subtree_recursive(
+            node,
+            prune_non_gpu,
+            cpu_op_fields=cpu_op_fields,
+            include_bwd=include_bwd,
+            _prefix="",
+            is_last=True,
+        )
+
+    def _traverse_subtree_recursive(
+        self,
+        node: Dict[str, Any],
+        prune_non_gpu: bool,
+        cpu_op_fields: tuple[str],
+        include_bwd: bool,
+        _prefix: str,
+        is_last: bool,
+    ) -> None:
+        connector = "└── " if is_last else "├── "
+        name = node.get(TraceEventUtils.TraceKeys.Name, "Unknown")
+        max_len = 64
+        if len(name) > max_len:
+            name = name[:max_len] + ".."
+
+        cat = self.event_to_category(node)
+        print_str = f"{_prefix}{connector}UID: {node[TraceEventUtils.TraceKeys.UID]}, Category: {cat}, Name: {name}"
+
+        if cat in {"kernel", "gpu_memset", "gpu_memcpy"}:
+            print_str += f", Duration: {node.get(TraceEventUtils.TraceKeys.Duration)}"
+
+        print(print_str)
+
+        if cat == "cpu_op":
+            args = node.get(TraceEventUtils.TraceKeys.Args, {})
+            cpu_detail_prefix = _prefix + ("    " if is_last else "│   ") + "|   "
+            details_emitted = False
+            for detail in cpu_op_fields:
+                if detail in args:
+                    detail_value = args[detail]
+                    print_str = f"{cpu_detail_prefix}{detail}: {detail_value}"
+                    print(print_str)
+                    details_emitted = True
+            if details_emitted:
+                print(cpu_detail_prefix)
+
+        children = self.get_children_events(node)
+        if prune_non_gpu:
+            children = [child for child in children if "non_gpu_path" not in child]
+
+        # Check if we have backward events to show after children
+        has_bwd = include_bwd and "bwd_events" in node and node["bwd_events"]
+
+        child_count = len(children)
+        new_prefix = _prefix + ("    " if is_last else "│   ")
+
+        for i, child in enumerate(children):
+            # If we have bwd events, children are never "last" (bwd comes after)
+            child_is_last = (i == child_count - 1) and not has_bwd
+            self._traverse_subtree_recursive(
+                child,
+                prune_non_gpu,
+                cpu_op_fields=cpu_op_fields,
+                include_bwd=include_bwd,
+                _prefix=new_prefix,
+                is_last=child_is_last,
+            )
+
+        # Print backward events AFTER children
+        if has_bwd:
+            bwd_events = node["bwd_events"]
+            for i, bwd_uid in enumerate(bwd_events):
+                bwd_event = self.get_UID2event(bwd_uid)
+                if bwd_event:
+                    bwd_is_last = i == len(bwd_events) - 1
+                    bwd_connector = "└── " if bwd_is_last else "├── "
+                    bwd_name = bwd_event.get(TraceEventUtils.TraceKeys.Name, "Unknown")
+                    print(
+                        f"{new_prefix}{bwd_connector}[BWD] {bwd_name} (UID: {bwd_event.get('UID')})"
+                    )
+                    # Print backward subtree with proper sibling handling
+                    bwd_subtree_prefix = new_prefix + (
+                        "    " if bwd_is_last else "│   "
+                    )
+                    bwd_children = [
+                        self.get_UID2event(uid) for uid in bwd_event.get("children", [])
+                    ]
+                    bwd_children = [c for c in bwd_children if c]  # Filter None
+                    for j, bwd_child in enumerate(bwd_children):
+                        child_is_last = j == len(bwd_children) - 1
+                        self._traverse_subtree_recursive(
+                            bwd_child,
+                            prune_non_gpu,
+                            cpu_op_fields=cpu_op_fields,
+                            include_bwd=False,  # Don't recurse bwd->fwd->bwd
+                            _prefix=bwd_subtree_prefix,
+                            is_last=child_is_last,
+                        )
+
+    def traverse_parents_and_get_callstack(
+        self,
+        node: Dict[str, Any],
+        filter: tuple[str, ...] = (),
+        follow_fwd_link: bool = False,
+    ):
+        """
+        Traverses the parent nodes and returns a list representation of the call stack.
+
+        Args:
+            node (Dict[str, Any]): The event node from which to start traversing upwards.
+            filter (tuple[str, ...]): Optional tuple of strings to filter which nodes to include in output.
+            follow_fwd_link (bool): If True, when reaching the root of a backward event chain,
+                follow the fwd_event link to continue traversing the forward call stack.
+
+        Returns:
+            list: The call stack as a list of frame strings, starting from the node itself.
+        """
+        depth = 0
+        frames = [node["name"]]
+        # Move to parent immediately so we don't re-add the starting node
+        node = self.get_parent_event(node)
+        while node is not None:
+            name = node.get(TraceEventUtils.TraceKeys.Name, "Unknown")
+            max_len = 256
+            if len(name) > max_len:
+                name = name[:max_len] + ".."
+            if filter is None:
+                frames.append(name)
+            else:
+                if any(filter_str in name for filter_str in filter):
+                    frames.append(name)
+            parent_node = self.get_parent_event(node)
+            if parent_node is None and follow_fwd_link and "fwd_event" in node:
+                fwd_uid = node["fwd_event"]
+                fwd_node = self.get_UID2event(fwd_uid)
+                frames.append("[FWD]")
+                fwd_callstack = self.traverse_parents_and_get_callstack(
+                    fwd_node, filter, follow_fwd_link=False
+                )
+                return frames + fwd_callstack
+            node = parent_node
+            depth += 1
+        return frames
+
+    def traverse_parents_and_print(
+        self,
+        node: Dict[str, Any],
+        cpu_op_fields: tuple[str, ...] = (),
+        follow_fwd_link: bool = False,
+    ) -> None:
+        """
+        Traverses the parent nodes of a given event node and prints their details
+        in a hierarchical format, starting from the node itself and going up to the root.
+
+        Args:
+            node (Dict[str, Any]): The event node from which to start traversing upwards.
+            cpu_op_fields (tuple[str, ...]): Optional tuple to specify printing additional details for CPU operations.
+                It will be some subset of ['Input Dims', 'Input type', 'Input Strides', 'Concrete Inputs'].
+            follow_fwd_link (bool): If True, when reaching the root of a backward event chain,
+                follow the fwd_event link to continue traversing the forward call stack.
+        """
+
+        depth = 0
+        while True:
+            if depth == 0:
+                print("Node:")
+            else:
+                print(f"{depth}-up:")
+
+            # Print category and name
+            # print(f"  cat: {self.event_to_category(node)}")
+            name = node.get(TraceEventUtils.TraceKeys.Name, "Unknown")
+            max_len = 64
+            if len(name) > max_len:
+                name = name[:max_len] + ".."
+            print_str = f"  UID: {node[TraceEventUtils.TraceKeys.UID]}, Category: {self.event_to_category(node)}, Name: {name}"
+            # Print duration if category is kernel, gpu_memset, or gpu_memcpy
+            if self.event_to_category(node) in {"kernel", "gpu_memset", "gpu_memcpy"}:
+                duration = node.get(TraceEventUtils.TraceKeys.Duration)
+                if duration is not None:
+                    print_str += f", Duration: {duration}"
+            print(print_str)
+            # Print additional CPU operation details if applicable
+            if self.event_to_category(node) == "cpu_op":
+                args = node.get(TraceEventUtils.TraceKeys.Args, {})
+                cpu_detail_prefix = " " * 4
+                for detail in cpu_op_fields:
+                    if detail in args:
+                        detail_value = args[detail]
+                        print_str = f"{cpu_detail_prefix}{detail}: {detail_value}"
+                        print(print_str)
+
+            # Move to the parent node
+            parent_node = self.get_parent_event(node)
+            if parent_node is None:
+                # Check if we should follow the fwd_event link for backward events
+                if follow_fwd_link and "fwd_event" in node:
+                    fwd_uid = node["fwd_event"]
+                    fwd_node = self.get_UID2event(fwd_uid)
+                    print(f"\n{'='*60}")
+                    print(
+                        f"Following fwd_event link to forward call stack (UID: {fwd_uid})"
+                    )
+                    print(f"{'='*60}")
+                    # Recursively traverse the forward event's parent chain
+                    return self.traverse_parents_and_print(
+                        fwd_node, cpu_op_fields, follow_fwd_link=False
+                    )
+                return node
+            node = parent_node
+            depth += 1
+
+    def get_seq_nums_for_node_subtree(self, node_UID):
+        seq_nums = set()
+        event = self.events_by_uid[node_UID]
+        if (
+            event.get(TraceEventUtils.TraceKeys.Args, {}).get("Sequence number")
+            is not None
+        ):
+            seq_nums.add(event[TraceEventUtils.TraceKeys.Args]["Sequence number"])
+        if "children" in event:
+            for child_UID in event["children"]:
+                seq_nums.update(self.get_seq_nums_for_node_subtree(child_UID))
+        return seq_nums
+
+    def get_subtree_bwd_events(self, event_UID):
+        """
+        Returns all backward event UIDs from this event and all its descendants.
+
+        Does NOT modify any event - just aggregates and returns.
+        Uses the 1:1 bwd_events links established by link_all_fwd_bwd_events().
+
+        Args:
+            event_UID: The UID of the forward event to get backward events for.
+
+        Returns:
+            list: List of backward event UIDs from this subtree.
+        """
+        fwd_event = self.events_by_uid[event_UID]
+
+        # Collect all bwd_events from this event and all descendants
+        all_bwd_uids = set()
+
+        def collect_bwd(event):
+            if "bwd_events" in event:
+                all_bwd_uids.update(event["bwd_events"])
+            for child_uid in event.get("children", []):
+                child = self.get_UID2event(child_uid)
+                if child:
+                    collect_bwd(child)
+
+        collect_bwd(fwd_event)
+        return list(all_bwd_uids)
+
+    def link_all_fwd_bwd_events(self):
+        """
+        Automatically link all forward events to their corresponding backward events
+        using 1:1 mapping. For each backward autograd event, finds the leaf forward op
+        that matches the sequence number.
+
+        This populates:
+          - fwd_event["bwd_events"] = [backward event UID]  (1:1 mapping)
+          - bwd_event["fwd_event"] = forward event UID
+        """
+        linked_count = 0
+
+        # Iterate through all autograd backward events
+        for seq_num, uids in self.seq_num2event_uids_map.items():
+            # Find the autograd::engine::evaluate_function event for this seq_num
+            bwd_autograd_event = None
+            for uid in uids:
+                event = self.events_by_uid[uid]
+                name = event.get(TraceEventUtils.TraceKeys.Name, "")
+                if name.startswith("autograd::engine::evaluate_function:"):
+                    bwd_autograd_event = event
+                    break
+
+            if not bwd_autograd_event:
+                continue
+
+            # Find the leaf forward op with this sequence number
+            # (the one with the latest timestamp = most specific/deepest op)
+            # Skip backward events by checking pid/tid - backward ops run on autograd thread
+            bwd_pid = bwd_autograd_event.get("pid")
+            bwd_tid = bwd_autograd_event.get("tid")
+            leaf_fwd_event = None
+            leaf_fwd_ts = -1
+            for uid in uids:
+                event = self.events_by_uid[uid]
+                # Skip events on the same thread as the backward autograd event
+                if event.get("pid") == bwd_pid and event.get("tid") == bwd_tid:
+                    continue
+                # This is a forward event - check if it's the latest (leaf)
+                ts = event.get(TraceEventUtils.TraceKeys.TimeStamp, 0)
+                if ts > leaf_fwd_ts:
+                    leaf_fwd_ts = ts
+                    leaf_fwd_event = event
+
+            if not leaf_fwd_event:
+                continue
+
+            # 1:1 link: backward -> forward
+            bwd_autograd_event["fwd_event"] = leaf_fwd_event[
+                TraceEventUtils.TraceKeys.UID
+            ]
+
+            # 1:1 link: forward -> backward (as a list for API compatibility)
+            if "bwd_events" not in leaf_fwd_event:
+                leaf_fwd_event["bwd_events"] = []
+            leaf_fwd_event["bwd_events"].append(
+                bwd_autograd_event[TraceEventUtils.TraceKeys.UID]
+            )
+            linked_count += 1
+
+        logger.debug(f"Linked {linked_count} forward-backward event pairs (1:1)")
+
+    def _get_graph_gpu_events(self, graph_launch_evt):
+        corr = graph_launch_evt.get(TraceEventUtils.TraceKeys.Args, {}).get(
+            self.linking_key
+        )
+        if corr is None:
+            return []
+        return self.linking_id_to_gpu_events.get(corr, [])
+
+    def _find_corresponding_output_event(self, input_event):
+        # 1. Get the linking id from the input event
+        # 2. Find the corresponding start and end ac2g events for the linking id
+        # 3. Find the output event using the pid, tid, and linking id of the end ac2g event
+        link_id = input_event.get(TraceEventUtils.TraceKeys.Args, {}).get(
+            self.linking_key
+        )
+        ac2g_start_event = self.ac2g_event_map["start"].get(link_id)
+        ac2g_end_event = self.ac2g_event_map["end"].get(link_id)
+
+        if not ac2g_start_event:
+            return None
+
+        if not ac2g_end_event:
+            # print(f"Warning: start ac2g event found for {self.linking_key}={link_id} but no corresponding end ac2g event found.")
+            # print(f"Input event name: {input_event[TraceEventUtils.TraceKeys.Name]}")
+            # print(('-'*64))
+            return None
+
+        pid = ac2g_end_event.get(TraceEventUtils.TraceKeys.PID)
+        tid = ac2g_end_event.get(TraceEventUtils.TraceKeys.TID)
+        link_id = ac2g_end_event.get("id")
+
+        output_event = self.pid_tid_event_map.get((pid, tid, link_id))
+        return output_event
+
+    def get_nn_module_children(self, nn_module_event: Dict[str, Any]):
+        """
+        Get the UIDs of the nn.Module children of the provided nn.Module event.
+        """
+        if not self.add_python_func:
+            raise ValueError(
+                "This method requires the add_python_func flag to be set to True when building the tree."
+            )
+        # if the nn.Module children are already cached, return them
+        if "nn_module_children" in nn_module_event:
+            return nn_module_event["nn_module_children"]
+        nn_module_children = []
+        for child_UID in nn_module_event.get("children", []):
+            child = self.get_UID2event(child_UID)
+            if self._is_nn_module_event(child):
+                nn_module_children.append(child_UID)
+            else:
+                nn_module_children.extend(
+                    self.get_nn_module_children(self.get_UID2event(child_UID))
+                )
+        # cache the nn.Module children for later use
+        nn_module_event["nn_module_children"] = nn_module_children
+        # set parent for each child
+        for child_UID in nn_module_children:
+            child = self.get_UID2event(child_UID)
+            child["nn_module_parent"] = nn_module_event[TraceEventUtils.TraceKeys.UID]
+        return nn_module_children
+
+    def get_nn_module_parent(self, nn_module_event: Dict[str, Any]):
+        """
+        Get the UID of the nn.Module parent of the provided nn.Module event.
+        """
+        if not self.add_python_func:
+            raise ValueError(
+                "This method requires the add_python_func flag to be set to True when building the tree."
+            )
+        # if the nn.Module parent is already cached, return it
+        if "nn_module_parent" in nn_module_event:
+            return nn_module_event["nn_module_parent"]
+        # find the parent, traverse up the tree until we find a nn.Module event or parent is None
+        parent_UID = nn_module_event.get("parent")
+        while parent_UID is not None:
+            parent = self.get_UID2event(parent_UID)
+            if self._is_nn_module_event(parent):
+                nn_module_event["nn_module_parent"] = parent_UID
+                return parent_UID
+            parent_UID = parent.get("parent")
+        # if no parent is found, return None
+        return None

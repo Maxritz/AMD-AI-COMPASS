@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "magpie": {
+      "command": "python",
+      "args": ["-m", "Magpie.mcp"],
+      "env": {
+        "PYTHONPATH": "/PATH/TO/PROJECT"
+      }
+    }
+  }
+}

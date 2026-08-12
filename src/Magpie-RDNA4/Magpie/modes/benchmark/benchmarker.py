@@ -1,0 +1,1992 @@
+###############################################################################
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+"""
+Core benchmarker for benchmark mode.
+
+Orchestrates benchmark execution using InferenceX as backend.
+"""
+
+import json
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from ...core.ray_executor import RayJobExecutor
+    from ...core.task import Task
+
+from ...utils.gpu import GPUVendor, detect_gpu, find_idle_gpus
+from ...utils.gpu_monitor import GPUMonitor
+from .config import BenchmarkConfig
+from .image_selector import ImageSelector
+from .inferencex import ensure_inferencex_available
+from .result import BenchmarkResult, LatencyMetrics, ResultParser, ThroughputMetrics
+from .tracelens import TraceLensAnalyzer
+from .tracelens_inference import (
+    TraceLensInferencePipeline,
+    is_tracelens_inference_enabled,
+)
+from .tracelens_runtime import prepare_tracelens_runtime_image
+from .workspace import WorkspaceManager
+
+logger = logging.getLogger(__name__)
+
+# Scripts shipping with Magpie that honor MAGPIE_RUN_PHASE (server/client split).
+MAGPIE_BUILTIN_SCRIPTS = frozenset(
+    {
+        "vllm_mi300x.sh",
+        "vllm_mi355x.sh",
+        "sglang_mi300x.sh",
+        "sglang_mi355x.sh",
+        "atom_mi300x.sh",
+        "atom_mi355x.sh",
+    }
+)
+
+
+class BenchmarkMode:
+    """
+    Benchmark mode for framework-level profiling.
+    
+    Uses InferenceX as backend to run vLLM/SGLang/Atom benchmarks
+    either inside Docker containers (run_mode=docker), directly
+    on the host (run_mode=local), or on a remote Ray cluster
+    (run_mode=ray).
+    """
+    
+    def __init__(
+        self,
+        config: BenchmarkConfig,
+        image_config_path: Optional[str] = None,
+        output_dir: str = "./results",
+    ):
+        """
+        Initialize benchmark mode.
+        
+        Args:
+            config: Benchmark configuration
+            image_config_path: Path to benchmark_images.yaml
+            output_dir: Base directory for results
+        """
+        self.config = config
+        self.image_selector = ImageSelector(image_config_path)
+        self.workspace_mgr = WorkspaceManager(
+            base_dir=output_dir,
+            framework=config.framework,
+            container_writable=config.run_mode == "docker",
+        )
+        self._task_id: Optional[str] = None
+    
+    def run(self, task_id: Optional[str] = None) -> BenchmarkResult:
+        """
+        Run benchmark.
+        
+        Args:
+            task_id: Optional task identifier for container naming
+        
+        Returns:
+            BenchmarkResult with metrics and profiling data
+        """
+        self._task_id = task_id or f"bench_{int(time.time())}"
+        start_time = time.time()
+        
+        logger.info(f"Starting benchmark: {self.config.framework} / {self.config.model}")
+        
+        # Ray mode: delegate to remote cluster and return when complete
+        if self.config.is_ray:
+            return self._execute_ray_benchmark()
+        
+        # 0. Ensure InferenceX is available (auto-clone if needed)
+        try:
+            self.config.inferencex_path = ensure_inferencex_available(
+                self.config.inferencex_path
+            )
+        except RuntimeError as e:
+            result = BenchmarkResult()
+            result.success = False
+            result.errors.append(f"Failed to setup InferenceX: {e}")
+            result.errors.append(
+                "Please clone manually: "
+                "git clone https://github.com/SemiAnalysisAI/InferenceX.git"
+            )
+            return result
+        
+        # 0b. Optionally pick idle GPU(s) and pin VISIBLE_DEVICES.
+        # When server_lifecycle will reuse an existing HTTP server, skip
+        # find_idle_gpus so ROCR/HIP/CUDA_VISIBLE_* are not reshuffled versus
+        # the already-running server's physical devices.
+        skip_idle_gpu_for_reuse = (
+            self.config.is_local
+            and self.config.is_server_lifecycle
+            and self._reuse_will_attach_to_existing_server()
+        )
+        try:
+            if skip_idle_gpu_for_reuse:
+                logger.info(
+                    "server_lifecycle: reusing eligible server on PORT=%s — "
+                    "skipping gpu_selection.auto (find_idle_gpus)",
+                    self._reuse_benchmark_port(),
+                )
+            else:
+                self._apply_gpu_selection()
+        except RuntimeError as e:
+            result = BenchmarkResult()
+            result.success = False
+            result.errors.append(str(e))
+            return result
+
+        # 1. Copy Magpie generic scripts to InferenceX/benchmarks/
+        self._prepare_benchmark_scripts()
+        
+        # 2. Determine runner type from GPU
+        runner_type = self._get_runner_type()
+        
+        # 3. Find and validate benchmark script BEFORE container starts
+        try:
+            benchmark_script = self._get_benchmark_script(runner_type)
+            logger.info(f"Selected benchmark script: {benchmark_script}")
+        except FileNotFoundError as e:
+            result = BenchmarkResult()
+            result.success = False
+            result.errors.append(str(e))
+            return result
+        
+        # 4. Create workspace
+        workspace = self.workspace_mgr.create(self.config.to_dict())
+
+        # 4a. For Docker benchmarks, TraceLens inference can derive a patched
+        # framework runtime image from supported official vLLM/SGLang images.
+        tracelens_runtime_result: Optional[Dict[str, Any]] = None
+        if (
+            is_tracelens_inference_enabled(self.config)
+            and self.config.run_mode == "docker"
+        ):
+            try:
+                base_image = self._select_image()
+                tracelens_runtime_result = prepare_tracelens_runtime_image(
+                    config=self.config,
+                    base_image=base_image,
+                    runner_type=runner_type,
+                )
+                self.config.docker_image = str(
+                    tracelens_runtime_result.get("image") or base_image
+                )
+                logger.info(
+                    "TraceLens runtime image: %s (%s)",
+                    self.config.docker_image,
+                    tracelens_runtime_result.get("reason", "ready"),
+                )
+                self.workspace_mgr._save_config_snapshot(
+                    workspace,
+                    self.config.to_dict(),
+                )
+            except Exception as e:
+                result = BenchmarkResult(
+                    success=False,
+                    framework=self.config.framework,
+                    model=self.config.model,
+                    workspace_dir=str(workspace),
+                    execution_time=time.time() - start_time,
+                    profiling_enabled=self.config.profiler.torch_profiler.enabled,
+                )
+                result.errors.append(f"TraceLens runtime image setup failed: {e}")
+                result.tracelens_analysis = {
+                    "enabled": True,
+                    "analysis_mode": "inference",
+                    "runtime_error": str(e),
+                }
+                self.workspace_mgr.save_report(result.to_dict())
+                self.workspace_mgr.save_summary(result.get_summary())
+                return result
+
+        # 4b. TraceLens inference mode needs to adjust profiler envs and a
+        # small number of InferenceX helper files before the benchmark starts.
+        tracelens_inference_pipeline: Optional[TraceLensInferencePipeline] = None
+        tracelens_preprocess_result: Optional[Dict[str, Any]] = None
+        if is_tracelens_inference_enabled(self.config):
+            logger.info("Preparing TraceLens inference-mode benchmark hooks")
+            tracelens_inference_pipeline = TraceLensInferencePipeline(self.config)
+            try:
+                tracelens_preprocess_result = tracelens_inference_pipeline.prepare(
+                    workspace
+                )
+                if tracelens_runtime_result is not None:
+                    tracelens_preprocess_result["runtime"] = tracelens_runtime_result
+                for warning in tracelens_preprocess_result.get("warnings", []):
+                    logger.warning("TraceLens preprocess warning: %s", warning)
+                # Refresh the config snapshot after preprocess mutates envs.
+                self.workspace_mgr._save_config_snapshot(
+                    workspace,
+                    self.config.to_dict(),
+                )
+            except Exception as e:
+                restore_result = tracelens_inference_pipeline.restore()
+                result = BenchmarkResult(
+                    success=False,
+                    framework=self.config.framework,
+                    model=self.config.model,
+                    workspace_dir=str(workspace),
+                    execution_time=time.time() - start_time,
+                    profiling_enabled=self.config.profiler.torch_profiler.enabled,
+                )
+                result.errors.append(f"TraceLens preprocess failed: {e}")
+                result.tracelens_analysis = {
+                    "enabled": True,
+                    "analysis_mode": "inference",
+                    "preprocess_error": str(e),
+                    "restore": restore_result,
+                }
+                self.workspace_mgr.save_report(result.to_dict())
+                self.workspace_mgr.save_summary(result.get_summary())
+                return result
+        
+        # 4b. Start GPU monitor if enabled
+        gpu_monitor = None
+        gpu_monitor_stats = None
+        if self.config.profiler.gpu_monitor.enabled:
+            monitor_cfg = self.config.profiler.gpu_monitor
+            device_id = monitor_cfg.device_id
+            if device_id is None:
+                # Auto-detect from GPU selection or default to 0
+                envs = self.config.envs or {}
+                visible = envs.get("HIP_VISIBLE_DEVICES") or envs.get("CUDA_VISIBLE_DEVICES") or envs.get("ROCR_VISIBLE_DEVICES")
+                if visible:
+                    device_id = int(visible.split(",")[0])
+                else:
+                    device_id = 0
+            gpu_monitor = GPUMonitor(
+                device_id=device_id,
+                interval_sec=monitor_cfg.interval_sec,
+            )
+            if gpu_monitor.start():
+                logger.info(f"GPU monitor started (device={device_id}, interval={monitor_cfg.interval_sec}s)")
+            else:
+                # Unsupported vendor, disable monitor
+                gpu_monitor = None
+        
+        # 5-7. Build and execute (Docker or local)
+        if self.config.is_local:
+            symlink = self._create_workspace_symlink(workspace)
+            try:
+                if self.config.is_server_lifecycle:
+                    logger.info(
+                        "Running local benchmark with server lifecycle (reuse-aware)"
+                    )
+                    result, stdout, stderr = self._execute_local_benchmark_with_reuse(
+                        workspace=workspace,
+                        runner_type=runner_type,
+                    )
+                else:
+                    local_cmd, local_env = self._build_local_command(
+                        workspace=workspace,
+                        runner_type=runner_type,
+                    )
+                    logger.info("Running benchmark locally (no Docker)")
+                    logger.debug(f"Local command: {' '.join(local_cmd)}")
+                    result, stdout, stderr = self._execute_local_benchmark(
+                        local_cmd, local_env, workspace,
+                    )
+            finally:
+                self._remove_workspace_symlink(symlink)
+                if not self.config.is_server_lifecycle:
+                    self._cleanup_server_processes(self.config.framework)
+        else:
+            docker_image = self._select_image()
+            docker_cmd = self._build_docker_command(
+                docker_image=docker_image,
+                workspace=workspace,
+                runner_type=runner_type,
+            )
+            logger.info(f"Running benchmark in container with image: {docker_image}")
+            logger.debug(f"Docker command: {' '.join(docker_cmd)}")
+            result, stdout, stderr = self._execute_benchmark(docker_cmd, workspace)
+        
+        # 7b. Stop GPU monitor and collect stats
+        if gpu_monitor is not None:
+            gpu_monitor_stats = gpu_monitor.stop()
+            logger.info(f"GPU monitor stopped: {gpu_monitor_stats.sample_count} samples collected")
+        
+        # 8. Collect results
+        result.workspace_dir = str(workspace)
+        result.execution_time = time.time() - start_time
+        result.framework = self.config.framework
+        result.model = self.config.model
+        result.profiling_enabled = self.config.profiler.torch_profiler.enabled
+        
+        # Add GPU monitor stats
+        if gpu_monitor_stats is not None:
+            result.gpu_monitor = gpu_monitor_stats.to_dict()
+        
+        # Parse InferenceX output
+        result_file = workspace / "inferencex_result.json"
+        if result_file.exists():
+            parsed = ResultParser.parse_inferencex_result(
+                result_file,
+                framework=self.config.framework,
+                model=self.config.model,
+                is_scriptable=self.config.is_scriptable,
+            )
+            # Merge parsed results
+            result.throughput = parsed.throughput
+            result.latency = parsed.latency
+            result.raw_result = parsed.raw_result
+            # Scriptable (server-less) extras — e.g. xDiT diffusion quality gate.
+            result.workload_kind = parsed.workload_kind
+            result.throughput_unit = parsed.throughput_unit
+            result.quality_gate = parsed.quality_gate
+            result.latency_s = parsed.latency_s
+            if parsed.errors:
+                result.errors.extend(parsed.errors)
+            # Propagate a parse-time gate failure: parse_inferencex_result sets
+            # success=False when the (scriptable) quality gate is missing/not
+            # passed, but the process exit code already set result.success=True.
+            # Without this the gate enforcement would be silently dropped.
+            if not parsed.success:
+                result.success = False
+        else:
+            result.success = False
+            mode_label = "locally" if self.config.is_local else "inside container"
+            result.errors.append(
+                f"inferencex_result.json not found - benchmark may have failed {mode_label}"
+            )
+            if stderr:
+                result.errors.append(f"stderr (last 500 chars): {stderr[-500:]}")
+
+            server_log = workspace / "server.log"
+            if server_log.exists():
+                try:
+                    lines = server_log.read_text().splitlines()
+                    error_lines = [
+                        line
+                        for line in lines[-50:]
+                        if any(
+                            kw in line
+                            for kw in [
+                                "Error",
+                                "Exception",
+                                "FAILED",
+                                "Traceback",
+                                "RuntimeError",
+                            ]
+                        )
+                    ]
+                    if error_lines:
+                        result.errors.append(
+                            f"server.log errors: {chr(10).join(error_lines[-5:])}"
+                        )
+                except Exception:
+                    pass
+        
+        # Validate that we got actual results
+        if result.success and not self._validate_results(result):
+            result.success = False
+            result.errors.append("Benchmark produced no valid throughput/latency metrics")
+        
+        # Parse torch trace if available
+        if self.config.profiler.torch_profiler.enabled:
+            torch_trace_dir = workspace / "torch_trace"
+            # Recursive: atom writes per-rank traces under rank_<N>/ subdirs
+            trace_files = list(torch_trace_dir.rglob("*.json.gz")) if torch_trace_dir.is_dir() else []
+            has_traces = len(trace_files) > 0
+
+            if not result.success or not has_traces:
+                if not has_traces:
+                    logger.warning("No torch trace files found, skipping trace analysis / gap analysis")
+                else:
+                    logger.warning("Benchmark failed, skipping trace analysis / gap analysis")
+            else:
+                kernels = ResultParser.parse_torch_trace(torch_trace_dir)
+                result.kernel_summary = kernels
+                result.top_bottlenecks = [k.name for k in kernels[:10]]
+
+                if self.config.profiler.tracelens.enabled:
+                    if is_tracelens_inference_enabled(self.config):
+                        tracelens_result = self._run_tracelens_inference_analysis(
+                            torch_trace_dir=torch_trace_dir,
+                            workspace=workspace,
+                            runner_type=runner_type,
+                            pipeline=tracelens_inference_pipeline,
+                        )
+                    else:
+                        tracelens_result = self._run_tracelens_analysis(
+                            torch_trace_dir, workspace
+                        )
+                    if tracelens_preprocess_result is not None:
+                        tracelens_result["preprocess"] = tracelens_preprocess_result
+                    result.tracelens_analysis = tracelens_result
+
+                if self.config.gap_analysis.enabled:
+                    gap_result = self._run_gap_analysis(torch_trace_dir, workspace)
+                    result.gap_analysis = gap_result
+
+        if tracelens_inference_pipeline is not None:
+            restore_result = tracelens_inference_pipeline.restore()
+            if result.tracelens_analysis is None:
+                result.tracelens_analysis = {
+                    "enabled": True,
+                    "analysis_mode": "inference",
+                }
+            if (
+                tracelens_preprocess_result is not None
+                and "preprocess" not in result.tracelens_analysis
+            ):
+                result.tracelens_analysis["preprocess"] = tracelens_preprocess_result
+            result.tracelens_analysis["restore"] = restore_result
+            for warning in restore_result.get("warnings", []):
+                logger.warning("TraceLens restore warning: %s", warning)
+
+        # Save report
+        self.workspace_mgr.save_report(result.to_dict())
+        self.workspace_mgr.save_summary(result.get_summary())
+        
+        logger.info(f"Benchmark completed in {result.execution_time:.2f}s")
+        
+        return result
+    
+    def _apply_gpu_selection(self) -> None:
+        """Resolve idle GPU(s) and inject the selection into config.envs.
+
+        No-op when ``self.config.gpu_selection.auto`` is False, when the
+        caller has already pinned ``HIP_VISIBLE_DEVICES`` /
+        ``CUDA_VISIBLE_DEVICES`` / ``ROCR_VISIBLE_DEVICES`` in the yaml,
+        or when run_mode is ``ray`` (Ray manages its own scheduling).
+        """
+        sel = self.config.gpu_selection
+        if not sel.auto:
+            return
+        if self.config.is_ray:
+            logger.info("gpu_selection.auto ignored under run_mode=ray")
+            return
+
+        # Honor manual override from yaml envs
+        envs_upper = {str(k).upper(): v for k, v in self.config.envs.items()}
+        for var in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES",
+                    "ROCR_VISIBLE_DEVICES"):
+            if envs_upper.get(var) not in (None, ""):
+                logger.info(
+                    "gpu_selection.auto skipped: %s already set in envs (%s)",
+                    var, envs_upper.get(var),
+                )
+                return
+
+        # Determine how many GPUs we need
+        count = sel.count
+        if count is None:
+            try:
+                count = max(1, int(envs_upper.get("TP", 1)))
+            except (TypeError, ValueError):
+                count = 1
+
+        try:
+            chosen = find_idle_gpus(
+                count=count,
+                min_free_memory_gb=sel.min_free_memory_gb,
+                candidates=sel.candidates,
+            )
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"gpu_selection.auto failed: {e}. "
+                "Free a GPU, raise gpu_selection.min_free_memory_gb, or set "
+                "HIP_VISIBLE_DEVICES manually in envs."
+            ) from e
+
+        if len(chosen) < count:
+            raise RuntimeError(
+                f"gpu_selection.auto: needed {count} idle GPU(s) but only "
+                f"found {len(chosen)} ({chosen})"
+            )
+
+        dev_str = ",".join(str(d) for d in chosen)
+
+        # AMD: set ROCR_VISIBLE_DEVICES (shares index space with rocm-smi);
+        #      Also set HIP_VISIBLE_DEVICES to 0..N-1 since ROCR re-indexes GPUs
+        #      and HIP needs logical indices, not physical ones.
+        # NVIDIA: force PCI_BUS_ID order so CUDA_VISIBLE_DEVICES matches nvidia-smi.
+        vendor, _ = detect_gpu()
+        if vendor == GPUVendor.AMD:
+            self.config.envs["ROCR_VISIBLE_DEVICES"] = dev_str
+            # HIP needs logical indices 0..N-1 after ROCR filtering
+            hip_indices = ",".join(str(i) for i in range(len(chosen)))
+            self.config.envs["HIP_VISIBLE_DEVICES"] = hip_indices
+        else:
+            self.config.envs["CUDA_VISIBLE_DEVICES"] = dev_str
+            self.config.envs.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
+        logger.info(
+            "gpu_selection.auto: pinned benchmark to physical GPU(s) %s "
+            "(vendor=%s)", dev_str, vendor.name,
+        )
+
+    def _select_image(self) -> str:
+        """Select Docker image based on configuration."""
+        return self.image_selector.select_image(
+            framework=self.config.framework,
+            gpu_arch=self.config.gpu_arch,
+            override_image=self.config.docker_image,
+        )
+    
+    def _get_runner_type(self) -> str:
+        """Get InferenceX runner type."""
+        if self.config.runner_type:
+            return self.config.runner_type
+        return self.image_selector.get_runner_type(self.config.gpu_arch)
+    
+    def _prepare_benchmark_scripts(self) -> None:
+        """
+        Copy Magpie generic benchmark scripts to InferenceX/benchmarks/.
+        
+        This allows using Magpie's generic scripts while still leveraging
+        InferenceX's benchmark_lib.sh and other utilities.
+        
+        Always overwrites to keep scripts in sync with Magpie source.
+        """
+        # Magpie scripts location: Magpie/scripts/benchmark/
+        magpie_scripts = Path(__file__).parent.parent.parent / "scripts" / "benchmark"
+        target_dir = Path(self.config.inferencex_path) / "benchmarks"
+        
+        if not magpie_scripts.exists():
+            logger.debug(f"Magpie scripts directory not found: {magpie_scripts}")
+            return
+        
+        # Ensure target directory exists
+        target_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy all .sh scripts (always overwrite to keep in sync with Magpie source)
+        for script in magpie_scripts.glob("*.sh"):
+            target_file = target_dir / script.name
+            self._copy_benchmark_script_atomic(script, target_file)
+            logger.info(f"Copied Magpie script {script.name} to {target_dir}")
+
+    @staticmethod
+    def _copy_benchmark_script_atomic(script: Path, target_file: Path) -> None:
+        """Copy a benchmark script without exposing a truncated target file."""
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{target_file.name}.",
+            suffix=".tmp",
+            dir=str(target_file.parent),
+        )
+        try:
+            os.close(tmp_fd)
+            shutil.copy2(script, tmp_name)
+            os.chmod(tmp_name, 0o755)
+            os.replace(tmp_name, target_file)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    
+    def _validate_results(self, result: BenchmarkResult) -> bool:
+        """
+        Validate that benchmark produced meaningful results.
+        
+        Args:
+            result: BenchmarkResult to validate
+        
+        Returns:
+            True if results are valid, False otherwise
+        """
+        # Check if we have throughput metrics with actual values
+        if result.throughput:
+            if result.throughput.request_throughput > 0:
+                return True
+            if result.throughput.output_throughput > 0:
+                return True
+            if result.throughput.completed_requests > 0:
+                return True
+        
+        # Check if we have latency metrics
+        if result.latency:
+            if result.latency.ttft_mean > 0 or result.latency.e2el_mean > 0:
+                return True
+        
+        return False
+    
+    def _build_docker_command(
+        self,
+        docker_image: str,
+        workspace: Path,
+        runner_type: str,
+    ) -> List[str]:
+        """
+        Build Docker run command.
+        
+        Args:
+            docker_image: Docker image to use
+            workspace: Workspace directory path
+            runner_type: InferenceX runner type
+        
+        Returns:
+            Docker command as list of strings
+        """
+        # Detect GPU vendor for device flags
+        vendor, arch = detect_gpu()
+        
+        cmd = [
+            "docker", "run", "--rm",
+            "--ipc=host", "--shm-size=16g", "--network=host",
+            "--name", f"magpie-benchmark-{self._task_id}",
+        ]
+        
+        # Add GPU-specific flags
+        if vendor == GPUVendor.AMD:
+            cmd.extend([
+                "--privileged",
+                "--cap-add=CAP_SYS_ADMIN",
+                "--device=/dev/kfd",
+                "--device=/dev/dri",
+                "--device=/dev/mem",
+                "--cap-add=SYS_PTRACE",
+                "--security-opt", "seccomp=unconfined",
+            ])
+        elif vendor == GPUVendor.NVIDIA:
+            cmd.extend([
+                "--gpus", "all",
+            ])
+        
+        # HuggingFace cache mount
+        hf_cache = self.config.hf_cache_path or os.path.expanduser("~/.cache/huggingface")
+        if os.path.exists(hf_cache):
+            cmd.extend(["-v", f"{hf_cache}:/root/.cache/huggingface"])
+        
+        # InferenceX mount
+        inferencex_path = self.config.inferencex_path
+        if os.path.exists(inferencex_path):
+            cmd.extend(["-v", f"{inferencex_path}:/opt/InferenceX"])
+
+        # Model directory mount — if the model path is a local directory, mount it
+        # so the container can access the weights (e.g. /mnt/dcgpuval/datasets/...)
+        model_path = self.config.model
+        if model_path and os.path.isdir(model_path):
+            cmd.extend(["-v", f"{model_path}:{model_path}"])
+        
+        # Workspace mount — map directly to /workspace so all output
+        # (server.log, results, torch_trace/) lands on the host automatically
+        cmd.extend(["-v", f"{workspace}:/workspace"])
+        
+        # Environment variables
+        env_vars = self.config.get_env_vars()
+        env_vars["RESULT_FILENAME"] = "inferencex_result"
+        env_vars["RESULT_DIR"] = "/workspace"
+        env_vars["RUNNER_TYPE"] = runner_type
+        
+        # torch_profiler environment (matches official InferenceX: PROFILE=1)
+        if self.config.profiler.torch_profiler.enabled:
+            env_vars["PROFILE"] = "1"
+            env_vars["VLLM_TORCH_PROFILER_DIR"] = "/workspace/torch_trace"
+            env_vars["SGLANG_TORCH_PROFILER_DIR"] = "/workspace/torch_trace"
+            env_vars["ATOM_TORCH_PROFILER_DIR"] = "/workspace/torch_trace"
+
+        
+        # HuggingFace token from environment
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if hf_token:
+            env_vars["HF_TOKEN"] = hf_token
+        
+        for key, value in env_vars.items():
+            cmd.extend(["-e", f"{key}={value}"])
+        
+        # Working directory
+        cmd.extend(["-w", "/opt/InferenceX"])
+        
+        # Image and entrypoint - always override to bash for script compatibility
+        cmd.extend(["--entrypoint", "/bin/bash"])
+        cmd.append(docker_image)
+        
+        # Build the benchmark command
+        benchmark_script = self._get_benchmark_script(runner_type)
+        
+        # With --entrypoint /bin/bash, pass -c as first arg
+        cmd.extend([
+            "-c",
+            f"cd /opt/InferenceX && bash {benchmark_script}"
+        ])
+        
+        return cmd
+    
+    def _create_workspace_symlink(self, workspace: Path) -> Optional[Path]:
+        """
+        Create /workspace symlink pointing to the real workspace directory.
+        
+        Skipped: RESULT_DIR and SERVER_LOG are already passed via env vars
+        in _build_local_command, so InferenceX scripts resolve paths correctly
+        without a /workspace symlink. Creating symlinks in pods causes stale
+        references when benchmarks are interrupted.
+        
+        Returns:
+            Always None (symlink creation disabled).
+        """
+        logger.debug(
+            f"Skipping /workspace symlink (RESULT_DIR={workspace} is passed via env)"
+        )
+        return None
+
+    @staticmethod
+    def _remove_workspace_symlink(symlink: Optional[Path]) -> None:
+        """Remove the /workspace symlink created by _create_workspace_symlink."""
+        if symlink is None:
+            return
+        try:
+            if symlink.is_symlink():
+                symlink.unlink()
+                logger.info(f"Removed symlink {symlink}")
+        except OSError as e:
+            logger.warning(f"Could not remove symlink {symlink}: {e}")
+
+    def _build_local_command(
+        self,
+        workspace: Path,
+        runner_type: str,
+        phase: str = "all",
+        server_pid_file: Optional[Path] = None,
+    ) -> tuple:
+        """
+        Build command and environment for local (non-Docker) execution.
+
+        Args:
+            workspace: Workspace directory path
+            runner_type: InferenceX runner type
+            phase: InferenceX MAGPIE_RUN_PHASE: ``all``, ``server``, or ``client``.
+            server_pid_file: Writes server PID during ``MAGPIE_RUN_PHASE=server``.
+
+        Returns:
+            Tuple of (command list, environment dict)
+        """
+        benchmark_script = self._get_benchmark_script(runner_type)
+        inferencex_path = str(Path(self.config.inferencex_path).resolve())
+
+        cmd = [
+            "bash", "-c",
+            f"cd {inferencex_path} && bash {benchmark_script}",
+        ]
+
+        env = os.environ.copy()
+
+        env_vars = self.config.get_env_vars()
+        env_vars["RESULT_FILENAME"] = "inferencex_result"
+        env_vars["RESULT_DIR"] = str(workspace)
+        env_vars["RUNNER_TYPE"] = runner_type
+        env_vars["MAGPIE_RUN_PHASE"] = phase
+        if phase == "server" and server_pid_file is not None:
+            env_vars["MAGPIE_SERVER_PID_FILE"] = str(server_pid_file)
+
+        if self.config.profiler.torch_profiler.enabled:
+            torch_trace_dir = workspace / "torch_trace"
+            torch_trace_dir.mkdir(parents=True, exist_ok=True)
+            env_vars["PROFILE"] = "1"
+            env_vars["VLLM_TORCH_PROFILER_DIR"] = str(torch_trace_dir)
+            env_vars["SGLANG_TORCH_PROFILER_DIR"] = str(torch_trace_dir)
+            env_vars["ATOM_TORCH_PROFILER_DIR"] = str(torch_trace_dir)
+
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if hf_token:
+            env_vars["HF_TOKEN"] = hf_token
+
+        env_vars["SERVER_LOG"] = str(workspace / "server.log")
+
+        for key, value in env_vars.items():
+            env[key] = str(value)
+
+        return cmd, env
+
+    def _execute_local_benchmark_with_reuse(
+        self,
+        workspace: Path,
+        runner_type: str,
+    ) -> Tuple[BenchmarkResult, str, str]:
+        """
+        Launch or reuse one shared server, run only the benchmark client locally.
+
+        See ``BenchmarkConfig.server_lifecycle`` — requires a Magpie built-in shell
+        that implements ``MAGPIE_RUN_PHASE=server`` / ``client``.
+        """
+        lc = self.config.server_lifecycle
+        assert lc is not None
+
+        result = BenchmarkResult()
+        stdout_parts: List[str] = []
+        stderr_parts: List[str] = []
+
+        try:
+            rel_script = self._get_benchmark_script(runner_type)
+        except FileNotFoundError as exc:
+            result.success = False
+            result.errors.append(str(exc))
+            return result, "", ""
+
+        script_name = Path(rel_script).name
+        if script_name not in MAGPIE_BUILTIN_SCRIPTS:
+            result.success = False
+            result.errors.append(
+                "server_lifecycle requires a Magpie built-in InferenceX benchmark "
+                "script (vllm_mi300x.sh, vllm_mi355x.sh, sglang_mi300x.sh, "
+                "sglang_mi355x.sh, atom_mi300x.sh, atom_mi355x.sh). Current "
+                f"resolved script={script_name}. Set benchmark_script accordingly "
+                "or omit server_lifecycle."
+            )
+            return result, "", ""
+
+        port = self._reuse_benchmark_port()
+
+        pid_dir, pid_file, meta_file = self._reuse_server_paths(port)
+        desired = self._desired_reuse_server_meta(port)
+
+        if self._reuse_http_healthy(port):
+            stored_meta = self._reuse_read_meta(meta_file)
+            if not lc.force_reuse:
+                mismatch = self._reuse_meta_mismatch(stored_meta, desired)
+                if mismatch:
+                    result.success = False
+                    result.errors.append(
+                        f"Reuse metadata mismatch ({mismatch}); running server on "
+                        f"PORT={port} is incompatible with this benchmark config "
+                        "or leftover state is stale. Set server_lifecycle."
+                        "force_reuse=true to skip checks, recycle with cleanup:true, "
+                        "or terminate the unrelated process manually."
+                    )
+                    return result, "", ""
+
+            rec_pid = None
+            if isinstance(stored_meta, dict):
+                rec_pid = stored_meta.get("server_pid")
+            logger.info(
+                "server_lifecycle: reusing HTTP server on port %s "
+                "(meta server_pid=%s, cleanup_after_run=%s)",
+                port,
+                rec_pid if rec_pid is not None else "n/a",
+                lc.cleanup,
+            )
+            stdout_parts.append(
+                f"[reuse] Using existing HTTP server on 127.0.0.1:{port}\n"
+            )
+        else:
+            self._reuse_clear_stale_artifacts(pid_file, meta_file, port)
+
+            spawn_pid_path = workspace / "reuse_server_spawn.pid"
+            server_timeout = float(lc.server_ready_timeout_s) + 180.0
+            server_cmd, server_env = self._build_local_command(
+                workspace=workspace,
+                runner_type=runner_type,
+                phase="server",
+                server_pid_file=spawn_pid_path,
+            )
+
+            logger.info(
+                "server_lifecycle: starting shared server phase (timeout %.0fs)",
+                server_timeout,
+            )
+            try:
+                proc = subprocess.run(
+                    server_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=server_timeout,
+                    env=server_env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                result.success = False
+                msg = (
+                    f"Shared server launcher timed out after {server_timeout:.0f}s "
+                    "(see workspace server.log)."
+                )
+                result.errors.append(msg)
+                sout = getattr(exc, "stdout", "") or ""
+                serr = getattr(exc, "stderr", "") or ""
+                return result, sout, serr
+
+            if proc.stdout:
+                stdout_parts.append(proc.stdout)
+            if proc.stderr:
+                stderr_parts.append(proc.stderr)
+
+            if proc.returncode != 0:
+                result.success = False
+                joined_err = "".join(stderr_parts[-1:]) if stderr_parts else (proc.stderr or "")
+                tail = joined_err[-500:] if joined_err else ""
+                result.errors.append(
+                    f"server_lifecycle server phase exited with "
+                    f"{proc.returncode}. stderr tail: {tail}"
+                )
+                return result, "\n".join(stdout_parts), "\n".join(stderr_parts)
+
+            if not spawn_pid_path.exists():
+                result.success = False
+                result.errors.append(
+                    "server_lifecycle: expected MAGPIE_SERVER_PID_FILE missing after "
+                    f"server phase ({spawn_pid_path})."
+                )
+                return result, "\n".join(stdout_parts), "\n".join(stderr_parts)
+
+            try:
+                server_pid_txt = spawn_pid_path.read_text().strip()
+                _ = int(server_pid_txt)
+            except (ValueError, OSError) as exc:
+                result.success = False
+                result.errors.append(
+                    f"server_lifecycle: could not read server PID ({exc})."
+                )
+                return result, "\n".join(stdout_parts), "\n".join(stderr_parts)
+
+            try:
+                pid_file.write_text(server_pid_txt + "\n")
+            except OSError as exc:
+                result.success = False
+                result.errors.append(f"failed to persist pid file ({exc}).")
+                return result, "\n".join(stdout_parts), "\n".join(stderr_parts)
+
+            deadline = time.time() + float(lc.server_ready_timeout_s)
+            if not self._reuse_wait_health(port, deadline):
+                tail = ""
+                srv_log = workspace / "server.log"
+                try:
+                    if srv_log.exists():
+                        tail = srv_log.read_text(errors="replace")[-2000:]
+                except OSError:
+                    tail = ""
+                result.success = False
+                result.errors.append(
+                    "Shared server did not become healthy in time "
+                    f"({lc.server_ready_timeout_s}s).\nTail server.log:\n{tail}"
+                )
+                try:
+                    self._reuse_terminate_persistent_server(int(server_pid_txt))
+                finally:
+                    self._cleanup_server_processes(self.config.framework)
+                    for p in (pid_file, meta_file):
+                        try:
+                            p.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError as exc_u:
+                            logger.warning("reuse failure cleanup unlink %s: %s", p, exc_u)
+                return result, "\n".join(stdout_parts), "\n".join(stderr_parts)
+
+            merged_meta = {"server_pid": int(server_pid_txt), **desired}
+            merged_meta.setdefault("started_at", time.time())
+            merged_meta["last_used_at"] = time.time()
+            self._reuse_write_meta(meta_file, merged_meta)
+
+            logger.info(
+                "server_lifecycle: persistent server is healthy (pid=%s, port=%s)",
+                server_pid_txt,
+                port,
+            )
+            stdout_parts.append(f"[reuse] Spawned persistent server PID {server_pid_txt}\n")
+
+        client_cmd, client_env = self._build_local_command(
+            workspace=workspace,
+            runner_type=runner_type,
+            phase="client",
+        )
+        client_res, cli_out, cli_err = self._execute_local_benchmark(
+            client_cmd,
+            client_env,
+            workspace,
+            timeout_seconds=self.config.timeout_seconds,
+        )
+        if cli_out:
+            stdout_parts.append(cli_out)
+        if cli_err:
+            stderr_parts.append(cli_err)
+
+        result = client_res
+
+        canonical_pid_text: Optional[str] = None
+        try:
+            if pid_file.exists():
+                canonical_pid_text = pid_file.read_text().strip()
+        except OSError:
+            canonical_pid_text = None
+
+        if lc.cleanup:
+            if canonical_pid_text:
+                try:
+                    self._reuse_terminate_persistent_server(int(canonical_pid_text))
+                except (ProcessLookupError, ValueError):
+                    logger.warning(
+                        "cleanup: persisted PID %s not running", canonical_pid_text
+                    )
+            self._cleanup_server_processes(self.config.framework)
+            try:
+                pid_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Could not delete pid_file %s: %s", pid_file, exc)
+            try:
+                meta_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Could not delete meta_file %s: %s", meta_file, exc)
+            logger.info(
+                "server_lifecycle: cleanup finished "
+                "(terminated pid=%s; removed reuse state files under %s)",
+                canonical_pid_text or "none",
+                pid_file.parent,
+            )
+        elif canonical_pid_text:
+            merged = self._reuse_read_meta(meta_file) or {}
+            merged.update(desired)
+            try:
+                merged["server_pid"] = int(canonical_pid_text.split()[0])
+            except ValueError:
+                merged["server_pid"] = canonical_pid_text
+            merged["last_used_at"] = time.time()
+            merged.setdefault(
+                "started_at",
+                merged.get("started_at", time.time()),
+            )
+            self._reuse_write_meta(meta_file, merged)
+            logger.info(
+                "server_lifecycle: server left running (pid=%s, port=%s, state=%s)",
+                canonical_pid_text,
+                port,
+                pid_file.parent,
+            )
+
+        full_out = "\n".join(stdout_parts)
+        full_err = "\n".join(stderr_parts)
+        self._save_logs(workspace, full_out, full_err)
+
+        return (result, full_out, full_err)
+
+    def _reuse_benchmark_port(self) -> int:
+        try:
+            return int(str(self.config.envs.get("PORT", 8888)))
+        except (TypeError, ValueError):
+            return 8888
+
+    def _reuse_will_attach_to_existing_server(self) -> bool:
+        """True when local server_lifecycle will only run the client (HTTP to existing server)."""
+        if not self.config.is_local or not self.config.is_server_lifecycle:
+            return False
+        lc = self.config.server_lifecycle
+        assert lc is not None
+        port = self._reuse_benchmark_port()
+        if not self._reuse_http_healthy(port):
+            return False
+        _, _, meta_file = self._reuse_server_paths(port)
+        stored = self._reuse_read_meta(meta_file)
+        desired = self._desired_reuse_server_meta(port)
+        if lc.force_reuse:
+            return True
+        return self._reuse_meta_mismatch(stored, desired) is None
+
+    @staticmethod
+    def _reuse_http_healthy(port: int) -> bool:
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{int(port)}/health",
+                headers={"Accept": "*/*"},
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                status = getattr(resp, "status", None) or resp.getcode()
+                return isinstance(status, int) and 200 <= status < 400
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+            return False
+
+    def _reuse_wait_health(self, port: int, deadline: float) -> bool:
+        while time.time() < deadline:
+            if self._reuse_http_healthy(port):
+                return True
+            time.sleep(5.0)
+        return False
+
+    def _desired_reuse_server_meta(self, port: int) -> Dict[str, Any]:
+        upper = {
+            str(k).upper(): str(v) for k, v in (self.config.envs or {}).items()
+        }
+        ix_path = str(Path(self.config.inferencex_path).resolve())
+
+        fw = self.config.framework.lower()
+
+        extras_vllm = str(upper.get("EXTRA_VLLM_ARGS", ""))
+        extras_sglang = str(upper.get("EXTRA_SGLANG_ARGS", ""))
+        extras_atom = str(upper.get("EXTRA_ATOM_ARGS", ""))
+        tp = upper.get("TP", "1")
+        max_ml = upper.get(
+            "MAX_MODEL_LEN",
+            upper.get(
+                "MAX_MODEL_LENGTH",
+                upper.get(
+                    "SGL_MEM_FRACTION_STATIC",
+                    "",
+                ),
+            ),
+        )
+
+        return {
+            "framework": fw,
+            "model": str(self.config.model),
+            "tp": str(tp),
+            "port": int(port),
+            "extra_vllm_args": extras_vllm,
+            "extra_sglang_args": extras_sglang,
+            "extra_atom_args": extras_atom,
+            "max_model_len": str(max_ml),
+            "inferencex_path": ix_path,
+        }
+
+    def _reuse_meta_mismatch(
+        self,
+        stored: Optional[Dict[str, Any]],
+        desired: Dict[str, Any],
+    ) -> Optional[str]:
+        if not stored:
+            return (
+                "missing reuse metadata JSON (possible zombie server on PORT or "
+                "first warm-up before metadata was persisted)"
+            )
+
+        check_keys = (
+            ("framework", "framework"),
+            ("model", "model"),
+            ("tp", "tp"),
+            ("port", "port"),
+            ("extra_vllm_args", "extra_vllm_args"),
+            ("extra_sglang_args", "extra_sglang_args"),
+            ("extra_atom_args", "extra_atom_args"),
+            ("max_model_len", "max_model_len"),
+            ("inferencex_path", "inferencex_path"),
+        )
+
+        diffs = []
+        for sk, dk in check_keys:
+            have = stored.get(sk)
+            want = desired.get(dk)
+            sh = "" if have is None else str(have)
+            sw = "" if want is None else str(want)
+            if sh != sw:
+                diffs.append(f"{sk}: stored={have!r} vs wanted={want!r}")
+
+        if diffs:
+            head = "; ".join(diffs[:8])
+            if len(diffs) > 8:
+                head += f" ...(+{len(diffs) - 8} more)"
+            return head
+
+        return None
+
+    def _reuse_server_paths(self, port: int) -> Tuple[Path, Path, Path]:
+        lc = self.config.server_lifecycle
+        assert lc is not None
+        base = Path(
+            lc.pid_dir
+            if lc.pid_dir
+            else os.path.join(Path.home(), ".cache", "magpie", "server")
+        ).expanduser()
+        base.mkdir(parents=True, exist_ok=True)
+        tag = f"{self.config.framework}_{port}"
+        pid_path = base / f"{tag}.pid"
+        meta_path = base / f"{tag}.json"
+        return base, pid_path, meta_path
+
+    @staticmethod
+    def _reuse_read_meta(meta_file: Path) -> Optional[Dict[str, Any]]:
+        try:
+            data = meta_file.read_text(encoding="utf-8", errors="replace")
+            parsed = json.loads(data)
+            if isinstance(parsed, dict):
+                return parsed
+            return None
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, OSError, TypeError):
+            return None
+
+    @staticmethod
+    def _reuse_write_meta(meta_file: Path, payload: Dict[str, Any]) -> None:
+        try:
+            meta_file.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        except OSError as exc:
+            logger.warning("Could not persist reuse metadata (%s)", exc)
+
+    def _reuse_clear_stale_artifacts(
+        self,
+        pid_file: Path,
+        meta_file: Path,
+        port: int,
+    ) -> None:
+        stale_txt: Optional[str] = None
+        try:
+            if pid_file.exists():
+                stale_txt = pid_file.read_text().strip()
+        except OSError:
+            stale_txt = None
+
+        if stale_txt:
+            try:
+                stale_pid = int(stale_txt.split()[0])
+                self._reuse_terminate_persistent_server(stale_pid)
+            except (ProcessLookupError, ValueError):
+                logger.debug(
+                    "Reuse cleanup: persisted PID unreadable/outdated (%s)",
+                    stale_txt,
+                )
+
+        self._cleanup_server_processes(self.config.framework)
+
+        for path in (pid_file, meta_file):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                logger.warning("reuse cleanup unlink %s failed: %s", path, exc)
+
+    @staticmethod
+    def _reuse_terminate_persistent_server(root_pid: int) -> None:
+        try:
+            os.killpg(root_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except (PermissionError, OSError):
+            try:
+                os.kill(root_pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                return
+
+        for _ in range(120):
+            try:
+                os.kill(root_pid, 0)
+                time.sleep(0.25)
+            except ProcessLookupError:
+                return
+
+        try:
+            os.killpg(root_pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(root_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+    def _execute_local_benchmark(
+        self,
+        cmd: List[str],
+        env: Dict[str, str],
+        workspace: Path,
+        timeout_seconds: Optional[float] = None,
+    ) -> tuple:
+        """
+        Execute benchmark locally (no Docker).
+        
+        Args:
+            cmd: Shell command list
+            env: Environment variables
+            workspace: Workspace directory for saving logs
+            timeout_seconds: Override :attr:`BenchmarkConfig.timeout_seconds`.
+
+        Returns:
+            Tuple of (BenchmarkResult, stdout, stderr)
+        """
+        result = BenchmarkResult()
+        stdout = ""
+        stderr = ""
+
+        deadline = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self.config.timeout_seconds
+        )
+
+        try:
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=deadline,
+                env=env,
+            )
+
+            stdout = process.stdout or ""
+            stderr = process.stderr or ""
+
+            self._save_logs(workspace, stdout, stderr)
+
+            if process.returncode == 0:
+                result.success = True
+                logger.info("Local benchmark completed successfully")
+            else:
+                result.success = False
+                result.errors.append(
+                    f"Benchmark process failed with code {process.returncode}"
+                )
+                if stderr:
+                    result.errors.append(f"stderr: {stderr[:1000]}")
+                logger.error(f"Benchmark failed: {process.returncode}")
+                logger.error(f"stderr: {stderr[:500]}")
+
+            if stdout:
+                logger.debug(f"stdout (last 500 chars): {stdout[-500:]}")
+
+        except subprocess.TimeoutExpired as e:
+            result.errors.append(
+                f"Benchmark timed out after {deadline}s"
+            )
+            logger.error("Benchmark timed out")
+
+            if hasattr(e, "stdout") and e.stdout:
+                stdout = e.stdout if isinstance(e.stdout, str) else e.stdout.decode()
+            if hasattr(e, "stderr") and e.stderr:
+                stderr = e.stderr if isinstance(e.stderr, str) else e.stderr.decode()
+
+            self._save_logs(workspace, stdout, stderr)
+
+        except Exception as e:
+            result.errors.append(f"Benchmark execution error: {str(e)}")
+            logger.exception(f"Benchmark execution failed: {e}")
+
+        return result, stdout, stderr
+
+    @staticmethod
+    def _cleanup_server_processes(framework: str) -> None:
+        """Kill leftover inference server processes after benchmark completes.
+
+        Targets vllm/sglang/atom server processes and their workers (TP
+        workers, schedulers, etc.) that may survive the shell EXIT trap —
+        e.g. when torch profiler stop hangs or NCCL cleanup stalls.
+        """
+        patterns = {
+            "vllm": [
+                "vllm.entrypoints",
+                "vllm serve",
+                "vllm.v1.executor",
+                "vllm.v1.worker",
+            ],
+            "sglang": [
+                "sglang.launch_server",
+                "sglang.srt.managers",
+                "sglang.srt.server",
+            ],
+            "atom": [
+                "atom.entrypoints",
+                "atom.entrypoints.openai_server",
+            ],
+        }
+
+        targets = patterns.get(framework, [])
+        if not targets:
+            return
+
+        killed = 0
+        for proc_dir in Path("/proc").iterdir():
+            if not proc_dir.name.isdigit():
+                continue
+            pid = int(proc_dir.name)
+            if pid == os.getpid():
+                continue
+            try:
+                cmdline = (proc_dir / "cmdline").read_bytes().decode(
+                    errors="replace"
+                ).replace("\x00", " ")
+                if any(pat in cmdline for pat in targets):
+                    os.kill(pid, signal.SIGKILL)
+                    killed += 1
+            except (ProcessLookupError, PermissionError, FileNotFoundError, OSError):
+                continue
+
+        if killed:
+            logger.info(
+                "cleanup: killed %d leftover %s process(es)", killed, framework
+            )
+            time.sleep(1)
+
+    def _find_script_in_benchmarks(self, benchmarks_dir: Path, script_name: str) -> Optional[Path]:
+        """
+        Search for a script by filename inside benchmarks/ and its subdirectories.
+        
+        Checks the top-level directory first, then searches subdirectories.
+        Returns the first match or None.
+        """
+        # Top-level first
+        top_level = benchmarks_dir / script_name
+        if top_level.exists():
+            return top_level
+        
+        # Recursive search in subdirectories
+        for match in benchmarks_dir.rglob(script_name):
+            if match.is_file():
+                return match
+        
+        return None
+    
+    def _get_benchmark_script(self, runner_type: str) -> str:
+        """
+        Get InferenceX benchmark script path with 3-tier priority.
+        
+        Searches benchmarks/ and its subdirectories (e.g. single_node/, multi_node/).
+        
+        Priority:
+            1. User-specified script (benchmark_script config) - must exist
+            2. InferenceX native scripts: {prefix}_{precision}_{runner}.sh
+               - sglang -> dsr1_
+               - vllm -> gptoss_
+            3. Magpie generic scripts: {framework}_{runner}.sh
+        
+        Args:
+            runner_type: Runner type (e.g., "mi300x", "h100", "b200")
+        
+        Returns:
+            Relative path to benchmark script (from InferenceX root)
+            
+        Raises:
+            FileNotFoundError: If no suitable script found
+        """
+        benchmarks_dir = Path(self.config.inferencex_path) / "benchmarks"
+        inferencex_root = Path(self.config.inferencex_path)
+        
+        # Priority 1: User-specified script (must exist)
+        if self.config.benchmark_script:
+            found = self._find_script_in_benchmarks(benchmarks_dir, self.config.benchmark_script)
+            if not found:
+                raise FileNotFoundError(
+                    f"Specified benchmark_script not found: {self.config.benchmark_script}\n"
+                    f"Searched in: {benchmarks_dir} (including subdirectories)\n"
+                    f"Please ensure the file exists or remove the benchmark_script config."
+                )
+            rel_path = found.relative_to(inferencex_root)
+            logger.info(f"Using user-specified script: {rel_path}")
+            return str(rel_path)
+        
+        # Priority 2: InferenceX native scripts
+        # Mapping: sglang -> dsr1_, vllm -> gptoss_
+        prefix_map = {"sglang": "dsr1", "vllm": "gptoss"}
+        prefix = prefix_map.get(self.config.framework)
+        
+        if prefix:
+            native_script = f"{prefix}_{self.config.precision}_{runner_type}.sh"
+            found = self._find_script_in_benchmarks(benchmarks_dir, native_script)
+            if found:
+                rel_path = found.relative_to(inferencex_root)
+                logger.info(f"Using InferenceX native script: {rel_path}")
+                return str(rel_path)
+        
+        # Priority 3: Magpie generic scripts (top-level only)
+        generic_script = f"{self.config.framework}_{runner_type}.sh"
+        if (benchmarks_dir / generic_script).exists():
+            logger.info(f"Using Magpie generic script: {generic_script}")
+            return f"benchmarks/{generic_script}"
+        
+        # No script found - raise error with helpful message
+        raise FileNotFoundError(
+            f"No benchmark script found for framework={self.config.framework}, "
+            f"precision={self.config.precision}, gpu={runner_type}.\n"
+            f"Searched in: {benchmarks_dir} (including subdirectories)\n"
+            f"Expected one of:\n"
+            f"  - {prefix}_{self.config.precision}_{runner_type}.sh (InferenceX native)\n"
+            f"  - {generic_script} (Magpie generic)\n"
+            f"Please create the script or specify benchmark_script in config."
+        )
+    
+    def _execute_benchmark(self, cmd: List[str], workspace: Path) -> tuple:
+        """
+        Execute Docker benchmark command.
+        
+        Args:
+            cmd: Docker command
+            workspace: Workspace directory for saving logs
+        
+        Returns:
+            Tuple of (BenchmarkResult, stdout, stderr)
+        """
+        result = BenchmarkResult()
+        stdout = ""
+        stderr = ""
+        
+        try:
+            # Run Docker command
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout_seconds,
+            )
+            
+            stdout = process.stdout or ""
+            stderr = process.stderr or ""
+
+            # Fix ownership: files written by root inside the container
+            # (server.log, inferencex_result.json, torch_trace/*, ...) appear
+            # as UID 0 on the host. chown them back to the invoking user so
+            # non-root users can read/modify/delete the output.
+            self._fix_workspace_ownership(workspace)
+
+            # Save logs to workspace for debugging
+            self._save_logs(workspace, stdout, stderr)
+            
+            if process.returncode == 0:
+                result.success = True
+                logger.info("Benchmark completed successfully")
+            else:
+                result.success = False
+                result.errors.append(f"Docker command failed with code {process.returncode}")
+                if stderr:
+                    result.errors.append(f"stderr: {stderr[:1000]}")
+                logger.error(f"Benchmark failed: {process.returncode}")
+                logger.error(f"stderr: {stderr[:500]}")
+            
+            # Log stdout for debugging
+            if stdout:
+                logger.debug(f"stdout (last 500 chars): {stdout[-500:]}")
+                
+        except subprocess.TimeoutExpired as e:
+            result.errors.append(f"Benchmark timed out after {self.config.timeout_seconds}s")
+            logger.error("Benchmark timed out")
+            
+            # Capture partial output if available
+            if hasattr(e, 'stdout') and e.stdout:
+                stdout = e.stdout if isinstance(e.stdout, str) else e.stdout.decode()
+            if hasattr(e, 'stderr') and e.stderr:
+                stderr = e.stderr if isinstance(e.stderr, str) else e.stderr.decode()
+            
+            self._save_logs(workspace, stdout, stderr)
+            
+            # Try to stop the container
+            try:
+                subprocess.run(
+                    ["docker", "stop", f"magpie-benchmark-{self._task_id}"],
+                    capture_output=True,
+                    timeout=30,
+                )
+            except Exception:
+                pass
+                
+        except Exception as e:
+            result.errors.append(f"Benchmark execution error: {str(e)}")
+            logger.exception(f"Benchmark execution failed: {e}")
+        
+        return result, stdout, stderr
+    
+    def _fix_workspace_ownership(self, workspace: Path) -> None:
+        """chown workspace files back to the invoking user after docker run.
+
+        The benchmark container writes as root, so /workspace outputs land
+        as root-owned on the host. We can't chown them from this process
+        (non-root can't change another user's files), so we spawn a short-
+        lived helper container that runs as root, mounts the same workspace,
+        and chowns to the invoking UID/GID. Best-effort.
+        """
+        try:
+            uid = os.getuid()
+            gid = os.getgid()
+        except AttributeError:
+            return  # non-POSIX
+
+        if uid == 0:
+            return  # nothing to fix
+
+        image = self.config.docker_image or "busybox"
+        try:
+            subprocess.run(
+                [
+                    "docker", "run", "--rm",
+                    "-v", f"{workspace}:/workspace",
+                    "--entrypoint", "chown",
+                    image, "-R", f"{uid}:{gid}", "/workspace",
+                ],
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fix workspace ownership: {e}")
+
+    def _save_logs(self, workspace: Path, stdout: str, stderr: str) -> None:
+        """Save benchmark subprocess stdout/stderr to workspace for debugging."""
+        try:
+            if stdout:
+                out_file = workspace / "benchmark_stdout.log"
+                with open(out_file, 'w') as f:
+                    f.write(stdout)
+                logger.debug(f"Saved stdout to {out_file}")
+            
+            if stderr:
+                err_file = workspace / "benchmark_stderr.log"
+                with open(err_file, 'w') as f:
+                    f.write(stderr)
+                logger.debug(f"Saved stderr to {err_file}")
+        except Exception as e:
+            logger.warning(f"Failed to save logs: {e}")
+    
+    def _run_tracelens_analysis(
+        self,
+        torch_trace_dir: Path,
+        workspace: Path,
+    ) -> Dict[str, Any]:
+        """
+        Run TraceLens analysis on torch profiler traces.
+        
+        NOTE: This runs on the HOST machine (not in container) after the
+        Docker benchmark completes. TraceLens will be auto-installed from
+        https://github.com/AMD-AGI/TraceLens.git if not present.
+        
+        Args:
+            torch_trace_dir: Directory containing torch trace files
+            workspace: Workspace directory for output
+        
+        Returns:
+            TraceLens analysis results dictionary
+        """
+        logger.info("Running TraceLens analysis on host...")
+        
+        try:
+            analyzer = TraceLensAnalyzer(self.config.profiler.tracelens)
+            
+            # Get number of ranks from TP config
+            num_ranks = int(self.config.envs.get("TP", 8))
+            
+            results = analyzer.analyze(
+                trace_dir=torch_trace_dir,
+                output_dir=workspace,
+                num_ranks=num_ranks,
+            )
+            
+            if results.get("output_files"):
+                logger.info(
+                    f"TraceLens analysis complete: {len(results['output_files'])} output files"
+                )
+            
+            if results.get("errors"):
+                for error in results["errors"]:
+                    logger.warning(f"TraceLens warning: {error}")
+            
+            return results
+            
+        except Exception as e:
+            logger.exception(f"TraceLens analysis failed: {e}")
+            return {"enabled": True, "error": str(e)}
+
+    def _run_tracelens_inference_analysis(
+        self,
+        torch_trace_dir: Path,
+        workspace: Path,
+        runner_type: str,
+        pipeline: Optional[TraceLensInferencePipeline] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run TraceLens inference analysis on torch profiler traces.
+
+        This split/report workflow is the default TraceLens mode for Magpie
+        benchmark because vLLM/SGLang traces need inference-phase handling.
+        For Docker benchmarks, run the TraceLens CLI inside the resolved
+        runtime image so host Python does not need TraceLens installed.
+        """
+        try:
+            analyzer = pipeline or TraceLensInferencePipeline(self.config)
+            if self.config.run_mode == "docker":
+                docker_image = self.config.docker_image or self._select_image()
+                logger.info(
+                    "Running TraceLens inference analysis in container: %s",
+                    docker_image,
+                )
+                results = analyzer.analyze_in_container(
+                    torch_trace_dir=torch_trace_dir,
+                    output_dir=workspace,
+                    runner_type=runner_type,
+                    docker_image=docker_image,
+                    workspace=workspace,
+                )
+            else:
+                logger.info("Running TraceLens inference analysis on host...")
+                results = analyzer.analyze(
+                    torch_trace_dir=torch_trace_dir,
+                    output_dir=workspace,
+                    runner_type=runner_type,
+                )
+
+            if results.get("output_files"):
+                logger.info(
+                    "TraceLens inference analysis complete: %s output files",
+                    len(results["output_files"]),
+                )
+
+            for warning in results.get("warnings", []):
+                logger.warning("TraceLens inference warning: %s", warning)
+            for error in results.get("errors", []):
+                logger.warning("TraceLens inference error: %s", error)
+
+            return results
+
+        except Exception as e:
+            logger.exception(f"TraceLens inference analysis failed: {e}")
+            return {
+                "enabled": True,
+                "analysis_mode": "inference",
+                "error": str(e),
+            }
+    
+    def _run_gap_analysis(
+        self,
+        torch_trace_dir: Path,
+        workspace: Path,
+    ) -> Dict[str, Any]:
+        """
+        Run gap analysis on torch profiler traces.
+        
+        Analyzes a time window of the trace to identify kernel-level
+        bottlenecks and writes a CSV report.
+        
+        Args:
+            torch_trace_dir: Directory containing torch trace files
+            workspace: Workspace directory for output
+        
+        Returns:
+            Gap analysis results dictionary
+        """
+        from .gap_analysis import GapAnalyzer
+
+        logger.info("Running gap analysis on torch traces...")
+        
+        try:
+            gap_dir = workspace / "gap_analysis"
+            gap_dir.mkdir(parents=True, exist_ok=True)
+
+            analyzer = GapAnalyzer(self.config.gap_analysis)
+            result = analyzer.analyze(torch_trace_dir)
+            
+            # Write merged CSV (with optional kernel source enrichment)
+            csv_path = gap_dir / "gap_analysis.csv"
+            result.to_csv(
+                csv_path,
+                find_kernel_sources=self.config.gap_analysis.find_kernel_sources,
+                kernel_source_repos=self.config.gap_analysis.kernel_source_repos,
+                auto_clone_repos=self.config.gap_analysis.auto_clone_repos,
+                repos_base_dir=self.config.gap_analysis.repos_base_dir,
+            )
+            logger.info(f"Wrote gap analysis CSV: {csv_path}")
+            
+            # Write per-rank CSVs if multiple ranks
+            if len(result.rank_results) > 1:
+                rank_paths = result.to_rank_csv(gap_dir)
+                for rp in rank_paths:
+                    logger.info(f"Wrote per-rank CSV: {rp}")
+            
+            ga_dict = result.to_dict()
+            ga_dict["csv_path"] = str(csv_path)
+            ga_dict["output_dir"] = str(gap_dir)
+            
+            if result.errors:
+                for err in result.errors:
+                    logger.warning(f"Gap analysis warning: {err}")
+            else:
+                n = len(result.merged_kernels)
+                logger.info(f"Gap analysis complete: {n} kernels in CSV")
+            
+            return ga_dict
+            
+        except Exception as e:
+            logger.exception(f"Gap analysis failed: {e}")
+            return {"enabled": True, "error": str(e)}
+    
+    def _build_ray_benchmark_task(self) -> Tuple[Optional["Task"], Optional[str]]:
+        """Build the ``Task`` for a Ray benchmark; sets ``self._task_id`` if unset."""
+        from ...core.task import ModeConfig, ModeType, Task
+
+        if self.config.ray_config is None:
+            return None, "ray_config is required when run_mode='ray'"
+
+        t_id = self._task_id or f"bench_{uuid.uuid4().hex[:12]}"
+        self._task_id = t_id
+
+        mode_config = ModeConfig(
+            mode_type=ModeType.BENCHMARK,
+            gpu_arch=self.config.gpu_arch,
+            timeout_seconds=self.config.timeout_seconds,
+            benchmark_config=self.config.to_dict(),
+        )
+        task = Task(
+            kernel_configs=[],
+            mode_config=mode_config,
+            task_id=t_id,
+        )
+        return task, None
+
+    def submit_ray_benchmark(self, executor: "RayJobExecutor") -> BenchmarkResult:
+        """
+        Submit a Ray benchmark without waiting for completion.
+
+        The remote task runs asynchronously; poll with MCP ``ray_task_*``
+        tools using the returned ``task_id``.
+
+        Args:
+            executor: A **started** ``RayJobExecutor`` (e.g. MCP singleton).
+
+        Returns:
+            ``BenchmarkResult`` with ``metadata`` containing ``task_id``,
+            ``ray_job_id``, and ``submitted: True`` on success.
+        """
+        result = BenchmarkResult()
+        result.framework = self.config.framework
+        result.model = self.config.model
+
+        if not self.config.is_ray:
+            result.success = False
+            result.errors.append("submit_ray_benchmark requires run_mode='ray'")
+            return result
+
+        task, err = self._build_ray_benchmark_task()
+        if err:
+            result.success = False
+            result.errors.append(err)
+            return result
+
+        try:
+            assert task is not None
+            tid = executor.submit(task)
+            logger.info(f"Submitted Ray benchmark task {tid} (async)")
+            result.success = True
+            result.metadata = {
+                "task_id": tid,
+                "ray_job_id": tid,
+                "submitted": True,
+            }
+            return result
+        except Exception as e:
+            result.success = False
+            result.errors.append(f"Ray submit failed: {e}")
+            logger.exception(f"submit_ray_benchmark failed: {e}")
+            return result
+
+    def _execute_ray_benchmark(self) -> BenchmarkResult:
+        """
+        Submit benchmark to a remote Ray cluster.
+
+        Dispatches the benchmark to a Ray GPU worker via ``ray.remote()``
+        and blocks until the task completes.  Returns a BenchmarkResult
+        with the full results from the worker.
+        """
+        from ...core.executor import ExecutorConfig, ExecutorType
+        from ...core.ray_executor import RayJobExecutor
+
+        result = BenchmarkResult()
+        rc = self.config.ray_config
+        if rc is None:
+            result.success = False
+            result.errors.append("ray_config is required when run_mode='ray'")
+            return result
+
+        executor = None
+        executor_started = False
+        try:
+            executor_config = ExecutorConfig(
+                executor_type=ExecutorType.RAY,
+                timeout_seconds=self.config.timeout_seconds,
+            )
+            executor = RayJobExecutor(executor_config, ray_config=rc)
+
+            if not executor.start():
+                executor.stop()
+                result.success = False
+                result.errors.append(
+                    f"Failed to connect to Ray cluster at {rc.cluster_address}"
+                )
+                return result
+
+            executor_started = True
+
+            task, err = self._build_ray_benchmark_task()
+            if err:
+                result.success = False
+                result.errors.append(err)
+                return result
+            assert task is not None
+
+            logger.info(f"Dispatching benchmark to Ray GPU worker (task={self._task_id})...")
+            task_result = executor.execute(task)
+
+            result.framework = self.config.framework
+            result.model = self.config.model
+            result.execution_time = task_result.execution_time
+
+            if task_result.status.value == "completed" and task_result.results:
+                self._populate_result_from_ray(result, task_result.results, rc)
+            else:
+                result.success = False
+                result.errors = task_result.errors or ["Ray task failed"]
+                result.metadata = {"task_id": self._task_id}
+
+            logger.info(f"Ray benchmark task {self._task_id} finished: {task_result.status.value}")
+            return result
+
+        except Exception as e:
+            result.success = False
+            result.errors.append(f"Ray submission failed: {e}")
+            logger.exception(f"Ray benchmark submission failed: {e}")
+            return result
+        finally:
+            if executor_started and executor is not None:
+                executor.stop()
+
+    def _populate_result_from_ray(
+        self, result: BenchmarkResult, ray_result: dict, rc
+    ) -> None:
+        """Fill *result* from the dict returned by the Ray worker."""
+        result.success = True
+        result.workspace_dir = ray_result.get("workspace_dir", "")
+
+        tp = ray_result.get("throughput")
+        if isinstance(tp, dict):
+            result.throughput = ThroughputMetrics(**{
+                k: tp[k] for k in ThroughputMetrics.__dataclass_fields__
+                if k in tp
+            })
+        else:
+            result.throughput = tp
+
+        lp = ray_result.get("latency")
+        if isinstance(lp, dict):
+            flat: dict = {}
+            for group in ("ttft", "tpot", "itl", "e2el"):
+                sub = lp.get(group, {})
+                if isinstance(sub, dict):
+                    flat[f"{group}_mean"] = sub.get("mean_ms", 0.0)
+                    flat[f"{group}_median"] = sub.get("median_ms", 0.0)
+                    flat[f"{group}_p99"] = sub.get("p99_ms", 0.0)
+                    flat[f"{group}_std"] = sub.get("std_ms", 0.0)
+                else:
+                    flat[f"{group}_mean"] = lp.get(f"{group}_mean", 0.0)
+                    flat[f"{group}_median"] = lp.get(f"{group}_median", 0.0)
+                    flat[f"{group}_p99"] = lp.get(f"{group}_p99", 0.0)
+                    flat[f"{group}_std"] = lp.get(f"{group}_std", 0.0)
+            result.latency = LatencyMetrics(**flat)
+        else:
+            result.latency = lp
+
+        result.kernel_summary = ray_result.get("kernel_summary", [])
+        result.top_bottlenecks = ray_result.get("top_bottlenecks", [])
+        result.gap_analysis = ray_result.get("gap_analysis")
+        result.tracelens_analysis = ray_result.get("tracelens_analysis")
+        result.errors = ray_result.get("errors", [])
+        result.metadata = {
+            "task_id": self._task_id,
+            "ray_cluster": rc.cluster_address,
+        }
+
+    def cleanup(self) -> None:
+        """Clean up resources."""
+        if self.config.is_local:
+            self._cleanup_server_processes(self.config.framework)
+        elif self._task_id:
+            try:
+                subprocess.run(
+                    ["docker", "stop", f"magpie-benchmark-{self._task_id}"],
+                    capture_output=True,
+                    timeout=30,
+                )
+            except Exception:
+                pass

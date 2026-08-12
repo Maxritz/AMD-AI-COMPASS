@@ -1,0 +1,127 @@
+# =============================================================================
+# Python
+# =============================================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# =============================================================================
+# Virtual Environments
+# =============================================================================
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# =============================================================================
+# IDE / Editor
+# =============================================================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# =============================================================================
+# Testing & Quality Tools
+# =============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.rocprof*/
+.ncu*/
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# Linters
+.ruff_cache/
+
+# =============================================================================
+# Project Specific
+# =============================================================================
+# Evaluation results output
+results/
+InferenceMAX/
+InferenceX/
+
+# Compiled kernel binaries
+*.out
+*.o
+*.a
+examples/simple_hip_test/vector_add
+
+# Profiling outputs
+*.prof
+*.stats
+rocprof_*/
+ncu_*/
+
+# Log files
+*.log
+logs/
+workloads/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Local configuration overrides (user-specific)
+config.local.yaml
+kernel_config.yaml
+
+# =============================================================================
+# OS Generated
+# =============================================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+.directory
+
+.claude/*
+.cursor/*

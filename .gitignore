@@ -11,6 +11,13 @@ framework-agent/scripts/env.sh
 # RDNA4 port clones (cloned from Maxritz forks, not synced to git)
 external/rdna4-ports/
 
+# nested .git in src/ port trees (committed as plain trees, not submodules)
+src/GEAK-RDNA/.git/
+src/Magpie-RDNA4/.git/
+src/TraceLens-RDNA4/.git/
+src/Apex-RDNA4/.git/
+src/intellikit-RDNA4/.git/
+
 # opencode plugin node_modules
 .opencode/node_modules/
 

@@ -1,0 +1,245 @@
+###############################################################################
+# Copyright (c) 2025 - 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+import os
+import math
+from collections import Counter
+import logging
+import numpy as np
+import pytest
+
+np.random.seed(42)
+
+from TraceLens.TreePerf import JaxTreePerfAnalyzer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Legacy JAX trace (~0.6) with .hlo_proto.pb sidecar files; full perf model (FLOPS, bytes) works.
+JAX_CONV_MINIMAL_LEGACY = os.path.join(
+    os.path.dirname(__file__),
+    "traces/mi300/jax_conv_minimal_legacy/chi-mi300x-013.ord.vultr.cpe.ice.amd.com.xplane.pb",
+)
+
+# Keep trace loading off import: xprof writes SSTABLE cache files next to the trace,
+# and parallel pytest-xdist workers racing on that path fail collection.
+pytestmark = pytest.mark.xdist_group("jax_traces")
+
+
+@pytest.fixture(scope="module")
+def perf_analyzer():
+    assert os.path.exists(JAX_CONV_MINIMAL_LEGACY)
+    return JaxTreePerfAnalyzer.from_file(profile_filepath=JAX_CONV_MINIMAL_LEGACY)
+
+
+@pytest.fixture(scope="module")
+def conv_events(perf_analyzer):
+    kernel_events = [
+        event for event in perf_analyzer.tree.events if event["cat"] == "kernel"
+    ]
+    assert len(kernel_events) == 25
+
+    events = [
+        event for event in kernel_events if event["gpu_kernel_op_cat"].lower() == "conv"
+    ]
+    assert len(events) == 10
+
+    result = Counter(
+        [perf_analyzer.get_event_perf_model_name(event) for event in events]
+    )
+    assert result == {"jax_conv": 10}
+    return events
+
+
+@pytest.fixture(scope="module")
+def rand_conv_idx(conv_events):
+    return np.random.randint(0, len(conv_events))
+
+
+@pytest.fixture(scope="module")
+def conv_event(conv_events, rand_conv_idx):
+    return conv_events[rand_conv_idx]
+
+
+def profile_jax_conv(path=None):
+    """
+    Parameters for the 3D convolution
+    batch_size = 1
+    time_dim = 32
+    height = 60
+    width = 104
+    in_channels = 16
+    out_channels = 5120
+    dtype = jax.numpy.bfloat16
+
+    # Kernel parameters
+    kernel_t = 1
+    kernel_h = 2
+    kernel_w = 2
+    stride = (1, 2, 2)
+    """
+
+    if path is None:
+        path = "/tmp/jax_trace.xplane.pb"
+    # Profile trace
+    # Jesus' example: ./jax-minimal/jax_conv.py
+    return path
+
+
+##################
+# Event Statistics
+##################
+
+
+def test_num_tree_events(perf_analyzer):
+    expected_result = 5903
+
+    result = len(perf_analyzer.tree.events)
+    assert result == expected_result
+
+
+def test_tree_event_cats(perf_analyzer):
+    """GPU event counts (kernel, memcpy) must match; host-side may vary by backend."""
+    result = Counter([event["cat"] for event in perf_analyzer.tree.events])
+    assert result["kernel"] == 25
+    assert result["memcpy"] == 53
+    # Host-side (cpu_op, python function, Unknown) can differ between xprof and
+    # tensorboard-plugin-profile; only assert the total matches
+    host_cats = {"cpu_op", "python function", "Unknown"}
+    host_total = sum(result.get(c, 0) for c in host_cats)
+    assert host_total == sum(result.values()) - 25 - 53
+
+
+def test_kernel_event_cats(perf_analyzer):
+    expected_result = {"Uncategorized Events/XLA": 15, "Conv": 10}
+
+    result = Counter(
+        [
+            event["gpu_kernel_op_cat"]
+            for event in perf_analyzer.tree.events
+            if event["cat"] == "kernel"
+        ]
+    )
+    assert result == expected_result
+
+
+################
+# GPU Statistics
+################
+
+
+def test_gpu_pids(perf_analyzer):
+    expected_result = set([1, 8])
+
+    result = set(perf_analyzer.gpu_event_analyser.gpu_pids)
+    assert result == expected_result
+
+
+def test_gpu_timeline(perf_analyzer):
+    # gpu 1
+    busy_time = perf_analyzer.get_df_gpu_timeline(gpu_pid=1).set_index("type")[
+        "time ms"
+    ]["busy_time"]
+    assert math.isclose(0.889028, busy_time, rel_tol=1e-5)
+
+    # gpu 8
+    busy_time = perf_analyzer.get_df_gpu_timeline(gpu_pid=8).set_index("type")[
+        "time ms"
+    ]["busy_time"]
+    assert math.isclose(3.586493, busy_time, rel_tol=1e-5)
+
+    # average
+    busy_time = perf_analyzer.get_df_gpu_events_averages().set_index("type")["time ms"][
+        "busy_time"
+    ]
+    assert math.isclose(2.237760, busy_time, rel_tol=1e-5)
+
+
+###############
+# Kernel Events
+###############
+
+
+def test_kernel_launchers(perf_analyzer):
+    # kernel launchers
+    kernel_launchers = perf_analyzer.get_kernel_launchers()
+    assert len(kernel_launchers) == 25
+
+
+def test_df_kernel_launchers(perf_analyzer):
+    """
+    Alternatively provide trace and desired output xlsx files (with tabs) for testing.
+    """
+    # dataframe
+    df_kernel_launchers = perf_analyzer.get_df_kernel_launchers()
+    df_kernel_launchers_summary = perf_analyzer.get_df_kernel_launchers_summary(
+        df_kernel_launchers
+    )
+    df_kernel_launchers_summary_by_category = (
+        perf_analyzer.get_df_kernel_launchers_summary_by_category(df_kernel_launchers)
+    )
+
+    assert df_kernel_launchers.shape == (25, 13)
+    assert "GPU_kernel_launch_latency" in df_kernel_launchers.columns
+    assert df_kernel_launchers_summary.shape == (5, 10)
+    assert df_kernel_launchers_summary_by_category.shape == (2, 6)
+
+
+#####################
+# Performance Metrics
+#####################
+
+
+def test_conv_event_bytes_and_flops(perf_analyzer, conv_event):
+    """
+    The total bytes moved during a single forward pass of a convolution can be estimated using the following formula:
+    Bytes Moved = (Input Size) + (Kernel Size) + (Output Size) = (16*32*60*104 + 4 + 5120*34*31*53)*2 = 578416648
+
+    The Floating Point Operations (FLOPs) of a standard convolutional layer can be calculated using the following formula:
+    FLOPs: bytes per element * Number of Kernel * Kernel Shape * Output Shape
+    FLOPs = 2*2*2*5120*34*31*53 = 2.288107520*1E09
+
+    Where:
+    C_out: Number of output channels (or filters).
+    C_in: Number of input channels.
+    K_h: Height of the convolutional kernel (filter).
+    K_w: Width of the convolutional kernel (filter).
+    H_out: Height of the output feature map.
+    W_out: Width of the output feature map.
+    """
+
+    perf_model_name = perf_analyzer.get_event_perf_model_name(conv_event)
+    perf_model_class = perf_analyzer.jax_op_to_perf_model_class_map.get(
+        perf_model_name, None
+    )
+    perf_model = perf_model_class(conv_event)
+    assert perf_model.bytes() == 578416648
+    assert perf_model.flops() == 2288107520
+
+
+def test_conv_event_metrics(perf_analyzer, conv_events, rand_conv_idx):
+
+    dict_perf_metrics = perf_analyzer.compute_perf_metrics(conv_events[rand_conv_idx])
+    assert dict_perf_metrics["param: input_shape"] == (1, 16, 32, 60, 104)
+    assert dict_perf_metrics["param: filter_shape"] == (1, 2, 2)
+    assert dict_perf_metrics["param: output_shape"] == (1, 5120, 34, 31, 53)
+    assert dict_perf_metrics["param: bias"] == False
+    assert math.isclose(2.288108, dict_perf_metrics["GFLOPS"], rel_tol=1e-5)
+    assert math.isclose(
+        578416648 / (1024 * 1024), dict_perf_metrics["Data Moved (MB)"], rel_tol=1e-5
+    )
+
+
+def test_conv_perf_metrics(perf_analyzer, conv_events):
+
+    df = perf_analyzer.build_df_perf_metrics(conv_events)
+    assert df.shape == (10, 23)
+
+    df_conv = df[df["perf model"].str.contains("jax_conv")]
+    df_metrics = perf_analyzer.summarize_df_perf_metrics(
+        df_conv, agg_metrics=["mean", "std"]
+    )
+    assert df_metrics.shape == (2, 23)

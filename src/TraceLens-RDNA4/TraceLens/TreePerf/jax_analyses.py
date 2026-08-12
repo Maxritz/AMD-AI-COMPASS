@@ -1,0 +1,591 @@
+###############################################################################
+# Copyright (c) 2025 - 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+import math
+import re
+import string
+from itertools import chain
+
+import pandas as pd
+
+from ..PerfModel import perf_model
+from ..PerfModel.utils import add_simulation_time_columns
+from ..util import DataLoader, JaxProfileProcessor, TraceEventUtils
+from .gpu_event_analyser import GPUEventAnalyser, JaxGPUEventAnalyser
+
+
+class JaxAnalyses:
+    GPU_STREAM_PID_MAX = 100
+    GPU_STREAM_TID_MAX = 100
+
+    @staticmethod
+    def is_gpu_stream_pid(event_or_pid) -> bool:
+        if isinstance(event_or_pid, dict):
+            pid = event_or_pid.get("pid")
+        else:
+            pid = event_or_pid
+        return pid is not None and int(pid) <= JaxAnalyses.GPU_STREAM_PID_MAX
+
+    @staticmethod
+    def is_gpu_stream_tid(event_or_tid) -> bool:
+        if isinstance(event_or_tid, dict):
+            tid = event_or_tid.get("tid")
+        else:
+            tid = event_or_tid
+        return tid is not None and int(tid) < JaxAnalyses.GPU_STREAM_TID_MAX
+
+    @staticmethod
+    def breakdown_compute_events(
+        event_list, group_by_gpu: bool = True, group_by_name=False
+    ):
+        def add_event(cur_event_list, name, duration):
+            current = cur_event_list.get(name, [0, 0])
+            current[0] += 1
+            current[1] += duration
+            if current[0] == 1:
+                cur_event_list[name] = current
+
+        categorized_events = {}
+        uncategorized_events = {}
+        for compute_event in event_list:
+            if group_by_gpu:
+                gpu = int(compute_event["pid"])
+                if gpu in categorized_events:
+                    cur_categorized_list = categorized_events[gpu]
+                    cur_uncategorized_list = uncategorized_events[gpu]
+                else:
+                    cur_categorized_list = {}
+                    categorized_events[gpu] = cur_categorized_list
+                    cur_uncategorized_list = {}
+                    uncategorized_events[gpu] = cur_uncategorized_list
+            else:
+                cur_categorized_list = categorized_events
+                cur_uncategorized_list = uncategorized_events
+
+            # Always seed the Uncategorized bucket so downstream code
+            # (e.g. create_gpu_summary) can index into it unconditionally
+            # even when the fallback below catches every event.
+            cur_categorized_list.setdefault(
+                TraceEventUtils.JaxOpKeys.UncategorizedEventKey, [0, 0]
+            )
+
+            name = compute_event[TraceEventUtils.TraceKeys.Name]
+            duration = compute_event[TraceEventUtils.TraceKeys.Duration]
+
+            def _match_category(candidate):
+                """Return the first JaxOpKeys category whose substring
+                filters match ``candidate``, or ``None``."""
+                if not isinstance(candidate, str) or not candidate:
+                    return None
+                for (
+                    category,
+                    filters,
+                ) in TraceEventUtils.JaxOpKeys.ClassCategories.items():
+                    if any(f in candidate for f in filters):
+                        return category
+                return None
+
+            # 1) Primary: match against the event name.
+            # 2) Fallback (issue #422): an XLA-emitted buffer-init kernel
+            #    such as ``__amd_rocclr_fillBufferAligned.kd`` does not
+            #    match any name keyword, but its ``args["hlo_op"]`` carries
+            #    the surrounding XLA op (e.g.
+            #    ``te_fused_attn_backward_ffi.12``) which does — retry the
+            #    same scan against that field.
+            args_dict = compute_event.get(TraceEventUtils.TraceKeys.Args) or {}
+            hlo_op = args_dict.get(TraceEventUtils.JaxKernelEventArgs.hlo_op)
+            category = _match_category(name) or _match_category(hlo_op)
+
+            if category is not None:
+                add_event(cur_categorized_list, category, duration)
+            else:
+                if group_by_name:
+                    name = name.rstrip(string.digits)
+                add_event(
+                    cur_categorized_list,
+                    TraceEventUtils.JaxOpKeys.UncategorizedEventKey,
+                    duration,
+                )
+                add_event(cur_uncategorized_list, name, duration)
+
+        return categorized_events, uncategorized_events
+
+    @staticmethod
+    def create_breakdown_df(events: dict, total_time, num_gpus: int = 8):
+        df = pd.DataFrame.from_dict(events, orient="index", columns=["count", "time"])
+        # convert time to ms by div by 1e3
+        df["time ms"] = df["time"] / 1e3
+        df["time ms per gpu"] = df["time ms"] / num_gpus
+        df["percent"] = df["time"] / total_time * 100
+        df = df.drop(columns=["time"])
+        df = df.sort_values("percent", ascending=False)
+        return df
+
+    @staticmethod
+    def default_gpu_event_filter(event: dict):
+        # Keep events from actual GPU streams, filter out supplemental metadata threads
+        thread_info = event.get("thread", {})
+        thread_name = thread_info.get("thread_name", "")
+        if not thread_name:
+            # Fallback to old logic for backward compatibility
+            return JaxAnalyses.is_gpu_stream_tid(event)
+        return thread_name.startswith("Stream #")
+
+    @staticmethod
+    def get_just_gpu_events(events):
+        return dict(
+            filter(
+                lambda v: len(v[1].get(GPUEventAnalyser.computation_key, {})) > 0,
+                events.items(),
+            )
+        )
+
+    @staticmethod
+    def create_gpu_summary(
+        analyzer: JaxGPUEventAnalyser,
+        group_by_gpu: bool = False,
+        group_kernels_by_name: bool = False,
+    ):
+        all_events = analyzer.get_gpu_event_lists(
+            event_filter=JaxAnalyses.default_gpu_event_filter
+        )
+
+        # create an average across GPUs
+        average_gpu_metrics = None
+        num_gpus = 0
+        for pid, cur_events in all_events.items():
+            if JaxAnalyses.is_gpu_stream_pid(pid):
+                num_gpus += 1
+                analyzer.verify_dict_gpu_event_lists(cur_events)
+                current_metrics = analyzer.compute_metrics_dict(cur_events)
+                if average_gpu_metrics is None:
+                    average_gpu_metrics = current_metrics
+                else:
+                    for k, v in current_metrics.items():
+                        average_gpu_metrics[k] += v
+        for k in average_gpu_metrics.keys():
+            average_gpu_metrics[k] /= num_gpus
+
+        # find compute times
+        just_gpu_events = JaxAnalyses.get_just_gpu_events(all_events)
+        all_gpu_compute_events = [
+            e
+            for ge in just_gpu_events.values()
+            for e in ge[GPUEventAnalyser.computation_key]
+        ]
+        categorized_times, uncategorized_times = JaxAnalyses.breakdown_compute_events(
+            all_gpu_compute_events,
+            group_by_gpu=group_by_gpu,
+            group_by_name=group_kernels_by_name,
+        )
+
+        categorized_df = JaxAnalyses.create_breakdown_df(
+            categorized_times,
+            average_gpu_metrics["computation_time"] * num_gpus,
+            num_gpus,
+        )
+        uncategorized_df = JaxAnalyses.create_breakdown_df(
+            uncategorized_times,
+            categorized_times[TraceEventUtils.JaxOpKeys.UncategorizedEventKey][1],
+            num_gpus,
+        )
+        return (
+            analyzer.get_breakdown_df_from_dict(average_gpu_metrics),
+            categorized_df,
+            uncategorized_df,
+        )
+
+    @staticmethod
+    def summarize_gpu_events(filename, save_preprocessed=False):
+        data = DataLoader.load_data(
+            filename_path=filename, save_preprocessed=save_preprocessed
+        )
+        events = data["traceEvents"]
+        my_gpu_event_analyser = JaxGPUEventAnalyser(events)
+        return JaxAnalyses.create_gpu_summary(my_gpu_event_analyser)
+
+    communication_events_map = {
+        "all-gather-start": "all-gather",
+        "all-reduce-start": "all-reduce",
+        "reduce-scatter": "reduce-scatter",
+        "collective-permute-start": "collective-permute",
+    }
+
+    # filename here is the "after-buffer-assignment" xla file
+    @staticmethod
+    def process_communication_events_from_xla_dump(xla_file_name: str) -> dict:
+        communication_events = {
+            key: [] for key in JaxAnalyses.communication_events_map.keys()
+        }
+
+        event_key = str.join("|", JaxAnalyses.communication_events_map.keys())
+        pattern = re.compile(
+            rf"^.*value:.*({event_key})\.?([\d]+)?.*size=(\d+).*: ([a-zA-Z\d].*)\[.*$"
+        )
+        with open(xla_file_name, "r") as f:
+            for line in f:
+                m = pattern.search(line)
+                if m:
+                    communication_events[m.group(1)].append(
+                        [m.group(2), m.group(3), m.group(4)]
+                    )
+        return communication_events
+
+    # filename here is the regular XLA file, not the "after-buffer-assignment" file
+    @staticmethod
+    def process_gemm_events_from_xla_dump(xla_file_name: str) -> dict:
+        return JaxProfileProcessor.process_gemm_ops(
+            JaxProfileProcessor.process_xla_file(xla_file_name)
+        )
+
+    @staticmethod
+    def process_gemm_events_from_pb(
+        pb_file_name: str, module_name: str = "jit_train_step"
+    ) -> dict:
+        return JaxProfileProcessor.process_gemm_ops(
+            JaxProfileProcessor.process_protobuf_file(pb_file_name, module_name)
+        )
+
+    # this function only takes the minimum of each instance of the communication across all steps
+    # ideally it would be nice to aggregate for each step instead, if we can find the step from the messsage
+    @staticmethod
+    def process_communication_events_from_profile(
+        analyzer: JaxGPUEventAnalyser, messages: dict
+    ) -> dict:
+        all_events = analyzer.get_gpu_event_lists(
+            event_filter=JaxAnalyses.default_gpu_event_filter
+        )
+        just_gpu_events = JaxAnalyses.get_just_gpu_events(all_events)
+        all_comm_events = [
+            e
+            for ge in just_gpu_events.values()
+            for e in ge[GPUEventAnalyser.communication_key]
+        ]
+        num_gpus = len(just_gpu_events)
+
+        rccl_stats = {}
+
+        for i in all_comm_events:
+            pid = i[TraceEventUtils.TraceKeys.PID]
+            dur = i[TraceEventUtils.TraceKeys.Duration]
+            op = i["args"]["hlo_op"]
+            if op.startswith("reduce-scatter"):
+                op = ".".join(
+                    op.split(".")[:2]
+                )  # need to remove sub-communications from reduce-scatter only
+            current = rccl_stats.get(op, [math.inf] * num_gpus)
+            current[pid - 1] = min(dur, current[pid - 1])
+            rccl_stats[op] = current
+
+        # each dict is indexed by the hlo_op, and the value is a list [duration, total message size, number of tuple arguments,algbw]
+        output = {}
+        for msg_type, msg_values in messages.items():
+            coll_dict = {}
+            output[JaxAnalyses.communication_events_map[msg_type]] = coll_dict
+            for msg in msg_values:
+                collname = f"{msg_type}.{msg[0]}" if msg[0] is not None else msg_type
+                collsize = int(msg[1])
+                collval = rccl_stats.get(collname, None)
+                if collval is not None:
+                    current = coll_dict.get(collname, [min(collval), 0, 0, 0])
+                    current[1] += collsize
+                    current[2] += 1
+                    coll_dict[collname] = current
+                else:
+                    print(collname, " not found")
+            scale = num_gpus if "reduce-scatter" in msg_type else 1
+            for collname, current in coll_dict.items():
+                current[3] = current[1] * scale * 0.001 / current[0]
+
+        return output
+
+    @staticmethod
+    def summarize_communication_data(comm_event_data):
+        summary_data = {}
+        for collective, collective_stats in comm_event_data.items():
+            current_data = [
+                [collective, xfer_name, data[0], data[1] / 1024, data[3]]
+                for xfer_name, data in collective_stats.items()
+            ]
+            df = pd.DataFrame(
+                data=current_data,
+                columns=[
+                    "base_collective",
+                    "collective_name",
+                    "latency_us",
+                    "buffer_size_kb",
+                    "effective_bw",
+                ],
+            )
+
+            bandwidth_stats = (
+                df.groupby(["base_collective", "buffer_size_kb"])["effective_bw"]
+                .agg(["mean", "std"])
+                .reset_index()
+            )
+
+            # Group by collective type and buffer size for call counts
+            call_counts = (
+                df.groupby(["base_collective", "buffer_size_kb"])
+                .size()
+                .reset_index(name="count")
+            )
+
+            bw_data = bandwidth_stats.sort_values("buffer_size_kb")
+            count_data = call_counts[
+                call_counts["base_collective"] == collective
+            ].sort_values("buffer_size_kb")
+
+            time_by_size = (
+                df.groupby("buffer_size_kb")["latency_us"].sum().reset_index()
+            )
+            total_time_us = time_by_size["latency_us"].sum()
+            time_by_size["percentage"] = (
+                (time_by_size["latency_us"] / total_time_us) * 100
+                if total_time_us > 0
+                else 0
+            )
+
+            # Calculate time spent in each bandwidth range
+            bw_thresholds = [0, 50, 100, 200, 300, 400]
+            total_time = (df["latency_us"].sum()) / 1e6  # Convert to seconds
+            time_in_ranges = []
+            labels = []
+
+            for i in range(len(bw_thresholds) - 1):
+                mask = (df["effective_bw"] >= bw_thresholds[i]) & (
+                    df["effective_bw"] < bw_thresholds[i + 1]
+                )
+                time_in_range = (df[mask]["latency_us"].sum()) / 1e6
+                percentage = (time_in_range / total_time) * 100 if total_time > 0 else 0
+                time_in_ranges.append(percentage)
+                labels.append(f"{bw_thresholds[i]}-{bw_thresholds[i+1]} GB/s")
+
+            # Add the highest range
+            mask = df["effective_bw"] >= bw_thresholds[-1]
+            time_in_range = (df[mask]["latency_us"].sum()) / 1e6
+            percentage = (time_in_range / total_time) * 100 if total_time > 0 else 0
+            time_in_ranges.append(percentage)
+            range_data = pd.DataFrame(
+                zip(labels, time_in_ranges),
+                columns=("Bandwidth range", "Percentage of time"),
+            )
+
+            summary_data[collective] = (
+                df,
+                bw_data,
+                count_data,
+                time_by_size,
+                range_data,
+            )
+        return summary_data
+
+    @staticmethod
+    def summarize_gpu_communication_events(profile_filename, xla_filename):
+        # summarizes communication events from a single step
+        data = DataLoader.load_data(profile_filename)
+        events = data["traceEvents"]
+        my_gpu_event_analyser = JaxGPUEventAnalyser(events)
+        comm_xla_events = JaxAnalyses.process_communication_events_from_xla_dump(
+            xla_filename
+        )
+        processed = JaxAnalyses.process_communication_events_from_profile(
+            my_gpu_event_analyser, comm_xla_events
+        )
+        return JaxAnalyses.summarize_communication_data(processed)
+
+    @staticmethod
+    def summarize_gpu_gemm_events_from_xla(xla_filename):
+        gemms = JaxAnalyses.process_gemm_events_from_xla_dump(xla_filename)
+        return pd.DataFrame.from_dict(
+            gemms, orient="index", columns=JaxProfileProcessor.gemm_columns
+        )
+
+    @staticmethod
+    def summarize_gpu_gemm_events_from_pb(
+        pb_filename, module_name: str = "jit_train_step"
+    ):
+        gemms = JaxAnalyses.process_gemm_events_from_pb(pb_filename, module_name)
+        return pd.DataFrame.from_dict(
+            gemms, orient="index", columns=JaxProfileProcessor.gemm_columns
+        )
+
+    @staticmethod
+    def gemm_performance_from_pb(
+        pb_file_name,
+        module_name: str = "jit_train_step",
+        arch: dict = None,
+        enable_origami: bool = False,
+    ):
+        all_profile_events = DataLoader.load_data(filename_path=pb_file_name)[
+            "traceEvents"
+        ]
+        metadata = TraceEventUtils.get_metadata(all_profile_events)
+        events = TraceEventUtils.split_events_by_pid_tid(
+            TraceEventUtils.non_metadata_events(all_profile_events)
+        )
+        if module_name is None:
+            # extract the first module name from the "XLA Modules:" thread
+            xla_module_thread = TraceEventUtils.find_thread_by_item_in_metadata(
+                metadata[1],
+                lambda x: x[0] is not None
+                and x[1][TraceEventUtils.MetadataFields.ThreadName]
+                == TraceEventUtils.JaxSpecialThreads.XlaModules,
+            )
+            module_name = events[1][xla_module_thread][0][
+                TraceEventUtils.TraceKeys.Name
+            ].split("(")[0]
+        hlo_ops = JaxProfileProcessor.process_protobuf_file(pb_file_name, module_name)
+        gemm_ops = JaxProfileProcessor.process_gemm_ops(hlo_ops)
+        # the keys in gemm ops start with % while the keys in the events don't - strip out the %
+        gemm_ops = dict((x[0][1:], x[1]) for x in gemm_ops.items())
+        # the first "Stream" thread is not always the thread with GEMMs - merge all of them
+        thread_ids = TraceEventUtils.find_threads_by_item_in_metadata(
+            metadata[1],
+            lambda x: x[0] is not None
+            and x[1][TraceEventUtils.MetadataFields.ThreadName].startswith(
+                TraceEventUtils.JaxSpecialThreads.StreamPrefix
+            ),
+        )
+        gpu_0_events = chain.from_iterable(map(lambda x: events[1][x], thread_ids))
+        gpu_0_gemms = filter(
+            lambda x: TraceEventUtils.TraceKeys.Args in x
+            and TraceEventUtils.JaxKernelEventArgs.hlo_op
+            in x[TraceEventUtils.TraceKeys.Args]
+            and x[TraceEventUtils.TraceKeys.Args][
+                TraceEventUtils.JaxKernelEventArgs.hlo_op
+            ]
+            in gemm_ops,
+            gpu_0_events,
+        )
+        metrics = [
+            JaxAnalyses.gemm_perf_metrics(
+                event,
+                gemm_ops[
+                    event[TraceEventUtils.TraceKeys.Args][
+                        TraceEventUtils.JaxKernelEventArgs.hlo_op
+                    ]
+                ],
+                False,
+                arch,
+                enable_origami=enable_origami,
+            )
+            for event in gpu_0_gemms
+        ]
+        return pd.DataFrame(metrics)
+
+    class JaxGemm(perf_model.GEMM):
+        @staticmethod
+        def get_param_details(event):
+            hlo_args = event[TraceEventUtils.JaxKernelEventArgs.hlo_op]
+            dict_dtype2simulation = {
+                "f32": "fp32",
+                "f16": "fp16",
+                "bf16": "bf16",
+                "f8": "fp8",
+                "fp8": "fp8",
+            }
+            return {
+                "M": hlo_args["M"],
+                "N": hlo_args["N"],
+                "K": hlo_args["K"],
+                "bias": hlo_args["Beta"] != 0,
+                "stride_A": None,
+                "stride_B": None,
+                "dtype_A_B": (hlo_args["Type"], hlo_args["Type"]),
+                "Op B": hlo_args["Batch"],
+                "simulation_dtype": dict_dtype2simulation.get(hlo_args["Type"]),
+            }
+
+        def flops(self):
+            """Total FLOPs for the entire batch."""
+            return self.param_details["Op B"] * super().flops()
+
+        def bytes(self, bpe_mat1=None, bpe_mat2=None, bpe_bias=None, bpe_output=None):
+            size_map = {
+                "f32": 4,
+                "f16": 2,
+                "bf16": 2,
+                "f8": 1,
+                "fp8": 1,
+            }
+            dtype_A_B = self.param_details["dtype_A_B"]
+            bpe = size_map[dtype_A_B[0]]
+            per_batch = super().bytes(
+                bpe_mat1=bpe,
+                bpe_mat2=bpe,
+                bpe_bias=bpe,  # not used, but keeps call signature
+                bpe_output=bpe,
+            )
+            return None if per_batch is None else self.param_details["Op B"] * per_batch
+
+        def flops_bwd(self):
+            raise NotImplementedError("Backward pass for JaxGemm is not defined.")
+
+        def bytes_bwd(self, bytes_per_element=None):
+            raise NotImplementedError("Backward pass for JaxGemm is not defined.")
+
+    @staticmethod
+    def get_perf_model(event: dict):
+        name = event[TraceEventUtils.TraceKeys.Name]
+        if any(f in name for f in TraceEventUtils.JaxOpKeys.GemmKeys):
+            return JaxAnalyses.JaxGemm
+        return None
+
+    @staticmethod
+    def gemm_perf_metrics(
+        event, op_params, bwd: bool = False, arch=None, enable_origami: bool = False
+    ):
+        perf_model_class = JaxAnalyses.get_perf_model(event)
+        # the class structure of the perf_model class doesn't make it easy to add additional parameters to the event,
+        # so make a copy of the event with the hlo op info inside it
+        event_copy = dict(event)
+        event_copy[TraceEventUtils.JaxKernelEventArgs.hlo_op] = op_params
+        # the perf model needs a kernel names field
+        event_copy["kernel_names"] = [event[TraceEventUtils.TraceKeys.Name]]
+        perf_model = perf_model_class(
+            event_copy, arch=arch, enable_origami=enable_origami
+        )
+
+        gflops = (perf_model.flops() if not bwd else perf_model.flops_bwd()) / 1e9
+        time = event[TraceEventUtils.TraceKeys.Duration]
+
+        tflops_per_s = (gflops / 1e3) / (time / 1e6) if time > 0 else float("nan")
+
+        bytes_moved = perf_model.bytes() if not bwd else perf_model.bytes_bwd()
+
+        # Return metrics
+        dict_metrics = {
+            "GFLOPS": gflops,
+            "Kernel Time (µs)": time,
+            "TFLOPS/s": tflops_per_s,
+        }
+        if bytes_moved is not None:
+            dict_metrics["Data Moved (MB)"] = bytes_moved / (1024 * 1024)
+            dict_metrics["FLOPS/Byte"] = (
+                (gflops * 1e9) / bytes_moved if bytes_moved > 0 else float("nan")
+            )
+            dict_metrics["TB/s"] = (
+                (bytes_moved / 1e12) / (time / 1e6) if time > 0 else float("nan")
+            )
+        else:
+            dict_metrics["Data Moved (MB)"] = float("nan")
+            dict_metrics["FLOPS/Byte"] = float("nan")
+            dict_metrics["TB/s"] = float("nan")
+
+        if hasattr(perf_model, "get_simulation_time"):
+            add_simulation_time_columns(
+                dict_metrics,
+                perf_model.get_simulation_time(),
+                gflops,
+                bytes_moved,
+                time,
+            )
+
+        for key, value in perf_model.param_details.items():
+            dict_metrics[f"param: {key}"] = value
+
+        return dict_metrics

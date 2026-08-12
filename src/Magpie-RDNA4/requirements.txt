@@ -1,0 +1,29 @@
+# Runtime dependencies used by make install and Ray runtime_env.
+# pip install . reads core dependencies from pyproject.toml instead.
+PyYAML>=6.0
+numpy>=1.24.0
+
+# MCP (Model Context Protocol) Server used by make/Ray installs
+mcp>=1.0.0
+
+# GPU/CUDA support (uncomment based on your setup)
+# torch>=2.0.0
+# triton>=2.1.0
+
+# Optional: benchmark profiling (rocm or cuda version)
+# vllm>=0.16.0
+# sglang>=0.5.8
+
+# Optional: ROCm/HIP profiling integration >= 3.40
+# see https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/install/core-install.html
+
+# Optional: CUDA profiling integration
+# see https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html
+
+# Optional: IntelliKit integrations.
+# These are exposed as optional pyproject extras because some components build
+# native ROCm/HIP code and should not be required for a plain install.
+# From a Magpie checkout:
+#   pip install -e ".[intellikit]"
+# Or install a pinned release extra:
+#   pip install "magpie-eval[intellikit] @ git+https://github.com/AMD-AGI/Magpie.git@<tag-or-sha>"

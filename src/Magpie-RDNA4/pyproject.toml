@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "magpie-eval"
+version = "0.2.0"
+description = "A general-purpose evaluation framework for GPU kernel implementations"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Magpie Team", email = "magpie@amd.com"}
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Testing",
+]
+keywords = ["gpu", "kernel", "evaluation", "profiling", "hip", "cuda", "rocm"]
+
+dependencies = [
+    "PyYAML>=6.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.0.0",
+]
+# IntelliKit components are pinned but optional because Accordo builds native
+# ROCm/HIP code and should not be required for a plain Magpie install.
+metrix = [
+    "metrix @ git+https://github.com/AMDResearch/intellikit.git@3f45cd314d455b652a1246678511b40547fe521e#subdirectory=metrix",
+]
+accordo = [
+    "accordo @ git+https://github.com/AMDResearch/intellikit.git@3f45cd314d455b652a1246678511b40547fe521e#subdirectory=accordo",
+]
+intellikit = [
+    "metrix @ git+https://github.com/AMDResearch/intellikit.git@3f45cd314d455b652a1246678511b40547fe521e#subdirectory=metrix",
+    "accordo @ git+https://github.com/AMDResearch/intellikit.git@3f45cd314d455b652a1246678511b40547fe521e#subdirectory=accordo",
+]
+all = [
+    "mcp>=1.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+magpie = "Magpie.main:main"
+
+[project.urls]
+Homepage = "https://github.com/AMD-AGI/Magpie"
+Documentation = "https://github.com/AMD-AGI/Magpie#readme"
+Repository = "https://github.com/AMD-AGI/Magpie"
+Issues = "https://github.com/AMD-AGI/Magpie/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["Magpie*"]
+
+[tool.setuptools.package-data]
+Magpie = ["*.yaml", "*.yaml.example", "*.json", "scripts/benchmark/*.sh"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310", "py311", "py312", "py313"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true

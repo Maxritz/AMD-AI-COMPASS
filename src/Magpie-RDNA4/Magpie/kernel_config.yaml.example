@@ -1,0 +1,150 @@
+# Kernel Configuration Example
+# =============================
+# This file defines kernel-specific configurations.
+# Copy and modify for your kernel evaluation.
+
+# =============================================================================
+# Analyze Mode Example (Single or Multiple Kernels)
+# =============================================================================
+# python main.py analyze --kernel-config my_kernel.yaml
+# Note: my_kernel.yaml can contain either `kernel` (single) or `kernels` (multiple).
+
+kernel:
+  # Kernel identifier
+  id: "my_matmul_kernel"
+  
+  # Kernel type: hip, cuda, pytorch
+  type: hip
+  
+  # Source file(s)
+  source_files:
+    - "./kernels/matmul.hip"
+  
+  # Working directory (optional)
+  working_dir: "./kernels"
+  
+  # Testcase command (required for analyze mode)
+  # Can be a single command or a list of commands executed in order
+  testcase_command: "./run_test.sh"
+  
+  # Custom compile command (optional, overrides default)
+  # compile_command: "hipcc -O2 matmul.hip -o matmul"
+  
+  # Environment variables (optional)
+  env:
+    HIP_VISIBLE_DEVICES: "0"
+
+# =============================================================================
+# Multiple Commands Example
+# =============================================================================
+# compile_command, testcase_command, prof_command can be lists of commands.
+# Use list of lists format: each inner list is a command with its arguments.
+
+# kernel:
+#   id: "multi_step_kernel"
+#   type: hip
+#   source_files:
+#     - "./src/kernel.hip"
+#   working_dir: "./build"
+#   
+#   # Multiple compile commands executed in order (list of lists)
+#   compile_command:
+#     - ["cmake", "-B", "build", "-S", "."]
+#     - ["cmake", "--build", "build"]
+#   
+#   # Multiple testcase commands executed in order
+#   testcase_command:
+#     - ["./setup_env.sh"]
+#     - ["./run_tests.sh", "--verbose"]
+#     - ["./cleanup.sh"]
+#   
+#   # Custom profiling command (optional)
+#   # If provided, replaces the built-in profiler (rocprof-compute or ncu)
+#   prof_command:
+#     - ["rocprof", "--stats", "./kernel.out"]
+#     - ["./parse_results.sh"]
+
+# =============================================================================
+# Custom Profiling Example
+# =============================================================================
+# Use prof_command to replace built-in profiler with custom commands
+
+# kernel:
+#   id: "custom_prof_kernel"
+#   type: hip
+#   source_files:
+#     - "./kernels/perf_kernel.hip"
+#   
+#   testcase_command: ["./test.sh"]
+#   
+#   # Custom profiling commands (replaces built-in rocprof-compute/ncu)
+#   prof_command:
+#     - ["rocprof", "--hip-trace", "./perf_kernel.out"]
+#     - ["python", "./analyze_trace.py", "results.json"]
+
+# =============================================================================
+# Multiple Kernels Example (Compare Mode)
+# =============================================================================
+# python main.py compare --kernel-config kernels_to_compare.yaml
+
+# kernels:
+#   - id: "baseline"
+#     type: hip
+#     source_files: ["./kernels/matmul_v1.hip"]
+#     
+#   - id: "optimized_v1"
+#     type: hip
+#     source_files: ["./kernels/matmul_v2.hip"]
+#     
+#   - id: "optimized_v2"
+#     type: hip
+#     source_files: ["./kernels/matmul_v3.hip"]
+
+# =============================================================================
+# HIP Kernel with Custom Compilation
+# =============================================================================
+# kernel:
+#   id: "custom_hip"
+#   type: hip
+#   source_files:
+#     - "./src/kernel.hip"
+#     - "./src/utils.hip"
+#   
+#   # Single multi-line compile command
+#   compile_command: |
+#     hipcc -O3 -std=c++17 \
+#       -I./include \
+#       ./src/kernel.hip ./src/utils.hip \
+#       -o kernel.out
+#   
+#   testcase_command: "./kernel.out --test"
+
+# =============================================================================
+# Performance Backend Override (Optional)
+# =============================================================================
+# Add a top-level `performance:` section to override the framework-level
+# performance settings for this specific config.  This takes priority over
+# the global config.yaml settings.
+#
+# Supported keys:
+#   backend           - "rocprof_compute" (default for HIP), "ncu", or "metrix"
+#   timeout_seconds   - overall profiling timeout
+#   metrix            - IntelliKit Metrix specific options
+#   rocprof_compute   - rocprof-compute specific options
+#   ncu               - NVIDIA Nsight Compute specific options
+#
+# Example: enable rocprof-compute roofline for this analyze/compare config
+# performance:
+#   rocprof_compute:
+#     roofline: true              # false adds --no-roof; true removes it
+#     profile_args: []            # optional extra rocprof-compute profile args
+
+# Example: use Metrix for this kernel config
+# performance:
+#   backend: metrix
+#   metrix:
+#     profile: memory           # optional preset profile
+#     metrics: []               # extra metric names
+#     kernel_filter: null       # regex to filter kernel names
+#     num_replays: 3
+#     timeout_seconds: 120

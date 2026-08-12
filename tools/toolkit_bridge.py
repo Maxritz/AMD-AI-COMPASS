@@ -39,7 +39,7 @@ _AMD_AI_ROOT = _AI_COMPASS_ROOT.parent
 if _VENDOR_DIR.exists() and str(_VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(_VENDOR_DIR))
 
-_PORTS_DIR = _AI_COMPASS_ROOT / "external" / "rdna4-ports"
+_PORTS_DIR = _AI_COMPASS_ROOT / "src"
 
 _TOOLKITS = {
     "GEAK": {
@@ -152,7 +152,7 @@ def toolkit_status() -> Dict[str, Any]:
             try:
                 importlib.import_module(pkg)
                 available = True
-                source = "RDNA4 port (external/)" if is_port else "bundled (vendor/)"
+                source = "RDNA4 port (src/)" if is_port else "bundled (vendor/)"
             except (ImportError, ModuleNotFoundError):
                 pass
 
