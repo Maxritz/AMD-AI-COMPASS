@@ -1,0 +1,69 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16   : require  
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_KHR_shader_subgroup_basic                    : require
+#extension GL_KHR_shader_subgroup_arithmetic               : require
+#extension GL_KHR_shader_subgroup_shuffle                  : require
+#extension GL_KHR_shader_subgroup_ballot                   : require
+#extension GL_KHR_shader_subgroup_clustered                : require
+#extension GL_EXT_subgroup_size_control : enable
+#extension GL_EXT_nonuniform_qualifier                     : require
+#extension GL_EXT_scalar_block_layout                      : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_KHR_memory_scope_semantics                   : require
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+#include "common.glsl"
+
+// O's weight matrix is [D rows, N_HEADS*HEAD_DIM cols] -- it projects FROM the
+// concatenated attention heads BACK DOWN to D, so each row has N_HEADS*HEAD_DIM
+// elements, not D. Using D here (copy-pasted from the QKV shaders, where D
+// really is the row width since Q/K/V project FROM D) is invisible whenever
+// N_HEADS*HEAD_DIM==D (e.g. Llama-3.2-1B, Qwen2 acrux) but reads every row
+// after row 0 from the wrong, misaligned byte offset whenever they differ
+// (e.g. Qwen3-4B: 32*128=4096 vs D=2560; MiniCPM: 16*128=2048 vs D=1536) --
+// a confirmed real bug, not a hypothetical one.
+#define Q8_0_BLOCK_BYTES   34u
+#define Q8_0_BLOCKS_PER_ROW (N_HEADS * HEAD_DIM / 32u)
+#define Q8_0_ROW_STRIDE    (Q8_0_BLOCKS_PER_ROW * Q8_0_BLOCK_BYTES)
+
+#define Q_BYTES  (N_HEADS * HEAD_DIM * Q8_0_ROW_STRIDE)
+#define K_BYTES  (N_KV_HEADS * HEAD_DIM * Q8_0_ROW_STRIDE)
+#define V_BYTES  (N_KV_HEADS * HEAD_DIM * Q8_0_ROW_STRIDE)
+
+#define O_BASE  pc.o_offset
+
+float read_q80_weight(uint base, uint row, uint col) {
+    uint block_idx     = col / 32u;
+    uint elem_in_block = col & 31u;
+    uint block_start   = base + row * Q8_0_ROW_STRIDE + block_idx * Q8_0_BLOCK_BYTES;
+    return dequant_q8_0(block_start, elem_in_block);
+}
+
+void main() {
+    uint out_row = gl_WorkGroupID.x * (WG_SIZE_X / SUBGROUP_SIZE) + gl_SubgroupID;
+    uint lane_id = gl_SubgroupInvocationID;
+
+    if (out_row >= D) return;
+
+    float accum = 0.0;
+    for (uint k = lane_id; k < N_HEADS * HEAD_DIM; k += SUBGROUP_SIZE) {
+        float x = float(hidden_in.x[k]);
+        accum += x * read_q80_weight(O_BASE, out_row, k);
+    }
+
+    float projected = warpReduceSum(accum);
+    float residual  = float(scratch.s[out_row]);
+
+    if (lane_id == 0u) {
+
+
+        hidden_out.y[out_row] = float16_t(projected * pc.residual_scale + residual);
+
+
+    }
+}

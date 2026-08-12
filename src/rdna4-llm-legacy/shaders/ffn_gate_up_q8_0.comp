@@ -1,0 +1,113 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16   : require  
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_KHR_shader_subgroup_basic                    : require
+#extension GL_KHR_shader_subgroup_arithmetic               : require
+#extension GL_KHR_shader_subgroup_shuffle                  : require
+#extension GL_KHR_shader_subgroup_ballot                   : require
+#extension GL_KHR_shader_subgroup_clustered                : require
+#extension GL_EXT_subgroup_size_control : enable
+#extension GL_EXT_nonuniform_qualifier                     : require
+#extension GL_EXT_scalar_block_layout                      : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_KHR_memory_scope_semantics                   : require
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+#include "common.glsl"
+
+// ─── Q8_0 Weight Layout Constants ───────────────────────────────────────────
+// All weights except norms are Q8_0 quantized in this shader variant.
+// Q8_0 block: 32 elements, 34 bytes (2B fp16 d + 32B int8 qs)
+
+#define Q8_0_BLOCK_BYTES      34u
+#define Q8_0_BLOCKS_PER_D     (D / 32u)
+#define Q8_0_ROW_STRIDE       (Q8_0_BLOCKS_PER_D * Q8_0_BLOCK_BYTES)
+
+// Q weight: [D_out = N_HEADS*HEAD_DIM][D_in = D], row-major in Q8_0
+#define Q_WEIGHT_BYTES        (N_HEADS * HEAD_DIM * Q8_0_ROW_STRIDE)
+
+// K weight: [D_out = HEAD_DIM * N_KV_HEADS][D_in = D], row-major in Q8_0
+#define K_WEIGHT_OUT_ELEMS    (HEAD_DIM * N_KV_HEADS)
+#define K_WEIGHT_BYTES        (K_WEIGHT_OUT_ELEMS * Q8_0_ROW_STRIDE)
+
+// V weight: same as K
+#define V_WEIGHT_BYTES        (K_WEIGHT_OUT_ELEMS * Q8_0_ROW_STRIDE)
+
+// O weight: [D_out = D][D_in = N_HEADS*HEAD_DIM]
+#define O_Q8_0_ROW_STRIDE     ((N_HEADS * HEAD_DIM / 32u) * Q8_0_BLOCK_BYTES)
+#define O_WEIGHT_BYTES        (D * O_Q8_0_ROW_STRIDE)
+
+// Norms: D fp16 elements = D * 2 bytes each
+#define NORM_BYTES            (D * 2u)
+
+// Per-layer byte offsets from start of weight buffer:
+// Layout: Q | K | V | O | q_norm | k_norm | attn_norm | ffn_norm | gate | up | down
+// q_norm/k_norm are always reserved by vk_model_compute_offsets even when the
+// architecture has no per-head norm tensors — must be accounted for here too.
+#define QK_NORM_BYTES         (HEAD_DIM * 2u)
+#define GATE_WEIGHT_BYTE_OFFSET  pc.gate_offset
+#define UP_WEIGHT_BYTE_OFFSET    pc.up_offset
+
+// ─── Workgroup Dispatch ─────────────────────────────────────────────────────
+// Dispatch: ceil(FFN_DIM / SUBGROUPS_PER_WG) workgroups in X
+// Each subgroup processes 1 row of the gate+up output.
+// SUBGROUPS_PER_WG = WG_SIZE_X / SUBGROUP_SIZE
+
+#define SUBGROUPS_PER_WG (WG_SIZE_X / SUBGROUP_SIZE)
+
+void main() {
+    uint wg_row_base = gl_WorkGroupID.x * SUBGROUPS_PER_WG;
+    uint sg_id       = gl_SubgroupID;
+    uint lane_id     = gl_SubgroupInvocationID;
+    uint out_row     = wg_row_base + sg_id;
+
+    if (out_row >= FFN_DIM) return;
+
+    // ── Dual accumulation: gate and up projections ───────────────────────
+    float gate_accum = 0.0;
+    float up_accum   = 0.0;
+
+    for (uint k = lane_id; k < D; k += SUBGROUP_SIZE) {
+        float x_val = float(hidden_in.x[k]);
+
+        // Dequant gate weight at [out_row, k]
+        uint gate_block_idx     = k / 32u;
+        uint gate_elem_in_block = k & 31u;
+        uint gate_block_start   = GATE_WEIGHT_BYTE_OFFSET
+                                + out_row * Q8_0_ROW_STRIDE
+                                + gate_block_idx * Q8_0_BLOCK_BYTES;
+        float gate_w = dequant_q8_0(gate_block_start, gate_elem_in_block);
+
+        // Dequant up weight at [out_row, k]
+        uint up_block_idx     = k / 32u;
+        uint up_elem_in_block = k & 31u;
+        uint up_block_start   = UP_WEIGHT_BYTE_OFFSET
+                              + out_row * Q8_0_ROW_STRIDE
+                              + up_block_idx * Q8_0_BLOCK_BYTES;
+        float up_w = dequant_q8_0(up_block_start, up_elem_in_block);
+
+        gate_accum += x_val * gate_w;
+        up_accum   += x_val * up_w;
+    }
+
+    // ── Subgroup reduction ───────────────────────────────────────────────
+    float gate_val = warpReduceSum(gate_accum);
+    float up_val   = warpReduceSum(up_accum);
+
+    // ── SiLU activation on gate ──────────────────────────────────────────
+    // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    float sigmoid_gate = sigmoid_f32(gate_val);
+    float silu_gate    = gate_val * sigmoid_gate;
+
+    // ── Elementwise multiply: SiLU(gate) * up ───────────────────────────
+    float result = silu_gate * up_val;
+
+    // ── Write fused output to scratch buffer ─────────────────────────────
+    if (lane_id == 0u) {
+        scratch.s[out_row] = float16_t(result);
+    }
+}

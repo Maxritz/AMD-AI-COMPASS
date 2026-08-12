@@ -1,0 +1,124 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Attribution renderer — gain split across optimization sources."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..base import Decision, RenderedSection, fmt_pct, md_table, register_renderer
+
+
+@register_renderer("attribution")
+def render(breakdown: dict[str, Any]) -> RenderedSection:
+    """Render the source-attribution section: gain split across sources.
+
+    Surfaces the per-source breakdown table, the collector's authoritative
+    attribution method label, and any assumption notes. Skipped when no
+    per-source split is available (single-source or unmined attribution).
+
+    Args:
+        breakdown (dict[str, Any]): The full ``session_breakdown.json`` dict.
+
+    Returns:
+        RenderedSection: The rendered section, marked skipped when there is no
+            per-source split to show.
+    """
+    optimizations = breakdown.get("optimizations") or {}
+    validation = optimizations.get("validation") or {}
+    a = validation or breakdown.get("attribution") or {}
+    notes = a.get("notes") or []
+    # Render ``attribution.method`` verbatim; never substitute a different label.
+    method_raw = a.get("method")
+    method = str(method_raw) if isinstance(method_raw, str) else ""
+    if method in ("", "missing"):
+        method_display = "unknown attribution method"
+    else:
+        method_display = method
+
+    if validation:
+        total_v = validation.get("validated_total_gain_pct")
+        summary = optimizations.get("summary_by_source") or {}
+        canonical_rows = [
+            [source, bucket.get("total_gain_pct")]
+            for source, bucket in summary.items()
+            if isinstance(bucket, dict)
+        ]
+        share_total = total_v
+        if not isinstance(share_total, (int, float)) or not share_total:
+            share_total = sum(
+                float(gain)
+                for _source, gain in canonical_rows
+                if isinstance(gain, (int, float))
+            )
+        rows = [
+            [
+                source,
+                gain,
+                (
+                    float(gain) / float(share_total) * 100.0
+                    if isinstance(gain, (int, float)) and share_total
+                    else None
+                ),
+            ]
+            for source, gain in canonical_rows
+        ]
+    else:
+        sb = a.get("source_breakdown") or {}
+        total_v = sb.get("validated_total_pct")
+        rows = [
+            ["explore", sb.get("explore_pct_of_total"), sb.get("explore_share_pct")],
+            [
+                "replay_warm_recipe",
+                sb.get("replay_warm_recipe_pct_of_total"),
+                sb.get("replay_warm_recipe_share_pct"),
+            ],
+            ["backends", sb.get("backends_pct_of_total"), sb.get("backends_share_pct")],
+            ["params", sb.get("params_pct_of_total"), sb.get("params_share_pct")],
+            ["sweep", sb.get("sweep_pct_of_total"), sb.get("sweep_share_pct")],
+            ["geak", sb.get("geak_pct_of_total"), sb.get("geak_share_pct")],
+        ]
+
+    facts: list[str] = []
+    if total_v is not None:
+        facts.append(f"Validated total gain attributed: {fmt_pct(total_v, plus=True)}.")
+    facts.append(f"Attribution method: `{method_display}`.")
+    has_any_split = any(r[1] not in (None, 0, 0.0) for r in rows)
+    if not has_any_split:
+        facts.append(
+            "No per-source split available — either the session ran a "
+            "single capability (single-source) or attribution mining was "
+            "not executed."
+        )
+    for src, pct, share in rows:
+        if pct in (None, 0, 0.0):
+            continue
+        facts.append(f"{src}: {fmt_pct(pct)} of total" + (f" ({fmt_pct(share)} share)" if share is not None else ""))
+    for n in notes:
+        facts.append(f"Note: {n}")
+
+    decisions: list[Decision] = []
+    for src, pct, _share in rows:
+        if pct and pct > 0:
+            decisions.append(
+                Decision(
+                    kind="kept",
+                    subject=f"attribution:{src}",
+                    metric_pct=float(pct),
+                    rationale="contributed positive validated gain",
+                )
+            )
+
+    # Only emit the table when some source is non-zero.
+    md = md_table(["source", "pct_of_total", "share_pct"], rows) if has_any_split else ""
+    skipped = not has_any_split
+    return RenderedSection(
+        section_id="attribution",
+        title="Source Attribution",
+        key_facts=facts,
+        markdown_block=md,
+        decisions=decisions,
+        warnings=[],
+        skipped=skipped,
+    )

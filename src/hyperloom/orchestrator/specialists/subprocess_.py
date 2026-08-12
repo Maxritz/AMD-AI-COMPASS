@@ -1,0 +1,1071 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Subprocess-based specialist dispatcher.
+
+Per-task git worktree under ``runs/specialist/<task_id>/worktree/``, a
+``claude --print --output-format stream-json`` subprocess scoped via
+``--add-dir``, and a ``specialist_done.json`` (+ ``worktree/patches/``) exit
+signal harvested into the final :class:`SpecialistRunResult`. Production uses
+the subprocess path; the in-process Backend path stays for unit tests.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import signal
+import subprocess
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from hyperloom.common.env import is_truthy
+from hyperloom.common.env_safety import scrub_child_process_env
+
+from ..trace.parse_usage import (
+    parse_claude_stream_json_response,
+    parse_claude_stream_json_tool_calls,
+    parse_claude_stream_json_turn_usages,
+    parse_claude_stream_json_usage,
+)
+
+
+log = logging.getLogger(__name__)
+
+
+_SPECIALIST_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "ANTHROPIC_BASE_URL",
+        "AWS_DEFAULT_REGION",
+        "AWS_REGION",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_MODEL",
+        "CODEX_MODEL",
+        "HOME",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "LANG",
+        "LC_ALL",
+        "NO_PROXY",
+        "OPENAI_BASE_URL",
+        "PATH",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "USERNAME",
+    }
+)
+_SPECIALIST_SECRET_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_CONFIG_FILE",
+        "AWS_PROFILE",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "OPENAI_API_KEY",
+    }
+)
+
+
+def _build_specialist_env() -> dict[str, str]:
+    """Build a minimal env for Bash-enabled specialist subprocesses."""
+    inherit_setting = os.environ.get("HYPERLOOM_SPECIALIST_INHERIT_SECRET_ENV")
+    inherit_secrets = True if inherit_setting is None else is_truthy(inherit_setting)
+    allowed = set(_SPECIALIST_ENV_ALLOWLIST)
+    if inherit_secrets:
+        allowed.update(_SPECIALIST_SECRET_ENV_ALLOWLIST)
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    env = scrub_child_process_env(env)
+    # claude's bypassPermissions/--dangerously-skip-permissions refuses to start
+    # under root unless IS_SANDBOX=1 (SWSPLAT-42390). Mirror the kernel-agent
+    # forge tools (forge_fusion / forge_submit) so specialist authoring
+    # subprocesses run on bare-root pods (non-Claw hosts) instead of crashing
+    # immediately. setdefault only under root keeps the guard intact elsewhere.
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        env.setdefault("IS_SANDBOX", "1")
+    return env
+
+
+# Live wall-budget extensions granted by ``extend_lease`` while a specialist is
+# already spawned. The reap loop re-reads this every poll, so an extension moves
+# the hard kill deadline of a run that is in flight — without it, extend_lease
+# would push the task / lane / GPU leases out while the subprocess still died at
+# its original ``wall_budget_sec``. Keyed by task_id; the dispatcher clears the
+# entry when the run finishes.
+_WALL_BUDGET_EXTENSIONS: dict[str, float] = {}
+
+
+def grant_wall_budget_extension(task_id: str, extra_sec: float) -> float:
+    """Add ``extra_sec`` to a live specialist's hard wall-clock deadline.
+
+    Safe to call for a task that is not running a subprocess (the entry is
+    simply never read and is cleared on the next dispatch of that task_id).
+
+    Args:
+        task_id: The specialist task whose deadline should move.
+        extra_sec: Seconds to add; non-positive values are a no-op.
+
+    Returns:
+        The task's cumulative granted extension in seconds.
+    """
+    key = str(task_id or "").strip()
+    if not key or extra_sec <= 0:
+        return _WALL_BUDGET_EXTENSIONS.get(key, 0.0)
+    total = _WALL_BUDGET_EXTENSIONS.get(key, 0.0) + float(extra_sec)
+    _WALL_BUDGET_EXTENSIONS[key] = total
+    return total
+
+
+def wall_budget_extension(task_id: str) -> float:
+    """Return the cumulative live extension granted to ``task_id`` (0 if none).
+
+    Args:
+        task_id: The specialist task to look up.
+
+    Returns:
+        Seconds of extension granted so far.
+    """
+    return _WALL_BUDGET_EXTENSIONS.get(str(task_id or "").strip(), 0.0)
+
+
+def clear_wall_budget_extension(task_id: str) -> None:
+    """Drop any recorded extension for ``task_id``.
+
+    Args:
+        task_id: The specialist task whose entry should be removed.
+    """
+    _WALL_BUDGET_EXTENSIONS.pop(str(task_id or "").strip(), None)
+
+
+# Configuration
+@dataclass(frozen=True)
+class SpecialistSubprocessConfig:
+    """Static config for spawning claude subprocesses per specialist.
+
+    Captured once at CLI boot and reused for every dispatch; per-task state is
+    passed at run time via :meth:`SpecialistSubprocessDispatcher.run`.
+    """
+
+    claude_executable: str = "claude"
+    """Path / name of the claude CLI binary. Default looks it up on $PATH."""
+
+    model: str = ""
+    """Claude model id (e.g. ``claude-opus-4-7``). Empty = SDK default."""
+
+    permission_mode: str = "bypassPermissions"
+    """claude-cli ``--permission-mode``. Default ``bypassPermissions``: specialist
+    subprocesses are autonomous and already sandboxed by three independent gates —
+    an isolated git worktree, a curated ``--allowedTools`` allowlist, and
+    Critic + PolicyGate review of everything they emit — so the claude-cli safety
+    classifier adds no real safety, only a hard dependency on a separate
+    ``claude-sonnet-5`` gateway call. When that classifier is degraded, ``auto``
+    made specialists stall on retries and burn their whole budget without running
+    a single Bash command (observed 96 classifier-unavailable errors vs 6 runs in
+    one enablement task). Operators can override per pod via
+    ``HYPERLOOM_SPECIALIST_PERMISSION_MODE`` (e.g. ``auto`` to restore the
+    classifier path); see ``cli/executors.py``."""
+
+    framework_source_roots: tuple[str, ...] = ()
+    """Roots used to seed ``git worktree add`` and as ``--add-dir`` parents.
+
+    The first existing root becomes the worktree base; the rest are exposed
+    to the CLI as additional ``--add-dir`` entries.
+    """
+
+    mcp_config_path: str | None = None
+    """Optional path to a JSON file holding ``{"mcpServers": {...}}``."""
+
+    output_format: str = "stream-json"
+    """``--output-format`` flag; ``stream-json`` matches Arbor."""
+
+    extra_claude_args: tuple[str, ...] = ()
+    """Operator escape hatch — appended verbatim to the claude command."""
+
+    leaf_agents_json: str | None = None
+    """``--agents`` JSON declaring leaf sub-agent types. None = built-in leaf."""
+
+    per_turn_max_seconds: float = 600.0
+    """Per-turn wall-clock fallback.
+
+    Only callers that omit ``wall_budget_sec`` fall back to
+    ``max_turns * per_turn_max_seconds`` as a per-task hard timeout.
+    """
+
+    poll_interval_seconds: float = 5.0
+    """How often the reaper polls done.json / process exit / heartbeat."""
+
+    heartbeat_stale_seconds: float = 300.0
+    """Liveness window for heartbeat.json or process.log activity.
+
+    A process that never creates either file is reaped after this window.
+    After either file has appeared, its mtime can refresh the liveness clock
+    for one window before the subsequent stale window expires, yielding about
+    two windows of silence before reap.
+    """
+
+
+# Result
+@dataclass
+class SpecialistSubprocessResult:
+    """Outcome of one specialist subprocess invocation.
+
+    The SpecialistRunner translates this into its own
+    :class:`SpecialistRunResult`.
+    """
+
+    done_payload: dict[str, Any] | None = None
+    """Parsed ``specialist_done.json`` content, or None when the file never
+    appeared (the runner then falls back to ``build_empty_specialist_done``)."""
+
+    exit_code: int | None = None
+    """Subprocess exit code (None when killed before exit)."""
+
+    elapsed_seconds: float = 0.0
+
+    timed_out: bool = False
+    """True when the dispatcher killed the subprocess past the wall-clock cap.
+
+    The cap is normally ``wall_budget_sec``, falling back to
+    ``max_turns * per_turn_max_seconds`` when no budget is supplied.
+    """
+
+    stale_heartbeat: bool = False
+    """True when the heartbeat went stale and the dispatcher killed
+    the subprocess."""
+
+    process_log_path: str = ""
+    patches: list[str] = field(default_factory=list)
+    """Full filesystem paths of patch files discovered under
+    ``<worktree>/patches/`` and ``<workspace>/patches/`` (absolute, since both
+    roots are session-absolute). Consumers read and sandbox-check these
+    directly — do not join them onto a base."""
+
+    usage: dict[str, Any] | None = None
+    """Token usage recovered from the Claude CLI ``stream-json`` log. Carries
+    the four canonical counters (``input_tokens`` / ``output_tokens`` /
+    ``cache_creation_input_tokens`` / ``cache_read_input_tokens``); the two
+    ``cache_*`` may be ``None``. ``None`` when no result row carried a ``usage``
+    block. Re-enters the unified ledger the production specialist's token spend."""
+
+    response: str | None = None
+    """Assistant reply text recovered from the same ``stream-json`` log. The
+    prompt is held by the parent; pairing it with this response lands the
+    production specialist turn in ``conversations.jsonl``. ``None`` when no
+    response text could be recovered."""
+
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    """Intel/tool calls (``{"tool", "query"}``) recovered from the same
+    stream-json log (WebSearch / WebFetch / pr_monitor / ...).
+    Empty when none were made or the log was missing/truncated."""
+
+    turn_usages: list[dict[str, int | None]] = field(default_factory=list)
+    """Per-assistant-turn token usage recovered from the stream-json log so the
+    parent can trace the multi-turn subprocess as one ledger row per model turn.
+    Empty when no per-message usage was present (parent falls back to ``usage``)."""
+
+    error: str = ""
+
+
+# Worktree management
+def _pick_worktree_base(roots: tuple[str, ...]) -> Path | None:
+    """Return the first ``roots`` entry that looks like a git checkout.
+
+    Falls back to None when none exist — the runner then runs the
+    specialist without an isolated worktree.
+
+    Args:
+        roots: Candidate root paths to probe for a ``.git`` marker.
+
+    Returns:
+        The first git-checkout root, or ``None`` when none qualify.
+    """
+    for r in roots:
+        p = Path(r)
+        if not p.is_dir():
+            continue
+        # ``.git`` may be a file (worktree) or a dir (repo).
+        git_marker = p / ".git"
+        if git_marker.exists():
+            return p
+    return None
+
+
+def _setup_worktree(
+    base: Path,
+    worktree_path: Path,
+    branch: str,
+) -> tuple[Path | None, str]:
+    """Create a fresh git worktree at ``worktree_path`` branched off
+    ``base``'s HEAD.
+
+    Best-effort: on git error returns ``(None, err)`` so the caller can
+    proceed without isolation or hard-fail.
+
+    Args:
+        base: Git checkout the worktree is branched off of.
+        worktree_path: Destination path for the new worktree.
+        branch: Branch name to create for the worktree.
+
+    Returns:
+        A ``(worktree_path, "")`` tuple on success, or ``(None, error)`` on
+        git failure.
+    """
+    if worktree_path.exists():
+        # Resume / retry: reuse an existing worktree.
+        log.warning(
+            "specialist worktree already exists at %s; reusing",
+            worktree_path,
+        )
+        return worktree_path, ""
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "git",
+        "-C",
+        str(base),
+        "worktree",
+        "add",
+        "-b",
+        branch,
+        str(worktree_path),
+    ]
+    try:
+        cp = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return None, f"git worktree add failed to spawn: {exc!r}"
+    if cp.returncode != 0:
+        return None, (f"git worktree add rc={cp.returncode}: stderr={cp.stderr.strip()[:400]!r}")
+    return worktree_path, ""
+
+
+# §3.3: how often to poll a PENDING GPU-specialist Ray actor for its pid.
+_RAY_PENDING_POLL_INTERVAL_SEC: float = 1.0
+
+
+def _ray_specialist_pending_deadline_sec() -> float:
+    """Max seconds to wait for a GPU-specialist actor to schedule before failing.
+
+    Reads ``INFERENCE_OPTIMIZER_RAY_SPECIALIST_SCHED_TIMEOUT_SEC``. A pending
+    request that exceeds this becomes a structured task failure rather than an
+    unbounded stall (§3.3 / invariant §6.4: pending time is bounded and tracked
+    separately from the running wall budget).
+    """
+    try:
+        return float(os.environ.get("INFERENCE_OPTIMIZER_RAY_SPECIALIST_SCHED_TIMEOUT_SEC", "300"))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+class _RayLeaseProcess:
+    """``Popen``-like adapter for a specialist that runs inside a Ray actor."""
+
+    def __init__(self, lease: Any, pid: int) -> None:
+        self._lease = lease
+        self.pid = pid
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        """Return ``None`` while running; exit code once done.
+
+        When the actor is unreachable (dead) and ``exit_code()`` is ``None``,
+        latches :data:`_RAY_ACTOR_DIED_RC` so the reap loop treats it as a
+        real failure immediately rather than looping until the wall-clock cap.
+        """
+        from hyperloom.orchestrator.actions.executors._ray_serving import (  # noqa: PLC0415
+            _RAY_ACTOR_DIED_RC,
+        )
+
+        if self.returncode is not None:
+            return self.returncode
+        if self._lease.is_alive():
+            return None
+        rc = self._lease.exit_code()
+        if rc is None:
+            rc = _RAY_ACTOR_DIED_RC
+        self.returncode = rc
+        return self.returncode
+
+    def reap(self) -> None:
+        """Reap the subprocess tree via the actor (lease released separately)."""
+        self._lease.stop()
+
+
+# Dispatcher
+class SpecialistSubprocessDispatcher:
+    """Spawn + reap one claude subprocess for a specialist task.
+
+    Reusable across many specialist tasks; owns no per-task state.
+    """
+
+    def __init__(self, config: SpecialistSubprocessConfig):
+        """Store the static spawn config for reuse across dispatches.
+
+        Args:
+            config (SpecialistSubprocessConfig): Session-wide config
+                captured at CLI boot; reused for every :meth:`run` call.
+        """
+        self.config = config
+
+    # Public entry point
+    async def run(
+        self,
+        *,
+        task_id: str,
+        workspace: Path,
+        worktree: Path | None,
+        worktree_base: Path | None,
+        system_prompt: str,
+        user_prompt: str,
+        allowed_tools: tuple[str, ...],
+        max_turns: int,
+        gpu_ids: tuple[int, ...] = (),
+        wall_budget_sec: float | None = None,
+        gpu_lease: Any = None,
+        progress_cb: Any = None,
+    ) -> SpecialistSubprocessResult:
+        """Spawn a claude subprocess, reap it, return the parsed result.
+
+        Args:
+            task_id (str): Task identifier used for logging / workspace
+                layout.
+            workspace (Path): ``runs/specialist/<task_id>/`` — where
+                prompt.md, process.log, heartbeat.json, and
+                specialist_done.json live.
+            worktree (Path | None): Per-task git worktree (None when
+                worktree setup failed; the dispatcher still spawns claude
+                but the agent has no write-isolated tree, only
+                ``--add-dir <workspace>``).
+            worktree_base (Path | None): Base checkout the worktree was
+                branched off. Unused here; the runner uses it as the clean
+                base for patch git-grounding.
+            system_prompt (str): System prompt assembled by
+                :func:`specialist_prompt_builder.build_specialist_prompts`.
+            user_prompt (str): User prompt from the same builder.
+            allowed_tools (tuple[str, ...]): Per-task tool whitelist
+                (post-:meth:`SpecialistRunner._resolve_tools`).
+            max_turns (int): Turn budget. This dispatcher never enforces it
+                mechanically — no ``--max-turns`` flag is passed to the claude
+                CLI (the cap reaches the specialist only as advisory prompt
+                text baked into ``system_prompt``). Its sole effect here is the
+                ``max_turns × per_turn_max_seconds`` fallback wall-clock
+                ceiling, used when ``wall_budget_sec`` is not supplied.
+            gpu_ids (tuple[int, ...]): GPU ids to expose to the subprocess.
+            wall_budget_sec (float | None): WS1 explicit wall-clock budget
+                (seconds). When provided it overrides the
+                ``max_turns × per_turn_max_seconds`` ceiling as the reaper's
+                hard kill deadline — turns are no longer the stop signal.
+            gpu_lease (Any): When set (Ray-managed GPU execution, §12 T4), a
+                started-on-demand ``GpuSpecialistLease``; the whole subprocess
+                runs inside its actor holding ``num_gpus`` (Ray sets the visible
+                devices, so any GPU command the specialist issues stays within
+                its lease). ``None`` keeps the local ``Popen`` path, with
+                ``gpu_ids`` pinned into ``*_VISIBLE_DEVICES`` as before.
+            progress_cb (Any): Optional async callback invoked with each new
+                partial checkpoint the specialist writes while it is still
+                alive. Exceptions from it never affect the run.
+
+        Returns:
+            SpecialistSubprocessResult: Parsed outcome — done payload (if
+                any), exit code, timing, timeout / stale-heartbeat flags,
+                process log path, and discovered patches.
+        """
+        # Drop any extension left over from a prior run of this task id.
+        clear_wall_budget_extension(task_id)
+        workspace.mkdir(parents=True, exist_ok=True)
+        prompt_file = workspace / "prompt.md"
+        process_log = workspace / "process.log"
+        # Poll worktree first (prompt-advertised path), then workspace as fallback.
+        done_candidates: list[Path] = []
+        if worktree is not None:
+            done_candidates.append(worktree / "specialist_done.json")
+        done_candidates.append(workspace / "specialist_done.json")
+        # Incremental checkpoint recovered as best-so-far on a budget kill; does
+        # NOT trigger reap. Same worktree-first / workspace-fallback order.
+        partial_candidates: list[Path] = []
+        if worktree is not None:
+            partial_candidates.append(worktree / "specialist_done.partial.json")
+        partial_candidates.append(workspace / "specialist_done.partial.json")
+        heartbeat_file = workspace / "heartbeat.json"
+
+        # Write the prompt file (system + user collapsed into one --system-prompt-file).
+        combined = "<!-- system_prompt -->\n" + system_prompt + "\n<!-- user_prompt -->\n" + user_prompt
+        prompt_file.write_text(combined, encoding="utf-8")
+
+        cmd = self._build_claude_cmd(
+            prompt_file=prompt_file,
+            workspace=workspace,
+            worktree=worktree,
+            allowed_tools=allowed_tools,
+        )
+
+        # Compose a minimal env. Provider credentials are inherited by default
+        # for compatibility with deployments that authenticate the claude CLI
+        # via env; set HYPERLOOM_SPECIALIST_INHERIT_SECRET_ENV=0 to disable.
+        env = _build_specialist_env()
+        # Bound the spawned claude CLI's request transport so a stalled gateway
+        # stream raises client-side instead of hanging forever.
+        from ..roles._llm_stability_env import apply_llm_stability_env
+
+        apply_llm_stability_env(env)
+        if gpu_lease is not None:
+            # Ray-managed GPU execution (§12 T4): Ray sets *_VISIBLE_DEVICES in
+            # the actor's worker; never let the caller env pin them (that would
+            # override Ray's card assignment). ``gpu_ids`` here is the logical
+            # 0..N-1 view the specialist sees under Ray's mask — kept only as the
+            # informational count env for specialist tooling.
+            for var in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
+                env.pop(var, None)
+            if gpu_ids:
+                env["INFERENCE_OPTIMIZER_SPECIALIST_GPU_IDS"] = ",".join(str(g) for g in gpu_ids)
+        elif gpu_ids:
+            visible = ",".join(str(g) for g in gpu_ids)
+            env["HIP_VISIBLE_DEVICES"] = visible
+            env["CUDA_VISIBLE_DEVICES"] = visible
+            env["ROCR_VISIBLE_DEVICES"] = visible
+            env["INFERENCE_OPTIMIZER_SPECIALIST_GPU_IDS"] = visible
+        else:
+            # CPU specialists must not inherit serving GPU visibility.
+            for var in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"):
+                env.pop(var, None)
+
+        log_fh: Any = None
+        proc_started: float
+        if gpu_lease is not None:
+            # §3.3 non-blocking start: submit the actor launch, then poll for
+            # the pid with ``asyncio.sleep`` between polls. This keeps the
+            # Coordinator event loop responsive while Ray schedules the actor
+            # (no blocking ``ray.get``), and — combined with the timing split
+            # below — excludes Ray *pending* time from the specialist's running
+            # wall budget. A bounded pending deadline turns a permanently
+            # unschedulable request into a structured task failure instead of an
+            # unbounded stall. The actor opens process.log inside its worker
+            # (same host on single-node), so the reaper below reads it directly.
+            try:
+                gpu_lease.start_async(
+                    cmd,
+                    env=env,
+                    cwd=str(worktree or workspace),
+                    log_path=str(process_log),
+                )
+            except Exception as exc:  # noqa: BLE001 — surface a submit failure as a result
+                return SpecialistSubprocessResult(
+                    done_payload=None,
+                    exit_code=None,
+                    elapsed_seconds=0.0,
+                    process_log_path=str(process_log),
+                    error=f"failed to submit specialist GPU actor: {exc!r}",
+                )
+            pending_deadline_sec = _ray_specialist_pending_deadline_sec()
+            pending_start = time.monotonic()
+            pid: int | None = None
+            while True:
+                try:
+                    pid = gpu_lease.poll_started()
+                except Exception as exc:  # noqa: BLE001 — dead actor / ray error mid-schedule
+                    gpu_lease.close()
+                    return SpecialistSubprocessResult(
+                        done_payload=None,
+                        exit_code=None,
+                        elapsed_seconds=0.0,
+                        process_log_path=str(process_log),
+                        error=f"specialist GPU actor start failed: {exc!r}",
+                    )
+                if pid is not None:
+                    break
+                pending_elapsed = time.monotonic() - pending_start
+                if pending_elapsed >= pending_deadline_sec:
+                    gpu_lease.close()
+                    return SpecialistSubprocessResult(
+                        done_payload=None,
+                        exit_code=None,
+                        elapsed_seconds=0.0,
+                        process_log_path=str(process_log),
+                        error=(
+                            f"specialist GPU actor did not schedule within "
+                            f"{pending_deadline_sec:.0f}s (Ray pending deadline); "
+                            "cluster fully occupied"
+                        ),
+                    )
+                await asyncio.sleep(_RAY_PENDING_POLL_INTERVAL_SEC)
+            proc: Any = _RayLeaseProcess(gpu_lease, pid)
+            # §3.3 timing split (invariant §6.4): the wall-budget clock starts
+            # only now that a real pid exists — the Ray pending time above is
+            # excluded so a slow-to-schedule actor is never mis-reaped.
+            proc_started = time.monotonic()
+        else:
+            proc_started = time.monotonic()
+            log_fh = process_log.open("w", encoding="utf-8")
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=str(worktree or workspace),
+                    start_new_session=True,
+                )
+            except (FileNotFoundError, OSError) as exc:
+                log_fh.close()
+                return SpecialistSubprocessResult(
+                    done_payload=None,
+                    exit_code=None,
+                    elapsed_seconds=0.0,
+                    process_log_path=str(process_log),
+                    error=f"failed to spawn claude subprocess: {exc!r}",
+                )
+
+        # Reap loop — poll done-file / exit / heartbeat staleness / timeout.
+        # Prefer the explicit wall budget; fall back to ``max_turns × per_turn``.
+        if wall_budget_sec and wall_budget_sec > 0:
+            max_seconds = float(wall_budget_sec)
+        else:
+            max_seconds = float(max_turns) * float(self.config.per_turn_max_seconds)
+        try:
+            outcome = await self._reap_loop(
+                proc=proc,
+                workspace=workspace,
+                done_files=tuple(done_candidates),
+                partial_files=tuple(partial_candidates),
+                heartbeat_file=heartbeat_file,
+                max_seconds=max_seconds,
+                started=proc_started,
+                progress_cb=progress_cb,
+                task_id=task_id,
+            )
+        finally:
+            if log_fh is not None:
+                log_fh.close()
+            clear_wall_budget_extension(task_id)
+
+        # Patches: scan worktree/patches/ (Arbor convention).
+        patches = self._collect_patches(worktree, workspace)
+
+        # Parse done.json (best-effort) — first existing candidate.
+        done_payload = None
+        for cand in done_candidates:
+            if cand.exists():
+                done_payload = self._read_done(cand)
+                if done_payload is not None:
+                    break
+
+        # No final done.json — fall back to the most recent incremental partial
+        # so a killed-but-productive specialist still surfaces its findings.
+        if done_payload is None:
+            for cand in partial_candidates:
+                if cand.exists():
+                    partial = self._read_done(cand)
+                    if partial is not None:
+                        partial["_recovered_from_partial"] = True
+                        done_payload = partial
+                        if not outcome.get("error"):
+                            outcome["error"] = "recovered_from_partial"
+                        break
+
+        # Recover cumulative session token usage from process.log.
+        usage = parse_claude_stream_json_usage(process_log)
+        # Recover the assistant's reply so the production turn lands in conversations.jsonl.
+        response = parse_claude_stream_json_response(process_log)
+        # Intel/tool calls the specialist made, recovered from the same log.
+        tool_calls = parse_claude_stream_json_tool_calls(process_log)
+        # Per-turn usage for fine-grained tracing; falls back to ``usage`` when absent.
+        turn_usages = parse_claude_stream_json_turn_usages(process_log)
+
+        return SpecialistSubprocessResult(
+            done_payload=done_payload,
+            exit_code=outcome["exit_code"],
+            elapsed_seconds=outcome["elapsed"],
+            timed_out=outcome["timed_out"],
+            stale_heartbeat=outcome["stale_heartbeat"],
+            process_log_path=str(process_log),
+            patches=patches,
+            usage=usage,
+            response=response,
+            tool_calls=tool_calls,
+            turn_usages=turn_usages,
+            error=outcome["error"],
+        )
+
+    # Internals
+    def _build_claude_cmd(
+        self,
+        *,
+        prompt_file: Path,
+        workspace: Path,
+        worktree: Path | None,
+        allowed_tools: tuple[str, ...],
+    ) -> list[str]:
+        """Assemble the ``claude`` CLI argv for a specialist subprocess.
+
+        Builds the flag list (output format, permission mode, system
+        prompt file, tool whitelist, mcp config, ``--add-dir`` entries,
+        operator escape-hatch args). ``emit_intent`` is dropped from the
+        tool whitelist since the subprocess has no in-process MCP server.
+
+        Args:
+            prompt_file (Path): Combined system+user prompt file passed via
+                ``--system-prompt-file``.
+            workspace (Path): Task workspace surfaced as an ``--add-dir``.
+            worktree (Path | None): Write-isolated worktree surfaced as the
+                first ``--add-dir`` when present.
+            allowed_tools (tuple[str, ...]): Per-task tool whitelist.
+
+        Returns:
+            list[str]: The full command argv to spawn.
+        """
+        cfg = self.config
+        cmd: list[str] = [
+            cfg.claude_executable,
+            "--print",
+            "--output-format",
+            cfg.output_format,
+            "--verbose",
+            "--permission-mode",
+            cfg.permission_mode,
+            "--system-prompt-file",
+            str(prompt_file),
+            "-p",
+            "Execute the task in your system prompt. Work autonomously. "
+            + "Write specialist_done.json as your absolute last action.",
+        ]
+        if cfg.model:
+            cmd.extend(["--model", cfg.model])
+        # Drop ``emit_intent``: the subprocess exits via writing specialist_done.json.
+        tools_filtered = [t for t in allowed_tools if t != "emit_intent"]
+        if tools_filtered:
+            cmd.extend(["--allowedTools", ",".join(tools_filtered)])
+        # Declare leaf sub-agent types when the specialist may fan out via Task.
+        if "Task" in tools_filtered:
+            from .leaf import build_leaf_agents_json
+
+            cmd.extend(["--agents", cfg.leaf_agents_json or build_leaf_agents_json()])
+        if cfg.mcp_config_path:
+            cmd.extend(["--mcp-config", cfg.mcp_config_path])
+        # --add-dir order: worktree (writes), workspace (done.json), framework roots.
+        add_dirs: list[str] = []
+        if worktree is not None:
+            add_dirs.append(str(worktree))
+        add_dirs.append(str(workspace))
+        for r in cfg.framework_source_roots:
+            if r and Path(r).is_dir() and r not in add_dirs:
+                add_dirs.append(r)
+        for d in add_dirs:
+            cmd.extend(["--add-dir", d])
+        if cfg.extra_claude_args:
+            cmd.extend(list(cfg.extra_claude_args))
+        return cmd
+
+    async def _publish_partial_progress(
+        self,
+        *,
+        partial_files: tuple[Path, ...],
+        since_mtime: float,
+        elapsed: float,
+        progress_cb: Any,
+    ) -> float:
+        """Forward a freshly-rewritten partial checkpoint to ``progress_cb``.
+
+        Publishes at most one file per call: worktree first, then workspace.
+
+        Args:
+            partial_files: Candidate checkpoint paths, worktree first.
+            since_mtime: Newest mtime already published.
+            elapsed: Seconds since spawn, passed to the callback.
+            progress_cb: Async callback receiving ``(payload, elapsed)``.
+
+        Returns:
+            The newest mtime seen, so the caller can skip unchanged files.
+        """
+        newest = since_mtime
+        for cand in partial_files:
+            try:
+                mtime = cand.stat().st_mtime
+            except OSError:
+                continue
+            if mtime <= since_mtime:
+                continue
+            payload = self._read_done(cand)
+            if payload is None:
+                continue
+            newest = max(newest, mtime)
+            try:
+                await progress_cb(payload, elapsed)
+            except Exception:  # noqa: BLE001 — never let telemetry kill a run
+                log.exception("specialist progress callback raised")
+            break
+        return newest
+
+    async def _reap_loop(
+        self,
+        *,
+        proc: Any,
+        workspace: Path,
+        done_files: tuple[Path, ...],
+        heartbeat_file: Path,
+        max_seconds: float,
+        started: float,
+        partial_files: tuple[Path, ...] = (),
+        progress_cb: Any = None,
+        task_id: str = "",
+    ) -> dict[str, Any]:
+        """Poll the subprocess until it finishes, stalls, or times out.
+
+        Each tick checks (in order): a done-file at any candidate path
+        (graceful exit with a short grace window), natural process exit,
+        activity staleness (heartbeat.json OR process.log), and the hard
+        wall-clock cap. Stale / timed-out
+        runs are killed via :meth:`_kill`. Partial checkpoints written along
+        the way are forwarded to ``progress_cb`` as they change.
+
+        Args:
+            proc (Any): The running claude subprocess — a ``subprocess.Popen``
+                (local) or a :class:`_RayLeaseProcess` (Ray GPU-specialist
+                actor). Only ``poll`` / ``returncode`` / ``pid`` are used.
+            workspace (Path): Task workspace; supplies the ``process.log``
+                whose mtime is the second liveness signal.
+            done_files (tuple[Path, ...]): Candidate done-file paths to poll.
+            heartbeat_file (Path): Heartbeat file whose mtime is one of the two
+                activity signals ORed together for the liveness check.
+            max_seconds (float): Hard wall-clock ceiling for the run.
+            started (float): ``time.monotonic()`` value at spawn time.
+            partial_files (tuple[Path, ...]): Candidate partial-checkpoint
+                paths polled for live progress; never an exit signal.
+            progress_cb (Any): Optional async callback for each new checkpoint.
+            task_id (str): Task identifier used to pick up live
+                ``extend_lease`` wall-budget extensions each poll.
+
+        Returns:
+            dict[str, Any]: Outcome with ``exit_code``, ``elapsed``,
+                ``timed_out``, ``stale_heartbeat``, and ``error`` keys.
+        """
+        cfg = self.config
+        outcome: dict[str, Any] = {
+            "exit_code": None,
+            "elapsed": 0.0,
+            "timed_out": False,
+            "stale_heartbeat": False,
+            "error": "",
+        }
+        last_heartbeat_seen: float = started
+        # process.log mtime is a reliable "still working" signal even when the
+        # agent never self-writes heartbeat.json.
+        process_log = workspace / "process.log"
+        last_partial_mtime: float = 0.0
+
+        while True:
+            await asyncio.sleep(cfg.poll_interval_seconds)
+            now = time.monotonic()
+            elapsed = now - started
+            outcome["elapsed"] = elapsed
+
+            # done.json appeared — graceful exit with up to 30s grace.
+            if any(p.exists() for p in done_files):
+                grace_until = now + 30.0
+                while time.monotonic() < grace_until and proc.poll() is None:
+                    await asyncio.sleep(2.0)
+                # Still alive after grace — reap it so no orphaned subprocess leaks.
+                if proc.poll() is None:
+                    self._kill(proc)
+                outcome["exit_code"] = proc.poll()
+                outcome["elapsed"] = time.monotonic() - started
+                break
+
+            # Process exited on its own.
+            if proc.poll() is not None:
+                outcome["exit_code"] = proc.returncode
+                outcome["elapsed"] = elapsed
+                break
+
+            # Still running: republish any checkpoint written since the last tick.
+            if progress_cb is not None:
+                last_partial_mtime = await self._publish_partial_progress(
+                    partial_files=partial_files,
+                    since_mtime=last_partial_mtime,
+                    elapsed=elapsed,
+                    progress_cb=progress_cb,
+                )
+
+            # Liveness check: alive if EITHER heartbeat.json was refreshed OR
+            # process.log is still growing. The hard wall-clock cap below still
+            # bounds genuinely hung subprocesses.
+            for activity_file in (heartbeat_file, process_log):
+                try:
+                    if not activity_file.exists():
+                        continue
+                    a_mtime = activity_file.stat().st_mtime
+                except OSError:
+                    continue
+                if max(0.0, time.time() - a_mtime) <= cfg.heartbeat_stale_seconds:
+                    last_heartbeat_seen = now
+                    break
+
+            if (now - last_heartbeat_seen) > cfg.heartbeat_stale_seconds:
+                outcome["stale_heartbeat"] = True
+                outcome["error"] = (
+                    f"heartbeat stale for {now - last_heartbeat_seen:.0f}s "
+                    f"(> {cfg.heartbeat_stale_seconds:.0f}s threshold)"
+                )
+                self._kill(proc)
+                outcome["exit_code"] = proc.poll()
+                outcome["elapsed"] = time.monotonic() - started
+                break
+
+            # Hard wall-clock cap — re-read each poll so an ``extend_lease``
+            # granted mid-run actually moves this deadline.
+            deadline = max_seconds + wall_budget_extension(task_id)
+            if elapsed > deadline:
+                outcome["timed_out"] = True
+                outcome["error"] = f"specialist subprocess exceeded {deadline:.0f}s wall-clock cap"
+                self._kill(proc)
+                outcome["exit_code"] = proc.poll()
+                outcome["elapsed"] = time.monotonic() - started
+                break
+
+        return outcome
+
+    @staticmethod
+    def _kill(proc: Any) -> None:
+        """Tear down a claude subprocess.
+
+        Kills the whole process group (SIGTERM, then SIGKILL after a 5s
+        grace) so child SDK / curl invocations die with it. No-op if the
+        process already exited. For a :class:`_RayLeaseProcess` (Ray
+        GPU-specialist actor) the reap is delegated to the actor, which reaps
+        the whole tree inside its worker (the lease is released separately).
+
+        Args:
+            proc (Any): The subprocess to terminate — ``subprocess.Popen`` or
+                :class:`_RayLeaseProcess`.
+        """
+        if isinstance(proc, _RayLeaseProcess):
+            proc.reap()
+            return
+        if proc.poll() is not None:
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        # Give SIGTERM 5s before SIGKILL.
+        for _ in range(10):
+            if proc.poll() is not None:
+                return
+            time.sleep(0.5)
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _collect_patches(
+        worktree: Path | None,
+        workspace: Path,
+    ) -> list[str]:
+        """Discover patch files written by the specialist.
+
+        Scans both ``worktree/patches/`` and ``workspace/patches/``
+        (defense in depth — the agent may write to either) for ``*.patch``
+        and ``*.diff`` files.
+
+        Args:
+            worktree (Path | None): Per-task worktree, or None.
+            workspace (Path): Task workspace.
+
+        Returns:
+            list[str]: Discovered patch file paths.
+        """
+        out: list[str] = []
+        for base in (worktree, workspace):
+            if base is None:
+                continue
+            patches_dir = base / "patches"
+            if not patches_dir.is_dir():
+                continue
+            for ext in ("*.patch", "*.diff"):
+                for p in sorted(patches_dir.glob(ext)):
+                    out.append(str(p))
+        return out
+
+    @staticmethod
+    def _read_done(done_file: Path) -> dict[str, Any] | None:
+        """Parse a ``specialist_done.json`` file, unwrapping intent envelopes.
+
+        Tolerates missing files and parse errors (logged, returns None).
+        When the file holds a ``specialist_done`` intent envelope, the
+        inner ``payload`` is merged with the outer keys so callers always
+        see a flat dict.
+
+        Args:
+            done_file (Path): Path to the candidate done-file.
+
+        Returns:
+            dict[str, Any] | None: The parsed (and possibly unwrapped)
+                payload, or None when missing / unparseable / not a dict.
+        """
+        if not done_file.exists():
+            return None
+        try:
+            data = json.loads(done_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning(
+                "specialist_done.json parse failed at %s: %r",
+                done_file,
+                exc,
+            )
+            return None
+        if not isinstance(data, dict):
+            log.warning(
+                "specialist_done.json at %s is not a dict (%r); ignoring",
+                done_file,
+                type(data).__name__,
+            )
+            return None
+        if str(data.get("intent_type") or "") == "specialist_done" and isinstance(data.get("payload"), dict):
+            inner = data["payload"]
+            merged: dict[str, Any] = {}
+            for k, v in data.items():
+                if k in ("intent_type", "payload"):
+                    continue
+                merged[k] = v
+            for k, v in inner.items():
+                merged[k] = v
+            log.info(
+                "_read_done: unwrapped specialist_done intent envelope at %s (proposal_set_len=%d, empty=%s)",
+                done_file,
+                len(inner.get("proposal_set") or []) if isinstance(inner.get("proposal_set"), list) else 0,
+                inner.get("empty"),
+            )
+            return merged
+        return data
+
+
+__all__ = [
+    "SpecialistSubprocessConfig",
+    "SpecialistSubprocessDispatcher",
+    "SpecialistSubprocessResult",
+    "_pick_worktree_base",
+    "_setup_worktree",
+]

@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Specialist subprocess MCP config generator.
+
+Generates the ``--mcp-config`` JSON the ``claude`` subprocess reads,
+registering the streamable-HTTP PR Monitor MCP server:
+
+- ``pr_monitor`` (at :meth:`KnowledgePlane.specialist_mcp_url`) — the name MUST
+  be ``pr_monitor`` so the ``mcp__pr_monitor__*`` whitelist names resolve.
+
+Schema follows :data:`claude_agent_sdk.types.McpHttpServerConfig`.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+
+log = logging.getLogger(__name__)
+
+
+SPECIALIST_MCP_CONFIG_FILENAME = "specialist_mcp.json"
+
+
+def write_specialist_mcp_config(
+    *,
+    session_dir: Path | str,
+    pr_monitor_mcp_url: str,
+) -> Path | None:
+    """Write the specialist subprocess MCP config and return its path.
+
+    Returns ``None`` when no MCP server is wireable (caller leaves
+    ``--mcp-config`` off). Idempotent.
+
+    Args:
+        session_dir: Session root; the file lands at
+            ``<session_dir>/runtime/<SPECIALIST_MCP_CONFIG_FILENAME>``.
+        pr_monitor_mcp_url: ``KnowledgePlane.specialist_mcp_url()``; empty
+            means disabled.
+
+    Returns:
+        The written config file path, or ``None`` when no MCP server is
+        wireable.
+    """
+    servers: dict[str, dict[str, Any]] = {}
+    pr_url = (pr_monitor_mcp_url or "").strip()
+    if pr_url:
+        servers["pr_monitor"] = {
+            "type": "http",
+            "url": pr_url,
+        }
+
+    if not servers:
+        log.info(
+            "specialist_mcp_config: no MCP servers to wire (pr_monitor disabled?); skipping config file generation"
+        )
+        return None
+
+    runtime_dir = Path(session_dir) / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = runtime_dir / SPECIALIST_MCP_CONFIG_FILENAME
+    payload = {"mcpServers": servers}
+    cfg_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        cfg_path.chmod(0o600)
+    except OSError:
+        log.debug("specialist_mcp_config: chmod 0600 failed for %s", cfg_path, exc_info=True)
+    log.info(
+        "specialist_mcp_config: wrote %s (servers=%s)",
+        cfg_path,
+        sorted(servers.keys()),
+    )
+    return cfg_path
+
+
+__all__ = [
+    "SPECIALIST_MCP_CONFIG_FILENAME",
+    "write_specialist_mcp_config",
+]

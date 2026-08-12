@@ -1,0 +1,76 @@
+defaults:
+  numbered: False
+  maxdepth: 6
+root: index
+
+subtrees:
+- entries:
+  - file: what-is-hyperloom.md
+    title: What is Hyperloom?
+  - file: release-notes.md
+    title: Release notes
+  - file: compatibility.rst
+    title: Compatibility matrix
+
+- caption: Install
+  entries:
+  - file: install/install.md
+    title: Install on Docker or Bare metal
+  - file: install/slurm.md
+    title: Install for Slurm
+
+- caption: Overview
+  entries:
+  - file: components/index.md
+    title: Components
+    subtrees:
+    - entries:
+      - url: https://rocm.docs.amd.com/projects/intellikit/en/latest/
+        title: IntelliKit
+      - url: https://rocm.docs.amd.com/projects/magpie/en/latest
+        title: Magpie
+      - url: https://rocm.docs.amd.com/projects/tracelens/en/latest/
+        title: TraceLens
+      - url: https://rocm.docs.amd.com/projects/geak/en/latest/
+        title: GEAK
+      - url: https://rocm.docs.amd.com/projects/agent-kernel-arena/en/latest/
+        title: AgentKernelArena
+  - file: conceptual/optimization-loop.md
+    title: Hyperloom optimization loop
+
+- caption: How to
+  entries:
+  - file: how-to/optimize.md
+    title: Run a Hyperloom optimization
+  - file: how-to/quantization-quark.md
+    title: Quantization with AMD Quark
+  - file: how-to/multi-node/hyperloom-remote-demo.md
+    title: Multi-node inference optimization demo
+
+- caption: Reference
+  entries:
+  - file: reference/api-reference.rst
+    title: API reference
+  - file: reference/environment-variables.md
+    title: Environment variables
+  - file: reference/authentication.md
+    title: Authentication and credentials
+  - file: reference/operations.md
+    title: Operations and self-hosting
+  - file: reference/upgrade.md
+    title: Upgrade guide
+  - file: reference/session-breakdown.md
+    title: Session output schema
+  - file: reference/integrate-kb.md
+    title: Knowledge base integration
+  - file: reference/operator-scripts.md
+    title: Operator scripts
+  - file: reference/troubleshooting.md
+    title: Troubleshooting
+
+- caption: About
+  entries:
+  - file: about.md
+    title: About
+  - file: license.rst
+    title: License

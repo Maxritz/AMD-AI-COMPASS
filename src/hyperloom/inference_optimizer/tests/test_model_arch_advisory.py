@@ -1,0 +1,297 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Advisory ``model_arch`` profile: loader, serialization, renderer, warm-param injection."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from hyperloom.inference_optimizer.cli.model_gate import _load_model_arch
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.orchestrator.state.shared_state import (
+    SharedState,
+    render_model_arch_compact,
+)
+
+
+_VALID_ARCH = {
+    "model_name": "DeepSeek-R1-0528",
+    "source": "gallery",
+    "decoder_type": "Sparse MoE",
+    "attention": "MLA",
+    "layer_mix": "61 MLA",
+    "kv_cache_per_token": "68.6 KiB",
+    "active_params": "37B active / 671B total",
+    "num_experts": 256,
+    "experts_per_tok": 8,
+    "mtp": True,
+    "swa_window": None,
+    "norm": "RMSNorm",
+    "notes": "DeepSeek V3-style: dense prefix + shared expert + MTP-1 path",
+}
+
+
+def _write(workspace: Path, payload: Any) -> Path:
+    p = workspace / "model_arch.json"
+    p.write_text(
+        payload if isinstance(payload, str) else json.dumps(payload),
+        encoding="utf-8",
+    )
+    return p
+
+
+# 1. _load_model_arch — happy path + soft-degrade matrix
+def test_load_model_arch_valid(tmp_path: Path):
+    _write(tmp_path, _VALID_ARCH)
+    out = _load_model_arch(tmp_path, "DeepSeek-R1-0528")
+    assert out == _VALID_ARCH
+
+
+def test_load_model_arch_matches_on_basename(tmp_path: Path):
+    """The guard compares basenames so a path / bare-name mismatch still matches."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "DeepSeek-R1-0528"})
+    out = _load_model_arch(tmp_path, "/weights/nfs/DeepSeek-R1-0528")
+    assert out["attention"] == "MLA"
+
+
+def test_load_model_arch_missing_file_returns_empty(tmp_path: Path):
+    assert _load_model_arch(tmp_path, "anything") == {}
+
+
+def test_load_model_arch_invalid_json_returns_empty(tmp_path: Path):
+    _write(tmp_path, "{not valid json")
+    assert _load_model_arch(tmp_path, "anything") == {}
+
+
+def test_load_model_arch_non_dict_returns_empty(tmp_path: Path):
+    _write(tmp_path, ["a", "list"])
+    assert _load_model_arch(tmp_path, "anything") == {}
+
+
+def test_load_model_arch_missing_model_name_returns_empty(tmp_path: Path):
+    payload = {k: v for k, v in _VALID_ARCH.items() if k != "model_name"}
+    _write(tmp_path, payload)
+    assert _load_model_arch(tmp_path, "DeepSeek-R1-0528") == {}
+
+
+def test_load_model_arch_stale_mismatch_returns_empty(tmp_path: Path):
+    """A leftover file from a different-model run must be ignored."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "Llama-3.1-8B"})
+    assert _load_model_arch(tmp_path, "DeepSeek-R1-0528") == {}
+
+
+# 1a. $HYPERLOOM_MODEL_ARCH_FILE pre-seed: the session dir is created and read
+# in the same CLI process, so a launcher can only get a profile in by seeding
+# it before launch.
+def test_load_model_arch_preseed_env_loads_and_copies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    src = tmp_path / "preseed.json"
+    src.write_text(json.dumps(_VALID_ARCH), encoding="utf-8")
+    session = tmp_path / "session"
+    session.mkdir()
+    monkeypatch.setenv("HYPERLOOM_MODEL_ARCH_FILE", str(src))
+
+    out = _load_model_arch(session, "DeepSeek-R1-0528")
+
+    assert out == _VALID_ARCH
+    # Copied into the session for provenance.
+    assert json.loads((session / "model_arch.json").read_text(encoding="utf-8")) == _VALID_ARCH
+
+
+def test_load_model_arch_in_session_file_wins_over_preseed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    src = tmp_path / "preseed.json"
+    src.write_text(json.dumps({**_VALID_ARCH, "source": "preseed"}), encoding="utf-8")
+    session = tmp_path / "session"
+    session.mkdir()
+    _write(session, {**_VALID_ARCH, "source": "in_session"})
+    monkeypatch.setenv("HYPERLOOM_MODEL_ARCH_FILE", str(src))
+
+    assert _load_model_arch(session, "DeepSeek-R1-0528")["source"] == "in_session"
+
+
+def test_load_model_arch_preseed_unreadable_returns_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HYPERLOOM_MODEL_ARCH_FILE", str(tmp_path / "missing.json"))
+    assert _load_model_arch(tmp_path / "session", "DeepSeek-R1-0528") == {}
+
+
+def test_load_model_arch_preseed_still_stale_guarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Pre-seeding does not bypass the stale-model guard."""
+    src = tmp_path / "preseed.json"
+    src.write_text(json.dumps({**_VALID_ARCH, "model_name": "Llama-3.1-8B"}), encoding="utf-8")
+    session = tmp_path / "session"
+    session.mkdir()
+    monkeypatch.setenv("HYPERLOOM_MODEL_ARCH_FILE", str(src))
+
+    assert _load_model_arch(session, "DeepSeek-R1-0528") == {}
+
+
+# 1b. HF hub cache path: launched --model is a snapshots/<hash> dir whose
+# basename is a commit hash, but the declared clean model_name must still match.
+_HF_SNAPSHOT = (
+    "/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"
+)
+
+
+def test_load_model_arch_matches_hf_cache_snapshot_clean_name(tmp_path: Path):
+    """Declared clean name matches an HF cache snapshot launch path."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "Qwen2.5-7B-Instruct"})
+    out = _load_model_arch(tmp_path, "a09a35458c702b33eeacc393d103063234e8bc28", _HF_SNAPSHOT)
+    assert out["attention"] == "MLA"
+
+
+def test_load_model_arch_matches_hf_cache_snapshot_org_repo(tmp_path: Path):
+    """Declared org--repo form matches an HF cache snapshot launch path."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "Qwen--Qwen2.5-7B-Instruct"})
+    out = _load_model_arch(tmp_path, "a09a35458c702b33eeacc393d103063234e8bc28", _HF_SNAPSHOT)
+    assert out["attention"] == "MLA"
+
+
+def test_load_model_arch_matches_hf_cache_snapshot_models_form(tmp_path: Path):
+    """Declared models--org--repo form matches an HF cache snapshot launch path."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "models--Qwen--Qwen2.5-7B-Instruct"})
+    out = _load_model_arch(tmp_path, "a09a35458c702b33eeacc393d103063234e8bc28", _HF_SNAPSHOT)
+    assert out["attention"] == "MLA"
+
+
+def test_load_model_arch_matches_repo_id(tmp_path: Path):
+    """A bare HF repo id launch matches a declared clean name."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "Qwen2.5-7B-Instruct"})
+    out = _load_model_arch(tmp_path, "Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen2.5-7B-Instruct")
+    assert out["attention"] == "MLA"
+
+
+def test_load_model_arch_flat_dir_still_matches(tmp_path: Path):
+    """A flat model dir basename still matches (no regression)."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "Qwen3-8B"})
+    out = _load_model_arch(tmp_path, "Qwen3-8B", "/primus/models/Qwen3-8B")
+    assert out["attention"] == "MLA"
+
+
+def test_load_model_arch_true_stale_ignored_with_hf_cache(tmp_path: Path):
+    """A different model's leftover file is still ignored under an HF cache launch."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "Llama-3.1-8B"})
+    assert _load_model_arch(tmp_path, "a09a35458c702b33eeacc393d103063234e8bc28", _HF_SNAPSHOT) == {}
+
+
+def test_load_model_arch_cross_org_same_repo_name_ignored(tmp_path: Path):
+    """Two different orgs sharing a repo name must NOT match when both qualify org."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "MyOrg--Llama-8B"})
+    launch = "/root/.cache/huggingface/hub/models--OtherOrg--Llama-8B/snapshots/deadbeef"
+    assert _load_model_arch(tmp_path, "deadbeef", launch) == {}
+
+
+def test_load_model_arch_bare_name_matches_any_org(tmp_path: Path):
+    """A declared clean name with no org still matches its launched org/repo form."""
+    _write(tmp_path, {**_VALID_ARCH, "model_name": "Llama-8B"})
+    launch = "/root/.cache/huggingface/hub/models--OtherOrg--Llama-8B/snapshots/deadbeef"
+    out = _load_model_arch(tmp_path, "deadbeef", launch)
+    assert out["attention"] == "MLA"
+
+
+# 2. SharedState serialization round-trip
+def test_model_arch_round_trips_through_dict():
+    state = SharedState(model_name="DeepSeek-R1-0528", model_arch=dict(_VALID_ARCH))
+    revived = SharedState.from_dict(state.to_dict())
+    assert revived.model_arch == _VALID_ARCH
+
+
+def test_model_arch_defaults_to_empty_dict():
+    state = SharedState(model_name="m")
+    assert state.model_arch == {}
+    revived = SharedState.from_dict(state.to_dict())
+    assert revived.model_arch == {}
+
+
+# 3. render_model_arch_compact
+def test_render_empty_inputs_return_blank():
+    assert render_model_arch_compact({}) == ""
+    assert render_model_arch_compact(None) == ""
+    assert render_model_arch_compact("not a dict") == ""  # type: ignore[arg-type]
+
+
+def test_render_drops_empty_fields_and_trails_notes():
+    line = render_model_arch_compact(_VALID_ARCH)
+    assert "attention=MLA" in line
+    assert "experts=256" in line
+    assert "swa_window" not in line  # None -> dropped
+    assert "model_name=" not in line  # not a structured render field
+    assert line.strip().endswith(_VALID_ARCH["notes"])
+    assert line.index("decoder=") < line.index("notes=")
+
+
+def test_render_skips_blank_notes():
+    line = render_model_arch_compact({"attention": "MLA", "notes": "   "})
+    assert line == "attention=MLA"
+
+
+# 4. to_prompt_summary block
+def test_prompt_summary_renders_block_when_set():
+    state = SharedState(model_name="m", model_arch=dict(_VALID_ARCH))
+    text = state.to_prompt_summary()
+    assert "model_arch(advisory; subordinate to TraceLens analysis_md)=" in text
+    assert "attention=MLA" in text
+
+
+def test_prompt_summary_omits_block_when_empty():
+    state = SharedState(model_name="m")
+    text = state.to_prompt_summary()
+    assert "model_arch" not in text
+
+
+# 5. Coordinator._warm_specialist_params -> arch_notes
+@dataclass
+class _ArchState:
+    """Minimal SharedState double for the warm-param path."""
+
+    model_arch: dict = field(default_factory=dict)
+    gpu_type: str = ""
+    framework: str = ""
+    tp: int = 0
+    precision: str = ""
+    conc: int = 0
+    isl: int = 0
+    osl: int = 0
+    max_model_len: int = 0
+    warm_start_recipe: dict[str, Any] = field(default_factory=dict)
+    warm_start_pitfalls: list[Any] = field(default_factory=list)
+    warm_start_lessons: list[Any] = field(default_factory=list)
+    stack_fingerprint_meta: dict[str, Any] = field(default_factory=dict)
+
+
+def _make_coord(tmp_path: Path, *, state: _ArchState) -> Coordinator:
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    c.shared_state = state
+    c.knowledge_plane = None
+    return c
+
+
+@pytest.mark.asyncio
+async def test_warm_populates_arch_notes_from_model_arch(tmp_path: Path):
+    coord = _make_coord(tmp_path, state=_ArchState(model_arch=dict(_VALID_ARCH)))
+    params: dict[str, Any] = {"domain": "serving_specialist"}
+    await coord._warm_specialist_params(params)
+    assert "arch_notes" in params
+    assert "attention=MLA" in params["arch_notes"]
+
+
+@pytest.mark.asyncio
+async def test_warm_omits_arch_notes_when_model_arch_empty(tmp_path: Path):
+    coord = _make_coord(tmp_path, state=_ArchState(model_arch={}))
+    params: dict[str, Any] = {"domain": "serving_specialist"}
+    await coord._warm_specialist_params(params)
+    assert "arch_notes" not in params
+
+
+@pytest.mark.asyncio
+async def test_warm_respects_caller_supplied_arch_notes(tmp_path: Path):
+    """``setdefault`` semantics: a caller-supplied value wins."""
+    coord = _make_coord(tmp_path, state=_ArchState(model_arch=dict(_VALID_ARCH)))
+    params: dict[str, Any] = {"domain": "serving_specialist", "arch_notes": "PRESET"}
+    await coord._warm_specialist_params(params)
+    assert params["arch_notes"] == "PRESET"

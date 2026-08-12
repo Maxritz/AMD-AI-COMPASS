@@ -1,0 +1,267 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""SQLite schema for the unified Coordinator state DB
+(``$SESSION_DIR/storage/coordinator.db``).
+
+Tables: ``leases`` (composite PK ``(lane, holder_id)`` for multi-holder
+lanes), ``lane_capacity``, ``events`` (A2A bus), ``cursors`` (idempotent
+replay), ``tasks`` (lifecycle state machine), ``gpu_leases`` (specialist GPU
+pool, separate from serving lanes).
+
+No FK constraints between ``tasks`` and ``leases``/``events``: lifetimes
+differ (a task's leases may be reaped before its events are pruned), so
+``leases.task_id`` / ``events.in_reply_to`` are advisory only.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+# ensure_schema creates the current schema under BEGIN IMMEDIATE. Databases
+# written by older versions are not supported and must be recreated.
+SCHEMA_VERSION = 3
+
+
+# Default lane capacities; ``--research-lane-capacity`` overrides research_lane
+# at boot. ``gpu_research_lane`` carries GPU specialists and is mutually
+# exclusive with the serving lanes (LANE_CONFLICTS); it is capacity-1 so a
+# single GPU specialist holds the machine at a time.
+DEFAULT_LANE_CAPACITIES: dict[str, int] = {
+    "server_lifecycle": 1,
+    "workspace_mutation": 1,
+    "benchmark_lane": 1,
+    "profile_lane": 1,
+    "research_lane": 1,
+    "gpu_research_lane": 1,
+    "build_lane": 1,
+}
+
+
+_DDL = [
+    # leases — Resource Lock Manager. Composite PK (lane, holder_id).
+    """
+    CREATE TABLE IF NOT EXISTS leases (
+        lane          TEXT    NOT NULL,
+        holder_id     TEXT    NOT NULL,
+        task_id       TEXT    NOT NULL,
+        action        TEXT    NOT NULL,
+        pid           INTEGER NOT NULL,
+        acquired_at   TEXT    NOT NULL,
+        expires_at    TEXT    NOT NULL,
+        heartbeat_at  TEXT    NOT NULL,
+        PRIMARY KEY (lane, holder_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_leases_lane ON leases(lane)",
+    # lane_capacity — per-lane concurrency cap
+    """
+    CREATE TABLE IF NOT EXISTS lane_capacity (
+        lane     TEXT PRIMARY KEY,
+        capacity INTEGER NOT NULL
+    )
+    """,
+    # events — A2A message bus
+    """
+    CREATE TABLE IF NOT EXISTS events (
+        seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg_id        TEXT    NOT NULL UNIQUE,
+        from_agent    TEXT    NOT NULL,
+        to_agent      TEXT    NOT NULL,
+        topic         TEXT    NOT NULL,
+        in_reply_to   TEXT,
+        payload       TEXT    NOT NULL,
+        priority      INTEGER NOT NULL,
+        ts            TEXT    NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_events_to_agent ON events(to_agent, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_events_topic ON events(topic, seq)",
+    # cursors — idempotent message processing
+    """
+    CREATE TABLE IF NOT EXISTS cursors (
+        agent                 TEXT PRIMARY KEY,
+        last_processed_seq    INTEGER NOT NULL,
+        last_processed_msg_id TEXT    NOT NULL,
+        processed_at          TEXT    NOT NULL
+    )
+    """,
+    # tasks — DelegatedTask state machine
+    """
+    CREATE TABLE IF NOT EXISTS tasks (
+        task_id          TEXT PRIMARY KEY,
+        kind             TEXT NOT NULL,
+        state            TEXT NOT NULL CHECK (state IN
+                           ('queued','running','succeeded','failed',
+                            'cancelled')),
+        params           TEXT NOT NULL,
+        idempotency_key  TEXT NOT NULL UNIQUE,
+        requires_lanes   TEXT NOT NULL DEFAULT '[]',
+        allowed_tools    TEXT NOT NULL DEFAULT '[]',
+        side_effects     TEXT NOT NULL DEFAULT '[]',
+        lease_ttl_sec    INTEGER NOT NULL DEFAULT 0,
+        history          TEXT NOT NULL DEFAULT '[]',
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_idem ON tasks(idempotency_key)",
+    # gpu_leases — specialist GPU pool (separate from serving lanes)
+    """
+    CREATE TABLE IF NOT EXISTS gpu_leases (
+        gpu_id       INTEGER PRIMARY KEY,
+        holder_id    TEXT    NOT NULL,
+        task_id      TEXT    NOT NULL,
+        acquired_at  TEXT    NOT NULL,
+        expires_at   TEXT    NOT NULL,
+        heartbeat_at TEXT    NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_gpu_leases_expires ON gpu_leases(expires_at)",
+    # schema_version — tracks future migrations
+    """
+    CREATE TABLE IF NOT EXISTS schema_version (
+        version    INTEGER PRIMARY KEY,
+        applied_at TEXT    NOT NULL
+    )
+    """,
+]
+
+
+_MANAGED_TABLES = (
+    "leases",
+    "lane_capacity",
+    "gpu_leases",
+    "events",
+    "cursors",
+    "tasks",
+    "schema_version",
+)
+
+
+def _seed_default_lane_capacity(cur: sqlite3.Cursor) -> None:
+    """Idempotently insert default capacity rows; existing rows are left
+    alone so a resume preserves the operator's choice.
+
+    Args:
+        cur: Open SQLite cursor within the caller's transaction.
+    """
+    for lane, capacity in DEFAULT_LANE_CAPACITIES.items():
+        cur.execute(
+            "INSERT OR IGNORE INTO lane_capacity(lane, capacity) VALUES (?, ?)",
+            (lane, int(capacity)),
+        )
+
+
+def set_lane_capacity(
+    conn: sqlite3.Connection,
+    lane: str,
+    capacity: int,
+) -> None:
+    """Upsert one ``lane_capacity`` row.
+
+    Called by the CLI / Coordinator boot path once
+    :data:`SharedState.research_lane_capacity` is known. Runs in its
+    own ``BEGIN IMMEDIATE`` transaction.
+
+    Args:
+        conn (sqlite3.Connection): Open database connection.
+        lane (str): Lane name to set capacity for.
+        capacity (int): New capacity value.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            "INSERT INTO lane_capacity(lane, capacity) VALUES (?, ?) "
+            "ON CONFLICT(lane) DO UPDATE SET capacity = excluded.capacity",
+            (str(lane), int(capacity)),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+
+def get_lane_capacity(conn: sqlite3.Connection, lane: str) -> int:
+    """Return capacity for ``lane``, falling back to defaults.
+
+    Falls back to :data:`DEFAULT_LANE_CAPACITIES` (and finally ``1``
+    for unknown lanes — defensive, since ``ensure_schema`` already
+    seeds every known lane).
+
+    Args:
+        conn (sqlite3.Connection): Open database connection.
+        lane (str): Lane name to look up.
+
+    Returns:
+        int: Configured capacity, or the default for the lane.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT capacity FROM lane_capacity WHERE lane = ?",
+            (str(lane),),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            return int(row[0])
+    finally:
+        cur.close()
+    return int(DEFAULT_LANE_CAPACITIES.get(lane, 1))
+
+
+def ensure_schema(conn: sqlite3.Connection) -> int:
+    """Idempotently create all tables, seed lane_capacity defaults, and
+    record the schema version. Single transaction so readers never see an
+    intermediate schema.
+
+    Args:
+        conn: Open database connection.
+
+    Returns:
+        The current (max) recorded schema version.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        for stmt in _DDL:
+            cur.execute(stmt)
+        _seed_default_lane_capacity(cur)
+        cur.execute(
+            "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
+            (SCHEMA_VERSION,),
+        )
+        cur.execute("SELECT MAX(version) FROM schema_version")
+        (current,) = cur.fetchone()
+        conn.commit()
+        return int(current or 0)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+
+def reset_schema(conn: sqlite3.Connection) -> None:
+    """Drop and recreate every managed table. Test-only convenience.
+
+    Drops all tables in :data:`_MANAGED_TABLES` in one transaction,
+    then re-runs :func:`ensure_schema` to rebuild them.
+
+    Args:
+        conn (sqlite3.Connection): Open database connection.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        for table in _MANAGED_TABLES:
+            cur.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.commit()
+    finally:
+        cur.close()
+    ensure_schema(conn)

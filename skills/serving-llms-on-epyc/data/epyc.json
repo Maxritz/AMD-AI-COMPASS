@@ -1,0 +1,58 @@
+{
+  "description": "Serving LLMs on AMD CPU/GPU — Windows 11 native, Vulkan backend, GGUF models",
+  "os": "windows",
+  "backend": "vulkan",
+  "engine": "llama.cpp",
+  "default_model": "Qwen/Qwen3-8B",
+  "default_model_gguf": "Qwen3-8B-Q8_0.gguf",
+  "vllm_version": "0.22.0",
+  "precision": {
+    "gpu": "float16",
+    "cpu": "bfloat16",
+    "note": "FP16 is native on RDNA2/RDNA4. BF16 is emulated on GPU — do not use."
+  },
+  "build": {
+    "engine": "llama.cpp",
+    "cmake_flags": "-DGGML_VULKAN=ON",
+    "build_command": "cmake --build build --config Release",
+    "output_binary": "build/bin/Release/llama-server.exe",
+    "note": "Requires Vulkan SDK installed. cmake and MSVC Build Tools in PATH."
+  },
+  "models": {
+    "gguf_dir": "E:\\OLLAMA-Models\\GGUF",
+    "supported_formats": [".gguf"],
+    "default_context_len": 4096,
+    "max_context_len": 32768
+  },
+  "gpu": {
+    "target": "RDNA4",
+    "vram_gb": 16,
+    "subgroup_size": 32,
+    "note": "RX 9070 XT — gfx1201, 76 GB total VRAM (shared + dedicated). Use -ngl 99 for full GPU offload."
+  },
+  "cpu": {
+    "target": "Zen3",
+    "physical_cores": 16,
+    "logical_cores": 32,
+    "ram_gb": 95,
+    "sockets": 1,
+    "affinity": "single-socket pinned via PowerShell ProcessorAffinity"
+  },
+  "launch": {
+    "native": {
+      "description": "Launch llama-server.exe with Vulkan backend, CPU affinity, and GGUF model",
+      "command": "$p = Start-Process '<build_path>\\bin\\Release\\llama-server.exe' -ArgumentList '-m <gguf_path> --port <port> -ngl 99 -c <context_len> --host 0.0.0.0' -PassThru -NoNewWindow; $p.ProcessorAffinity = <affinity_mask>",
+      "health_check": "curl -sf http://localhost:<port>/health",
+      "chat_endpoint": "http://localhost:<port>/v1/chat/completions"
+    }
+  },
+  "memory": {
+    "reserve_gb": 16,
+    "kv_bytes_per_elem": 2,
+    "kv_dtype": "fp16",
+    "note": "FP16 KV cache on GPU via Vulkan. Reserve 16 GB for OS + runtime."
+  },
+  "container": null,
+  "supported_zen_architectures": ["Zen3", "Zen4", "Zen5"],
+  "supported_gpu_architectures": ["RDNA2", "RDNA3", "RDNA3.5", "RDNA4"]
+}

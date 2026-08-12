@@ -1,0 +1,144 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Lint
+
+# Static analysis on push and pull_request for all branches. Skips when every
+# changed file matches paths-ignore (same list as ``tests-coverage.yml``).
+#
+# Ruff reads ``[tool.ruff]`` / ``[tool.ruff.lint]`` in ``pyproject.toml``. Step
+# ``continue-on-error: true`` keeps results advisory until the finding backlog
+# is cleared; then set those flags to ``false`` so merge gates can require a
+# green Lint job.
+#
+# Pylint: ``--errors-only`` limits output to fatal/error-severity messages
+# (not convention or refactor hints). tree-reform.MD P2.5: critic-agent,
+# robustness-agent, framework-agent, and quantization_agent were all promoted
+# into the single ``hyperloom`` distribution (``hyperloom.agents.*``); the
+# single editable install below covers all of them (no more per-agent
+# editable installs / separate PYTHONPATH entries / bare ``runtime`` module).
+#
+# Bandit scans production Python code only (tests excluded) for medium+ security
+# findings. It remains advisory while the security baseline is being ratcheted.
+on:
+  # PRs run via ``pull_request``; ``push`` is scoped to ``main`` so a same-repo
+  # PR does not double-trigger (one run per event class).
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "COPYRIGHT"
+      - "CODEOWNERS"
+      - ".gitattributes"
+
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same ref.
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ruff:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install Ruff
+        run: |
+          pip install --upgrade pip
+          pip install "ruff>=0.8,<1"
+
+      - name: Ruff check
+        id: ruff_check
+        continue-on-error: true
+        run: ruff check .
+
+      - name: Ruff format (check only)
+        id: ruff_format
+        continue-on-error: true
+        run: ruff format --check .
+
+      - name: Advisory notice when Ruff failed
+        if: >-
+          always() &&
+          (steps.ruff_check.outcome == 'failure' ||
+           steps.ruff_format.outcome == 'failure')
+        run: |
+          echo "::warning::Ruff reported issues (advisory: step uses continue-on-error). Flip to hard-fail in this workflow after backlog is zero."
+
+  bandit:
+    name: bandit (medium+, production code)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install Bandit
+        run: |
+          pip install --upgrade pip
+          pip install "bandit>=1.7,<2"
+
+      - name: Bandit scan
+        id: bandit_scan
+        continue-on-error: true
+        run: |
+          bandit -r src/hyperloom -x "*/tests/*" -q --severity-level medium
+
+      - name: Advisory notice when Bandit failed
+        if: always() && steps.bandit_scan.outcome == 'failure'
+        run: |
+          echo "::warning::Bandit reported medium-or-higher security findings (advisory: step uses continue-on-error). Review findings before making this a hard gate."
+
+  pylint:
+    name: pylint (errors-only, multi-package)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install Pylint and editable packages
+        run: |
+          pip install --upgrade pip
+          pip install "pylint>=3.0,<4"
+          pip install -e ".[test]"
+
+      - name: Pylint (errors only)
+        continue-on-error: true
+        env:
+          # ``quantization_agent`` and ``ci`` are still flat repo-root
+          # packages (tree-reform.MD P2.6 promotes ``ci``; quantization_agent
+          # itself was promoted into hyperloom.agents but the bare-name
+          # dotted-path below is kept for the pylint invocation).
+          PYTHONPATH: >-
+            ${{ github.workspace }}
+        run: |
+          pylint --errors-only \
+            hyperloom.inference_optimizer \
+            hyperloom.orchestrator \
+            hyperloom.agents.robustness \
+            hyperloom.agents.framework \
+            hyperloom.agents.critic.runtime \
+            hyperloom.agents.quantization

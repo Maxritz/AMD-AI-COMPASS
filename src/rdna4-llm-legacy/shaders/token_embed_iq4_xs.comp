@@ -1,0 +1,73 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16   : require  
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_KHR_shader_subgroup_basic                    : require
+#extension GL_KHR_shader_subgroup_arithmetic               : require
+#extension GL_KHR_shader_subgroup_shuffle                  : require
+#extension GL_KHR_shader_subgroup_ballot                   : require
+#extension GL_KHR_shader_subgroup_clustered                : require
+#extension GL_EXT_subgroup_size_control : enable
+#extension GL_EXT_nonuniform_qualifier                     : require
+#extension GL_EXT_scalar_block_layout                      : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_KHR_memory_scope_semantics                   : require
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+#define CUSTOM_IO_BINDINGS
+#include "common.glsl"
+
+// IQ4_XS token embedding: reads the quantized token_embd.weight (block_iq4_xs)
+// from set1 binding 0 and dequants each element to fp16 output.
+
+layout(set = IO_SET, binding = BINDING_HIDDEN_IN, scalar) readonly buffer EmbBuf { uint8_t data[]; } emb;
+layout(set = IO_SET, binding = BINDING_HIDDEN_OUT, scalar)          buffer OutBuf { float16_t y[]; } hidden_out;
+
+#define IQ4_XS_BLOCK_BYTES  135u
+#define IQ4_XS_BLOCKS_PER_D (D / 256u)
+#define IQ4_XS_ROW_STRIDE   (IQ4_XS_BLOCKS_PER_D * IQ4_XS_BLOCK_BYTES)
+
+float emb_dequant_iq4_xs(uint row, uint idx) {
+    uint sb_idx     = idx / 256u;
+    uint elem_in_sb = idx % 256u;
+    uint block_start = row * IQ4_XS_ROW_STRIDE + sb_idx * IQ4_XS_BLOCK_BYTES;
+
+    uint ib = elem_in_sb / 32u;
+    uint j  = elem_in_sb & 31u;
+
+    uint ls = ((uint(emb.data[block_start + 130u + ib / 2u]) >> (4u * (ib & 1u))) & 0x0Fu)
+            | (((uint(emb.data[block_start + 134u]) >> (2u * ib)) & 3u) << 4u);
+    float dl = f16tof32_from_bytes(emb.data[block_start], emb.data[block_start + 1u])
+             * float(int(ls) - 32);
+
+    uint qs_byte = uint(emb.data[block_start + 2u + ib * 16u + j / 2u]);
+    uint qi      = ((j & 1u) != 0u) ? (qs_byte >> 4u) : (qs_byte & 0x0Fu);
+
+    float kval;
+    if      (qi == 0u)  kval = -127.0;
+    else if (qi == 1u)  kval = -104.0;
+    else if (qi == 2u)  kval = -83.0;
+    else if (qi == 3u)  kval = -65.0;
+    else if (qi == 4u)  kval = -49.0;
+    else if (qi == 5u)  kval = -35.0;
+    else if (qi == 6u)  kval = -23.0;
+    else if (qi == 7u)  kval = -12.0;
+    else if (qi == 8u)  kval = -3.0;
+    else if (qi == 9u)  kval = 5.0;
+    else if (qi == 10u) kval = 13.0;
+    else if (qi == 11u) kval = 22.0;
+    else if (qi == 12u) kval = 32.0;
+    else if (qi == 13u) kval = 43.0;
+    else if (qi == 14u) kval = 56.0;
+    else                kval = 71.0;
+    return dl * kval;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= D) return;
+    uint row = uint(pc.token_id);
+    hidden_out.y[idx] = float16_t(emb_dequant_iq4_xs(row, idx) * pc.embedding_scale);
+}

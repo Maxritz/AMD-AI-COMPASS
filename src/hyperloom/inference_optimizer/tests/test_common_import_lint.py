@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Import-lint guard for ``hyperloom.common``.
+
+``hyperloom.common`` is the zero-dependency shared library: it may import only
+the stdlib (plus ``httpx``) and must NEVER import a first-party package. This
+test statically parses every module under ``hyperloom.common`` and fails if a
+forbidden import creeps in.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import hyperloom.common
+
+_FORBIDDEN_TOP_LEVEL = frozenset(
+    {
+        "inference_optimizer",
+        "orchestrator",
+        "robustness_agent",
+        "framework_agent",
+        "critic",
+        "critic_agent",
+        "kernel_agent",
+        "quantization_agent",
+        "ci",
+    }
+)
+
+
+def _common_py_files() -> list[Path]:
+    root = Path(hyperloom.common.__file__).resolve().parent
+    return sorted(root.rglob("*.py"))
+
+
+def _imported_module_names(path: Path) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            # A relative import stays inside hyperloom.common.
+            if node.level and node.level > 0:
+                names.append("hyperloom.common")
+            elif node.module:
+                names.append(node.module)
+    return names
+
+
+def test_common_modules_exist():
+    files = _common_py_files()
+    assert files, "expected at least hyperloom/common/__init__.py to exist"
+
+
+def test_common_has_no_first_party_imports():
+    offenders: list[str] = []
+    for path in _common_py_files():
+        for module in _imported_module_names(path):
+            top = module.split(".")[0]
+            if top in _FORBIDDEN_TOP_LEVEL:
+                offenders.append(f"{path.name}: import {module}")
+            elif top == "hyperloom":
+                parts = module.split(".")
+                # Only hyperloom.common(.*) is allowed.
+                if len(parts) >= 2 and parts[1] != "common":
+                    offenders.append(f"{path.name}: import {module}")
+
+    assert not offenders, f"hyperloom.common must not import first-party packages (tree-reform.MD §7): {offenders}"

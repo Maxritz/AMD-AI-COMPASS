@@ -1,0 +1,373 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Framework source-root resolution for PolicyGate and flag discovery.
+
+Centralises probe order across container layouts (``/sgl-workspace/...``,
+``/app/ATOM/atom``, ``/app/xDiT``, site/dist-packages) so PolicyGate, AST
+discovery, install.sh, and ``apply_kernel_patch`` all agree. First-class
+frameworks: atom, sglang, vllm, xdit (``xfuser`` package); aiter is in the
+allowlist as a shared kernel library.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import site
+import sys
+import sysconfig
+from pathlib import Path
+
+_DEFAULT_SOURCE_ROOTS: tuple[str, ...] = (
+    "/sgl-workspace/aiter/",
+    "/sgl-workspace/sglang/",
+    "/sgl-workspace/vllm/",
+    # atom's editable-install layout.
+    "/app/ATOM/atom/",
+    # xDiT editable install (pure-Python).
+    "/app/xDiT/",
+)
+
+_FRAMEWORK_PACKAGES: tuple[str, ...] = ("aiter", "sglang", "vllm", "atom", "xfuser")
+
+# Parents scanned for ``python*/{site,dist}-packages/<pkg>`` wheel layouts.
+_INSTALL_GLOB_PARENTS: tuple[Path, ...] = (
+    Path("/usr/local/lib"),
+    Path("/opt/venv/lib"),
+)
+
+# aiter device sources often live in the sibling ``aiter_meta`` package.
+_AITER_META_CSRC_ROOT = "/aiter_meta/csrc/"
+
+# ROCm / HIP source roots for the enablement path, always merged into the
+# allowlist.
+_ROCM_HIP_SOURCE_ROOTS: tuple[str, ...] = ("/opt/rocm/",)
+
+
+def resolve_rocm_hip_source_roots() -> tuple[str, ...]:
+    """Return the ROCm/HIP source roots for the enablement path.
+
+    Always included in :func:`resolve_source_file_allowlist`.
+
+    Returns:
+        tuple[str, ...]: :data:`_ROCM_HIP_SOURCE_ROOTS`.
+    """
+    return _ROCM_HIP_SOURCE_ROOTS
+
+
+# Minimal static fallbacks when importlib/glob find nothing (image defaults).
+_STATIC_PATCH_FALLBACK_ROOTS: tuple[str, ...] = (
+    "/opt/venv/lib/python3.10/site-packages/aiter/",
+    "/opt/venv/lib/python3.10/site-packages/sglang/",
+    "/opt/venv/lib/python3.10/site-packages/vllm/",
+    "/opt/venv/lib/python3.10/site-packages/atom/",
+    "/opt/venv/lib/python3.12/site-packages/aiter/",
+    "/opt/venv/lib/python3.12/site-packages/sglang/",
+    "/opt/venv/lib/python3.12/site-packages/vllm/",
+    "/opt/venv/lib/python3.12/site-packages/atom/",
+    "/usr/local/lib/python3.12/dist-packages/aiter/",
+    "/usr/local/lib/python3.12/dist-packages/sglang/",
+    "/usr/local/lib/python3.12/dist-packages/vllm/",
+    "/usr/local/lib/python3.12/dist-packages/atom/",
+    "/usr/local/lib/python3.10/dist-packages/aiter/",
+    "/usr/local/lib/python3.10/dist-packages/sglang/",
+    "/usr/local/lib/python3.10/dist-packages/vllm/",
+    "/usr/local/lib/python3.10/dist-packages/atom/",
+    "/app/ATOM/atom/",
+    "/app/xDiT/",
+    _AITER_META_CSRC_ROOT,
+)
+
+
+def _normalize_root(path: str) -> str:
+    """Normalise a root path to a trailing-slash form.
+
+    Args:
+        path (str): Raw path string (may be empty / whitespace).
+
+    Returns:
+        str: The stripped path with a guaranteed trailing ``/``, or an
+            empty string when the input was blank.
+    """
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    return p if p.endswith("/") else f"{p}/"
+
+
+def _merge_roots(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    """Concatenate root groups, dropping blanks and duplicates.
+
+    Args:
+        *groups (tuple[str, ...]): One or more ordered groups of root
+            strings to merge.
+
+    Returns:
+        tuple[str, ...]: The merged roots in first-seen order with
+            duplicates and empty strings removed.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in groups:
+        for root in group:
+            if root and root not in seen:
+                seen.add(root)
+                out.append(root)
+    return tuple(out)
+
+
+def _find_spec_origin(module_name: str) -> Path | None:
+    """Return the package directory for an importable module.
+
+    Args:
+        module_name (str): Importable module / package name to locate.
+
+    Returns:
+        Path | None: The directory containing the module's origin (its
+            parent dir, whether or not it's a package ``__init__.py``), or
+            None when the module cannot be found / has no origin.
+    """
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return None
+    if spec is None or not spec.origin:
+        return None
+    origin = Path(spec.origin)
+    return origin.parent
+
+
+def _glob_install_package_roots() -> tuple[str, ...]:
+    """Discover framework package dirs under common lib layouts.
+
+    Globs ``python*/{site,dist}-packages/<pkg>`` under the known install
+    parents plus ``sys.prefix/lib``.
+
+    Returns:
+        tuple[str, ...]: Normalised, de-duplicated package root paths.
+    """
+    patterns = (
+        "python*/dist-packages/aiter",
+        "python*/dist-packages/sglang",
+        "python*/dist-packages/vllm",
+        "python*/dist-packages/atom",
+        "python*/dist-packages/xfuser",
+        "python*/site-packages/aiter",
+        "python*/site-packages/sglang",
+        "python*/site-packages/vllm",
+        "python*/site-packages/atom",
+        "python*/site-packages/xfuser",
+    )
+    found: list[str] = []
+    seen: set[str] = set()
+    parents: list[Path] = list(_INSTALL_GLOB_PARENTS)
+    prefix_lib = Path(sys.prefix) / "lib"
+    if prefix_lib.is_dir() and prefix_lib not in parents:
+        parents.append(prefix_lib)
+    for parent in parents:
+        if not parent.is_dir():
+            continue
+        for pattern in patterns:
+            for match in sorted(parent.glob(pattern)):
+                if not match.is_dir():
+                    continue
+                root = _normalize_root(str(match))
+                if root and root not in seen:
+                    seen.add(root)
+                    found.append(root)
+    return tuple(found)
+
+
+def _discover_installed_framework_roots() -> tuple[str, ...]:
+    """Runtime discovery via importlib and filesystem globs.
+
+    Combines ``importlib`` spec origins for each framework package, a
+    ``$VIRTUAL_ENV`` site-packages glob, and the common install-parent
+    globs.
+
+    Returns:
+        tuple[str, ...]: Normalised, de-duplicated discovered root paths.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str | Path) -> None:
+        """Append a normalised root to ``found`` if new and non-empty.
+
+        Args:
+            path (str | Path): Candidate root path to record.
+        """
+        root = _normalize_root(str(path))
+        if root and root not in seen:
+            seen.add(root)
+            found.append(root)
+
+    for mod in _FRAMEWORK_PACKAGES:
+        origin = _find_spec_origin(mod)
+        if origin is not None:
+            add(origin)
+
+    venv = os.environ.get("VIRTUAL_ENV", "").strip()
+    if venv:
+        site = Path(venv) / "lib"
+        if site.is_dir():
+            for pattern in (
+                "python*/site-packages/vllm",
+                "python*/site-packages/sglang",
+                "python*/site-packages/aiter",
+                "python*/site-packages/atom",
+                "python*/site-packages/xfuser",
+            ):
+                for match in sorted(site.glob(pattern)):
+                    if match.is_dir():
+                        add(match)
+
+    # Isolated vLLM lives outside $VIRTUAL_ENV; only fall back to the installer's
+    # VLLM_VENV_ROOT when no vllm root was found in the main venv above.
+    if not any(r.rstrip("/").endswith("/vllm") for r in found):
+        vllm_venv = os.environ.get("VLLM_VENV_ROOT", "").strip()
+        if vllm_venv:
+            site = Path(vllm_venv) / "lib"
+            if site.is_dir():
+                for pattern in (
+                    "python*/site-packages/vllm",
+                    "python*/site-packages/aiter",
+                ):
+                    for match in sorted(site.glob(pattern)):
+                        if match.is_dir():
+                            add(match)
+
+    for root in _glob_install_package_roots():
+        add(root)
+
+    return tuple(found)
+
+
+def _discover_installed_package_roots() -> tuple[str, ...]:
+    """Return active site/dist-packages roots available to specialists."""
+    candidates: list[Path] = []
+    try:
+        candidates.extend(Path(p) for p in site.getsitepackages())
+    except (AttributeError, OSError):
+        pass
+    try:
+        user_site = site.getusersitepackages()
+        if user_site:
+            candidates.append(Path(user_site))
+    except (AttributeError, OSError):
+        pass
+    for key in ("purelib", "platlib"):
+        value = sysconfig.get_path(key)
+        if value:
+            candidates.append(Path(value))
+    candidates.extend(
+        Path(p)
+        for p in sys.path
+        if p and Path(p).name in {"site-packages", "dist-packages"}
+    )
+    for env_name in ("VIRTUAL_ENV", "VLLM_VENV_ROOT"):
+        root = Path(os.environ.get(env_name, "").strip())
+        lib = root / "lib"
+        if lib.is_dir():
+            candidates.extend(lib.glob("python*/site-packages"))
+            candidates.extend(lib.glob("python*/dist-packages"))
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate.is_dir():
+            continue
+        root = _normalize_root(str(candidate))
+        if root and root not in seen:
+            seen.add(root)
+            found.append(root)
+    return tuple(found)
+
+
+def resolve_source_file_allowlist() -> tuple[str, ...]:
+    """Return trusted source roots available to specialists and integration.
+
+    Includes editable framework trees and every active site/dist-packages root.
+    File-level editability is decided during reviewed integration rather than by
+    restricting specialist discovery to named framework packages.
+
+    Returns:
+        tuple[str, ...]: The merged, de-duplicated allowlist roots.
+    """
+    env = os.environ.get("INFERENCE_OPTIMIZER_FRAMEWORK_SOURCE_ROOTS", "").strip()
+    env_roots = tuple(_normalize_root(p) for p in env.split(":") if p.strip()) if env else ()
+    return _merge_roots(
+        _DEFAULT_SOURCE_ROOTS,
+        _discover_installed_package_roots(),
+        _discover_installed_framework_roots(),
+        env_roots,
+        resolve_rocm_hip_source_roots(),
+    )
+
+
+def resolve_patch_target_roots() -> tuple[str, ...]:
+    """Roots for substring matching in patch apply + kernel classifiers.
+
+    Same as :func:`resolve_source_file_allowlist` plus static fallbacks for
+    layouts that are not importable until first use (e.g. ``aiter_meta/csrc``).
+
+    Returns:
+        tuple[str, ...]: The allowlist roots merged with the static patch
+            fallback roots.
+    """
+    return _merge_roots(
+        resolve_source_file_allowlist(),
+        _STATIC_PATCH_FALLBACK_ROOTS,
+    )
+
+
+def probe_framework_source_roots_for_env() -> str:
+    """Colon-separated roots for ``INFERENCE_OPTIMIZER_FRAMEWORK_SOURCE_ROOTS``.
+
+    Filters the resolved allowlist down to roots that exist on disk.
+
+    Returns:
+        str: Existing roots joined by ``:`` (empty string when none exist).
+    """
+    found: list[str] = []
+    for root in resolve_source_file_allowlist():
+        p = Path(root.rstrip("/"))
+        if p.is_dir():
+            found.append(_normalize_root(str(p)))
+    return ":".join(found)
+
+
+# Ordered for deterministic substring matching (atom before vllm/sglang).
+_FRAMEWORK_BUCKETS: tuple[str, ...] = ("atom", "vllm", "sglang", "aiter", "xdit")
+
+
+def summarise_framework_root_discovery(roots: str) -> str:
+    """Return ``"sglang=ok atom=missing ..."``-style one-line summary.
+
+    Input is the colon-separated string from
+    ``probe_framework_source_roots_for_env``; emitted in ``_FRAMEWORK_BUCKETS``
+    order for stable output.
+
+    Args:
+        roots: Colon-separated source roots to summarise.
+
+    Returns:
+        A one-line ``fw=ok``/``fw=missing`` summary in bucket order.
+    """
+    parts: list[str] = []
+    items = [p.strip().lower() for p in (roots or "").split(":") if p.strip()]
+    for fw in _FRAMEWORK_BUCKETS:
+        token = f"/{fw}/"
+        status = "ok" if any(item.endswith(token) for item in items) else "missing"
+        parts.append(f"{fw}={status}")
+    return " ".join(parts)
+
+
+__all__ = [
+    "probe_framework_source_roots_for_env",
+    "resolve_patch_target_roots",
+    "resolve_rocm_hip_source_roots",
+    "resolve_source_file_allowlist",
+    "summarise_framework_root_discovery",
+]

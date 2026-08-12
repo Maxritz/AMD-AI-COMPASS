@@ -1,0 +1,48 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16   : require  
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_KHR_shader_subgroup_basic                    : require
+#extension GL_KHR_shader_subgroup_arithmetic               : require
+#extension GL_KHR_shader_subgroup_shuffle                  : require
+#extension GL_KHR_shader_subgroup_ballot                   : require
+#extension GL_KHR_shader_subgroup_clustered                : require
+#extension GL_EXT_subgroup_size_control : enable
+#extension GL_EXT_nonuniform_qualifier                     : require
+#extension GL_EXT_scalar_block_layout                      : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_KHR_memory_scope_semantics                   : require
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+#define CUSTOM_IO_BINDINGS
+#include "common.glsl"
+
+// Q8_0 token embedding: the GGUF token_embd.weight is stored quantized (Q8_0),
+// so read the raw block bytes from set1 binding 0 and dequant to fp16 output.
+
+layout(set = IO_SET, binding = BINDING_HIDDEN_IN, scalar) readonly buffer EmbBuf { uint8_t data[]; } emb;
+layout(set = IO_SET, binding = BINDING_HIDDEN_OUT, scalar)          buffer OutBuf { float16_t y[]; } hidden_out;
+
+#define Q8_0_BLOCK_BYTES   34u
+#define Q8_0_BLOCKS_PER_D  (D / 32u)
+#define Q8_0_ROW_STRIDE    (Q8_0_BLOCKS_PER_D * Q8_0_BLOCK_BYTES)
+
+float emb_dequant_q8_0(uint row, uint idx) {
+    uint block_idx     = idx / 32u;
+    uint elem_in_block = idx % 32u;
+    uint block_start   = row * Q8_0_ROW_STRIDE + block_idx * Q8_0_BLOCK_BYTES;
+    float d = f16tof32_from_bytes(emb.data[block_start], emb.data[block_start + 1u]);
+    uint raw = uint(emb.data[block_start + 2u + elem_in_block]);
+    int qs = int(raw);
+    if (qs >= 128) qs -= 256;
+    return d * float(qs);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= D) return;
+    uint row = uint(pc.token_id);
+    hidden_out.y[idx] = float16_t(emb_dequant_q8_0(row, idx) * pc.embedding_scale);
+}

@@ -1,0 +1,1087 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Server-argument composition helpers.
+
+Shared by the explore / integrate_patch / grid executors and the workload-env
+builder: merge/remove/replace semantics for ``EXTRA_*_ARGS``, last-wins dedupe
+for vLLM/atom single-value flags, shell-safety validation, JSON-valued flag
+compaction/repair, the sglang watchdog / context-length / attention-backend /
+MoE-runner injections, and ``apply_runtime_benchmark_overrides`` for the
+materialized Magpie YAML. Nothing here runs a benchmark — the run/parse/
+winner-selection loop lives in :mod:`._grid_runner`.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shlex
+from typing import Any
+
+from hyperloom.common.coerce import optional_positive_int, to_str_list
+
+
+log = logging.getLogger(__name__)
+
+_UNSAFE_SERVER_ARG_CHARS_RE = re.compile(r"[;&|`$<>\r\n]")
+
+
+def validate_server_args_shell_safe(server_args: str | None) -> str:
+    """Reject server-arg strings that would be shell control syntax.
+
+    Magpie benchmark scripts expand ``EXTRA_*_ARGS`` through shell wrappers, so
+    this is the final sink-side guard against LLM/payload content escaping from
+    argv-like flags into shell control operators.
+    """
+    args = str(server_args or "").strip()
+    if not args:
+        return ""
+    if _UNSAFE_SERVER_ARG_CHARS_RE.search(args):
+        raise ValueError("extra_server_args contains shell control characters")
+    try:
+        tokens = shlex.split(args)
+    except ValueError as exc:
+        raise ValueError(f"extra_server_args is not shell-tokenizable: {exc}") from exc
+    expect_value = False
+    for token in tokens:
+        if token.startswith("-"):
+            expect_value = "=" not in token
+            continue
+        if expect_value:
+            expect_value = False
+            continue
+        raise ValueError("extra_server_args must be argv-like flags, not bare positional arguments")
+    return args
+
+
+def server_args_env_name(framework: str | None) -> str:
+    """Return the Magpie env var used to append backend server args.
+
+    Resolution is exact (registry-keyed) with a substring fallback so a
+    framework string carrying a version suffix (e.g. ``"vllm@0.21"``) still
+    maps correctly. Unknown names fall back to the default framework's env.
+
+    Args:
+        framework (str | None): Framework name; matched case-insensitively.
+
+    Returns:
+        str: The ``EXTRA_*_ARGS`` env name for the framework (e.g.
+        ``"EXTRA_XDIT_ARGS"`` for xDiT, ``"EXTRA_SGLANG_ARGS"`` default).
+    """
+    from hyperloom.inference_optimizer import framework_registry
+
+    name = str(framework or "").strip().lower()
+    if framework_registry.is_supported(name):
+        return framework_registry.extra_args_env(name)
+    # Substring fallback for version-suffixed names.
+    for fw in framework_registry.names():
+        if fw in name:
+            return framework_registry.extra_args_env(fw)
+    return framework_registry.extra_args_env(framework_registry.DEFAULT_FRAMEWORK)
+
+
+def merge_server_args(*parts: str | None) -> str:
+    """Merge server arg strings preserving left-to-right override semantics.
+
+    Only removes empty chunks; does NOT de-duplicate option names, because
+    repeated flags are how later args override base args (e.g. ``--block-size
+    1`` then ``--block-size 256``).
+
+    Args:
+        *parts (str | None): Server-arg chunks to merge, in override order;
+            empty/``None`` chunks are dropped.
+
+    Returns:
+        str: The space-joined non-empty chunks.
+    """
+    return " ".join(str(p).strip() for p in parts if str(p or "").strip())
+
+
+def remove_server_args(server_args: str | None, remove_args: Any) -> str:
+    """Remove flag specs from a server-arg string.
+
+    ``remove_args`` entries are flag-oriented. ``"--foo"`` removes ``--foo`` and
+    its following value when one is present; ``"--foo=bar"`` removes that exact
+    token shape; ``"--foo bar"`` removes the exact flag/value pair. Unknown /
+    unparseable inputs are left untouched rather than guessed.
+    """
+    args = str(server_args or "").strip()
+    removes = to_str_list(remove_args)
+    if not args or not removes:
+        return args
+    try:
+        tokens = shlex.split(args)
+    except ValueError:
+        return args
+
+    remove_flags: set[str] = set()
+    remove_pairs: set[tuple[str, str | None]] = set()
+    for spec in removes:
+        try:
+            spec_tokens = shlex.split(spec)
+        except ValueError:
+            spec_tokens = spec.split()
+        i = 0
+        while i < len(spec_tokens):
+            tok = spec_tokens[i]
+            if not tok.startswith("--"):
+                i += 1
+                continue
+            if "=" in tok:
+                flag, _, value = tok.partition("=")
+                remove_pairs.add((flag, value))
+                i += 1
+            elif i + 1 < len(spec_tokens) and not spec_tokens[i + 1].startswith("--"):
+                remove_pairs.add((tok, spec_tokens[i + 1]))
+                i += 2
+            else:
+                remove_flags.add(tok)
+                i += 1
+
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        flag = tok.split("=", 1)[0] if tok.startswith("--") else ""
+        if flag and "=" in tok:
+            _flag, _, value = tok.partition("=")
+            if _flag in remove_flags or (_flag, value) in remove_pairs:
+                i += 1
+                continue
+        if flag and i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+            value = tokens[i + 1]
+            if flag in remove_flags or (flag, value) in remove_pairs:
+                i += 2
+                continue
+        if flag and flag in remove_flags:
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    # ``shlex.split`` above strips the inner double quotes of any JSON-valued
+    # flag (``--compilation-config {"cudagraph_mode":"FULL"}`` ->
+    # ``{cudagraph_mode:FULL}``); re-quote/compact the JSON blobs so removal
+    # never corrupts a sibling flag that vLLM parses with ``json.loads``.
+    return _reserialize_json_blobs(" ".join(out))
+
+
+def compose_server_args(
+    *,
+    inherited_args: str | None = "",
+    base_extra_args: str | None = "",
+    variant_extra_args: str | None = "",
+    remove_args: Any = None,
+    args_mode: str = "append",
+) -> str:
+    """Compose inherited/base/variant args with optional remove/replace semantics."""
+    mode = str(args_mode or "append").strip().lower()
+    if mode == "replace":
+        pruned_base = remove_server_args(base_extra_args, remove_args)
+        pruned_variant = remove_server_args(variant_extra_args, remove_args)
+        return merge_server_args(pruned_base, pruned_variant)
+    combined_base = merge_server_args(inherited_args, base_extra_args)
+    pruned = remove_server_args(combined_base, remove_args)
+    return merge_server_args(pruned, variant_extra_args)
+
+
+def split_config_changes(
+    config_changes: dict[str, str],
+) -> tuple[str, dict[str, str]]:
+    """Split a flat config_changes dict into (server_args_str, envs_dict).
+
+    Keys starting with ``-`` are CLI flags: they are rebuilt into an argv
+    string (``--flag value`` or bare ``--flag``) and returned as
+    ``server_args``.  All other keys are env vars and returned as ``envs``.
+    This translates the legacy flat representation produced by
+    ``_framework_config_levers_from_done`` into the structured form that
+    ``GridVariant`` expects so ``--``-prefixed flags reach ``EXTRA_{FW}_ARGS``
+    instead of being silently dropped by ``valid_env_key``.
+
+    Args:
+        config_changes: Flat dict from a framework specialist deliverable,
+            mixing ``--flag: value`` server-arg keys with ``ENV_VAR: value``
+            env keys.
+
+    Returns:
+        A ``(server_args, envs)`` tuple where ``server_args`` is an argv-like
+        string safe to assign to ``GridVariant.extra_server_args`` and
+        ``envs`` is a ``dict[str, str]`` for ``GridVariant.extra_envs``.
+    """
+    from ._grid_base import coerce_extra_envs
+
+    arg_tokens: list[str] = []
+    env_items: dict[str, str] = {}
+    for k, v in (config_changes or {}).items():
+        key = str(k).strip()
+        val = str(v).strip()
+        if key.startswith("-"):
+            if val:
+                arg_tokens.append(f"{key}={val}" if "=" not in key else f"{key} {val}")
+            else:
+                arg_tokens.append(key)
+        else:
+            if key:
+                env_items[key] = val
+    server_args = merge_server_args(*arg_tokens) if arg_tokens else ""
+    return server_args, coerce_extra_envs(env_items)
+
+
+# A JSON "bareword": an identifier-like token that appears where a double-quoted
+# JSON key or string value should be (letters/digits/underscore plus the ``.``,
+# ``/``, ``-`` common in model ids and paths). Numbers, ``true``/``false``/
+# ``null`` are handled separately so they stay unquoted.
+_JSON_BAREWORD = r"[A-Za-z_][A-Za-z0-9_./-]*"
+_UNQUOTED_KEY_RE = re.compile(r"([{,]\s*)(" + _JSON_BAREWORD + r")(\s*:)")
+_UNQUOTED_VALUE_RE = re.compile(r"([:\[,]\s*)(" + _JSON_BAREWORD + r")")
+
+
+def _repair_unquoted_json(blob: str) -> str | None:
+    """Best-effort repair of a JSON blob whose double quotes were stripped.
+
+    A shlex round-trip (``shlex.split`` then space-join without re-quoting)
+    strips the inner double quotes of a JSON-valued server arg, turning a
+    stored-valid ``{"method":"ngram"}`` into ``{method:ngram}`` — which vLLM's
+    ``json.loads`` rejects at boot. Re-quote bare object keys and bare string
+    values, then VALIDATE by parsing: return the compact valid-JSON string, or
+    ``None`` when it still does not parse (caller keeps the blob verbatim).
+
+    This is a narrowly scoped recovery heuristic for known JSON-valued server
+    flags after shlex damage, not a general parser for JSON-like syntax.
+    """
+    def _quote_value(m: "re.Match[str]") -> str:
+        prefix, word = m.group(1), m.group(2)
+        if word in ("true", "false", "null"):
+            return m.group(0)  # JSON literals stay unquoted
+        return f'{prefix}"{word}"'
+
+    # Keys first (so a re-quoted key is not re-matched as a value), then values.
+    candidate = _UNQUOTED_KEY_RE.sub(r'\1"\2"\3', blob)
+    candidate = _UNQUOTED_VALUE_RE.sub(_quote_value, candidate)
+    try:
+        return json.dumps(json.loads(candidate), separators=(",", ":"))
+    except Exception:
+        return None
+
+
+def compact_json_server_args(
+    server_args: str | None,
+    framework: str | None,
+) -> str:
+    """Strip separator spaces inside JSON-valued vLLM/atom server args.
+
+    Magpie's scripts expand ``vllm serve ... $EXTRA_VLLM_ARGS`` UNQUOTED, so any
+    token with an embedded space is word-split by the shell before vLLM sees it.
+    Re-serialising each JSON object/array with compact separators removes the
+    SEPARATOR spaces only — ``json.dumps`` preserves spaces *inside* string
+    values.
+
+    JSON string values that themselves contain spaces cannot survive unquoted
+    expansion and are left intact rather than corrupted; callers must avoid
+    them for vLLM/atom.
+
+    No-op for sglang, for empty strings, and for strings with no ``{``/``[``.
+    Any blob that does not parse as JSON is left verbatim.
+    """
+    args = str(server_args or "").strip()
+    if not args or ("{" not in args and "[" not in args):
+        return args
+    if server_args_env_name(framework) == "EXTRA_SGLANG_ARGS":
+        return args
+    return _reserialize_json_blobs(args)
+
+
+def _reserialize_json_blobs(args: str) -> str:
+    """Compact (and, when needed, repair) every JSON object/array in ``args``.
+
+    Framework-agnostic core shared by :func:`compact_json_server_args` and
+    :func:`remove_server_args`. Each balanced ``{...}``/``[...]`` blob is
+    re-serialised with compact separators; a blob whose inner double quotes were
+    stripped by an earlier shlex round-trip is repaired via
+    :func:`_repair_unquoted_json`, and anything that still does not parse is left
+    verbatim (never worse than the input).
+    """
+    if "{" not in args and "[" not in args:
+        return args
+    out: list[str] = []
+    i = 0
+    n = len(args)
+    while i < n:
+        ch = args[i]
+        if ch in "{[":
+            # Walk to the balanced close, honouring quoted strings.
+            depth = 0
+            in_str = False
+            esc = False
+            j = i
+            while j < n:
+                c = args[j]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif c == "\\":
+                        esc = True
+                    elif c == '"':
+                        in_str = False
+                elif c == '"':
+                    in_str = True
+                elif c in "{[":
+                    depth += 1
+                elif c in "}]":
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+                j += 1
+            blob = args[i:j]
+            try:
+                out.append(json.dumps(json.loads(blob), separators=(",", ":")))
+            except Exception:
+                # A prior shlex round-trip can strip the JSON double quotes,
+                # leaving an unquoted-bareword object (``{"m":"ngram"}`` ->
+                # ``{m:ngram}``) that vLLM's json.loads rejects at boot. Try to
+                # re-quote bare keys/values; fall back to verbatim if that still
+                # does not parse (never worse than before).
+                repaired = _repair_unquoted_json(blob)
+                out.append(repaired if repaired is not None else blob)
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+# Flags whose value can contain spaces / JSON; never tokenize-dedupe these.
+# If any is present, the dedup helpers leave the whole arg string untouched.
+_SPACE_VALUE_FLAGS = (
+    "--json-model-override-args",
+    "--override-generation-config",
+    "--tool-call-parser",
+    # JSON-object-valued flags: after ``compact_json_server_args`` these are a
+    # single space-free shell word, but their value still contains inner double
+    # quotes (``{"cudagraph_mode":"PIECEWISE"}``). ``dedup_vllm_server_args``
+    # tokenizes with ``shlex.split`` (which STRIPS those quotes) and rejoins
+    # without re-quoting, corrupting the JSON to ``{cudagraph_mode:PIECEWISE}``
+    # -> vLLM boot fails with ``Invalid JSON``. Listing them here makes both
+    # dedup helpers leave the whole arg string untouched (round-trip safe), the
+    # same contract already relied on for the flags above.
+    "--compilation-config",
+    "--speculative-config",
+    "--hf-overrides",
+    "--kv-transfer-config",
+)
+
+_MULTI_VALUE_FLAGS = (
+    "--cuda-graph-bs",
+    "--cuda-graph-max-bs",
+)
+
+# vLLM / atom argparse-style single-value options safe to collapse last-wins.
+# vLLM hard-errors on a duplicate / conflicting flag (e.g.
+# ``--attention-backend``); collapsing to last-wins keeps the variant override.
+_VLLM_SINGLE_VALUE_FLAGS = frozenset(
+    {
+        "--attention-backend",
+        "--gpu-memory-utilization",
+        "--max-model-len",
+        "--max-num-seqs",
+        "--max-num-batched-tokens",
+        "--block-size",
+        "--kv-cache-dtype",
+        "--quantization",
+        "--dtype",
+        "--swap-space",
+        "--tensor-parallel-size",
+        "--pipeline-parallel-size",
+    }
+)
+
+
+def dedup_vllm_server_args(
+    server_args: str | None,
+    framework: str | None,
+) -> str:
+    """Collapse repeated vLLM/atom single-value flags to last-wins.
+
+    vLLM crashes on duplicated single-value flags; sglang tolerates repeats, so
+    this is scoped to the vllm/atom framework envs and is a no-op for sglang.
+    Only the flags in :data:`_VLLM_SINGLE_VALUE_FLAGS` are touched; every other
+    token is preserved verbatim and in order. For each affected flag the LAST
+    occurrence wins, matching the override intent of :func:`merge_server_args`.
+
+    Returns ``server_args`` unchanged when the framework is sglang, the string
+    is empty, it carries a space/JSON-valued flag (see
+    :data:`_SPACE_VALUE_FLAGS` / :data:`_MULTI_VALUE_FLAGS`), or it cannot be
+    shell-parsed.
+
+    Args:
+        server_args (str | None): The server-arg string to dedupe.
+        framework (str | None): Framework name; matched case-insensitively
+            (sglang is a no-op).
+
+    Returns:
+        str: The deduped server-arg string, or the input unchanged when no
+        dedupe applies.
+    """
+    args = str(server_args or "").strip()
+    if not args:
+        return args
+    if server_args_env_name(framework) == "EXTRA_SGLANG_ARGS":
+        return args
+    # Never tokenize a string carrying a space/JSON-valued (or multi-value) flag.
+    if any(f in args for f in _SPACE_VALUE_FLAGS + _MULTI_VALUE_FLAGS):
+        return args
+    try:
+        tokens = shlex.split(args)
+    except ValueError:
+        return args
+    # Collect the token span of every recognized single-value flag.
+    spans: list[tuple[str, int, int]] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        name = tok.split("=", 1)[0] if tok.startswith("--") else None
+        if name in _VLLM_SINGLE_VALUE_FLAGS:
+            if "=" in tok:  # ``--flag=value`` is self-contained.
+                spans.append((name, i, i))
+                i += 1
+            elif i + 1 < n and not tokens[i + 1].startswith("-"):  # ``--flag value``
+                spans.append((name, i, i + 1))
+                i += 2
+            else:  # Bare ``--flag`` with no value.
+                spans.append((name, i, i))
+                i += 1
+        else:
+            i += 1
+    drop: set[int] = set()
+    by_name: dict[str, list[tuple[str, int, int]]] = {}
+    for span in spans:
+        by_name.setdefault(span[0], []).append(span)
+    for occurrences in by_name.values():
+        # Keep only the last occurrence; drop the token span of the earlier ones.
+        for _name, start, end in occurrences[:-1]:
+            drop.update(range(start, end + 1))
+    if not drop:
+        return args
+    kept = [tok for idx, tok in enumerate(tokens) if idx not in drop]
+    return " ".join(kept)
+
+
+def _shell_safe_dedupe(args: str) -> str:
+    """Last-wins dedupe for single-token-valued flags only.
+
+    Collapses repeated ``--flag value`` (or ``--flag=value``) pairs whose value
+    is a single whitespace-free token, keeping the last occurrence. Returns the
+    string unchanged when it contains a flag known to carry a space/JSON value.
+
+    Args:
+        args (str): The server-arg string to dedupe.
+
+    Returns:
+        str: The last-wins deduped string, or the input unchanged when it
+        carries a space/JSON-valued flag.
+    """
+    if not args.strip():
+        return ""
+    if any(f in args for f in _SPACE_VALUE_FLAGS + _MULTI_VALUE_FLAGS):
+        return args
+    tokens = args.split()
+    pairs: dict[str, list[str]] = {}
+    order: list[str] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t.startswith("--"):
+            if "=" in t:  # Normalize so it dedupes against ``--flag value``.
+                flag, _, val = t.partition("=")
+                pair = [flag, val]
+                i += 1
+            else:
+                flag = t
+                i += 1
+                if i < len(tokens) and not tokens[i].startswith("--"):
+                    pair = [flag, tokens[i]]
+                    i += 1
+                else:
+                    pair = [flag]
+            if flag not in pairs:
+                order.append(flag)
+            pairs[flag] = pair
+        else:
+            key = f"__pos_{len(order)}__"
+            order.append(key)
+            pairs[key] = [t]
+            i += 1
+    out: list[str] = []
+    for k in order:
+        out.extend(pairs[k])
+    return " ".join(out)
+
+
+# sglang scheduler watchdog timeout injection: the first request's JIT compile
+# can exceed sglang's default watchdog, firing SIGQUIT mid-warmup. Inject a
+# longer timeout unless the user already pinned one.
+DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SEC = 1800
+
+SGLANG_WATCHDOG_TIMEOUT_ENV = "SGLANG_WATCHDOG_TIMEOUT"
+
+_SGLANG_WATCHDOG_FLAG = "--watchdog-timeout"
+
+# Matches space- or equals-separated form without false-matching a longer flag.
+_SGLANG_WATCHDOG_RE = re.compile(r"--watchdog-timeout(?:[=\s]|$)")
+
+
+def resolve_sglang_watchdog_timeout() -> int:
+    """Resolve the sglang scheduler watchdog timeout in seconds.
+
+    Reads ``$SGLANG_WATCHDOG_TIMEOUT`` (integer seconds) and falls back to
+    :data:`DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SEC` when the env var is unset,
+    empty, non-integer, or non-positive. A malformed value logs a warning
+    and uses the default rather than crashing the YAML materialization.
+
+    Returns:
+        int: The resolved watchdog timeout in seconds.
+    """
+    raw = os.environ.get(SGLANG_WATCHDOG_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SEC
+    try:
+        val = int(raw)
+    except ValueError:
+        log.warning(
+            "%s=%r is not an integer; using default %ds.",
+            SGLANG_WATCHDOG_TIMEOUT_ENV,
+            raw,
+            DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SEC,
+        )
+        return DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SEC
+    if val <= 0:
+        log.warning(
+            "%s=%d is not positive; using default %ds.",
+            SGLANG_WATCHDOG_TIMEOUT_ENV,
+            val,
+            DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SEC,
+        )
+        return DEFAULT_SGLANG_WATCHDOG_TIMEOUT_SEC
+    return val
+
+
+def inject_sglang_watchdog_timeout(
+    server_args: str | None,
+    framework: str | None,
+) -> str:
+    """Append ``--watchdog-timeout <N>`` to ``server_args`` for sglang runs.
+
+    Returns ``server_args`` unchanged when the framework is not sglang
+    (empty/unknown is treated as sglang) or the flag is already present.
+    Otherwise appends the value from :func:`resolve_sglang_watchdog_timeout`;
+    no other flag is touched.
+
+    Args:
+        server_args (str | None): The server-arg string to augment.
+        framework (str | None): Framework name; empty/unknown treated as sglang.
+
+    Returns:
+        str: ``server_args`` with ``--watchdog-timeout`` appended, or unchanged
+        for non-sglang frameworks or when the flag is already present.
+    """
+    args = str(server_args or "").strip()
+    if server_args_env_name(framework) != "EXTRA_SGLANG_ARGS":
+        return args
+    if _SGLANG_WATCHDOG_RE.search(args):
+        return args
+    timeout = resolve_sglang_watchdog_timeout()
+    return merge_server_args(args, f"{_SGLANG_WATCHDOG_FLAG} {timeout}")
+
+
+# sglang ``--context-length`` cap injection: sglang sizes ``max_total_tokens``
+# off the model's ``max_position_embeddings``, so a huge native window balloons
+# the aiter workspace_buffer past GPU memory. Cap to ISL+OSL+headroom (floored,
+# clamped to the native window) unless the flag is already pinned.
+DEFAULT_SGLANG_CONTEXT_HEADROOM_TOKENS = 2048
+
+DEFAULT_SGLANG_CONTEXT_FLOOR_TOKENS = 8192
+
+SGLANG_CONTEXT_HEADROOM_ENV = "SGLANG_CONTEXT_HEADROOM_TOKENS"
+
+SGLANG_CONTEXT_FLOOR_ENV = "SGLANG_CONTEXT_FLOOR_TOKENS"
+
+_SGLANG_CONTEXT_LENGTH_FLAG = "--context-length"
+
+# Matches space- or equals-separated form without false-matching a longer flag.
+_SGLANG_CONTEXT_LENGTH_RE = re.compile(r"--context-length(?:[=\s]|$)")
+
+_SGLANG_ATTN_BACKEND_FLAG = "--attention-backend"
+
+_SGLANG_ATTN_BACKEND_RE = re.compile(r"--attention-backend(?:[=\s]|$)")
+
+_SGLANG_DUAL_CHUNK_BACKEND = "dual_chunk_flash_attn"
+
+
+def _resolve_nonneg_int_env(name: str, default: int) -> int:
+    """Read a non-negative integer env override, else return ``default``.
+
+    A blank/non-integer/negative value logs a warning and falls back to the
+    default rather than crashing the YAML materialization.
+
+    Args:
+        name (str): Environment variable name to read.
+        default (int): Fallback value when unset/invalid.
+
+    Returns:
+        int: The parsed non-negative integer, or ``default``.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        log.warning(
+            "%s=%r is not an integer; using default %d.",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if val < 0:
+        log.warning(
+            "%s=%d is negative; using default %d.",
+            name,
+            val,
+            default,
+        )
+        return default
+    return val
+
+
+def resolve_sglang_context_cap(isl: int, osl: int) -> int:
+    """Resolve the sglang ``--context-length`` cap for an ISL+OSL workload.
+
+    Returns ``max(isl + osl + headroom, floor)`` (headroom / floor are
+    operator-tunable via ``$SGLANG_CONTEXT_HEADROOM_TOKENS`` /
+    ``$SGLANG_CONTEXT_FLOOR_TOKENS``). Caller clamps to the model's native
+    window before injecting.
+
+    Args:
+        isl (int): Input sequence length.
+        osl (int): Output sequence length.
+
+    Returns:
+        int: ``max(isl + osl + headroom, floor)``.
+    """
+    headroom = _resolve_nonneg_int_env(
+        SGLANG_CONTEXT_HEADROOM_ENV,
+        DEFAULT_SGLANG_CONTEXT_HEADROOM_TOKENS,
+    )
+    floor = _resolve_nonneg_int_env(
+        SGLANG_CONTEXT_FLOOR_ENV,
+        DEFAULT_SGLANG_CONTEXT_FLOOR_TOKENS,
+    )
+    return max(int(isl) + int(osl) + headroom, floor)
+
+
+def inject_sglang_context_length(
+    server_args: str | None,
+    framework: str | None,
+    model_path: str | None,
+    isl: int,
+    osl: int,
+    max_model_len: int | str | None = None,
+) -> str:
+    """Append ``--context-length <N>`` to ``server_args`` for sglang runs.
+
+    Returns ``server_args`` unchanged when the framework is not sglang
+    (empty/unknown treated as sglang), the flag is already present, or the
+    model's ``max_position_embeddings`` cannot be read. Otherwise appends
+    ``min(max_pos, max_model_len, cap)`` from :func:`resolve_sglang_context_cap`;
+    only this flag is added.
+
+    sglang sizes its window off ``--context-length`` (it does not honor
+    ``--max-model-len``), so without this clamp a workload cap above the run's
+    explicit ``--max-model-len`` would inject a self-contradictory config. The
+    ``max_model_len`` ceiling is applied only when it is a positive value.
+
+    Args:
+        server_args (str | None): The server-arg string to augment.
+        framework (str | None): Framework name; empty/unknown treated as sglang.
+        model_path (str | None): Model path used to read
+            ``max_position_embeddings``.
+        isl (int): Input sequence length.
+        osl (int): Output sequence length.
+        max_model_len (int | str | None): The run's explicit ``MAX_MODEL_LEN``
+            ceiling; clamps ``--context-length`` so it never exceeds it. Ignored
+            when unset, non-positive, or non-integer.
+
+    Returns:
+        str: ``server_args`` with ``--context-length`` appended, or unchanged
+        for non-sglang frameworks, when the flag is present, or when the model
+        window cannot be read.
+    """
+    args = str(server_args or "").strip()
+    if server_args_env_name(framework) != "EXTRA_SGLANG_ARGS":
+        return args
+    if _SGLANG_CONTEXT_LENGTH_RE.search(args):
+        return args
+    from hyperloom.inference_optimizer.cli.model_gate import _load_model_max_position_embeddings
+
+    max_pos = _load_model_max_position_embeddings(str(model_path or ""))
+    if not max_pos:
+        return args
+    cap = resolve_sglang_context_cap(isl, osl)
+    context_length = min(int(max_pos), cap)
+    max_model_len_int = optional_positive_int(max_model_len)
+    if max_model_len_int is not None:
+        context_length = min(context_length, max_model_len_int)
+    return merge_server_args(
+        args,
+        f"{_SGLANG_CONTEXT_LENGTH_FLAG} {context_length}",
+    )
+
+
+def _resolve_dual_chunk_backend(gpu_type: str | None = None) -> str:
+    """Pick the dual-chunk attention backend for the current hardware.
+
+    ``dual_chunk_flash_attn`` is the only backend sglang accepts when the
+    model declares ``dual_chunk_attention_config``. It requires sm90+; on
+    AMD/ROCm the preflight gate blocks these models before they reach here.
+    Override via ``$HYPERLOOM_DUAL_CHUNK_BACKEND``.
+
+    Args:
+        gpu_type (str | None): Caller-known GPU type; accepted for parity but
+            the canonical backend is returned regardless.
+
+    Returns:
+        str: ``$HYPERLOOM_DUAL_CHUNK_BACKEND`` when set, else
+        ``dual_chunk_flash_attn``.
+    """
+    override = os.environ.get("HYPERLOOM_DUAL_CHUNK_BACKEND", "").strip()
+    if override:
+        return override
+    return _SGLANG_DUAL_CHUNK_BACKEND
+
+
+def inject_sglang_attention_backend(
+    server_args: str | None,
+    framework: str | None,
+    model_path: str | None,
+    gpu_type: str | None = None,
+) -> str:
+    """Append an ``--attention-backend`` for dual-chunk sglang models.
+
+    Models that declare ``dual_chunk_attention_config`` make sglang hard-reject
+    its default aiter backend. The backend is picked by
+    :func:`_resolve_dual_chunk_backend`; ``gpu_type`` (when known by the caller)
+    takes precedence over runtime autodetect.
+
+    Returns ``server_args`` unchanged when: framework is not sglang, an
+    ``--attention-backend`` is already pinned (operator wins), or the model
+    config has no dual-chunk block (fail-safe: inject nothing).
+
+    Args:
+        server_args (str | None): The server-arg string to augment.
+        framework (str | None): Framework name; empty/unknown treated as sglang.
+        model_path (str | None): Model path checked for a dual-chunk config.
+        gpu_type (str | None): Caller-known GPU type; takes precedence over
+            autodetect.
+
+    Returns:
+        str: ``server_args`` with ``--attention-backend`` appended, or unchanged
+        for non-sglang frameworks, when already pinned, or for non-dual-chunk
+        models.
+    """
+    args = str(server_args or "").strip()
+    if server_args_env_name(framework) != "EXTRA_SGLANG_ARGS":
+        return args
+    if _SGLANG_ATTN_BACKEND_RE.search(args):
+        return args
+    from hyperloom.inference_optimizer.cli.model_gate import _model_has_dual_chunk_attention
+
+    if not _model_has_dual_chunk_attention(str(model_path or "")):
+        return args
+    backend = _resolve_dual_chunk_backend(gpu_type)
+    if backend != _SGLANG_DUAL_CHUNK_BACKEND:
+        log.info(
+            "dual-chunk model on AMD/ROCm: injecting --attention-backend %s (dual_chunk_flash_attn needs sm90+).",
+            backend,
+        )
+    return merge_server_args(
+        args,
+        f"{_SGLANG_ATTN_BACKEND_FLAG} {backend}",
+    )
+
+
+# sglang MoE runner backend injection: sglang's default routes MoE models
+# through aiter's CK 2-stage fused-MoE kernel, whose JIT build is broken in some
+# ROCm images. Inject the ROCm-capable ``triton`` backend for MoE models on AMD
+# unless the operator already pinned one. Override via
+# ``$HYPERLOOM_SGLANG_MOE_RUNNER_BACKEND``.
+HYPERLOOM_SGLANG_MOE_RUNNER_BACKEND_ENV = "HYPERLOOM_SGLANG_MOE_RUNNER_BACKEND"
+
+DEFAULT_SGLANG_AMD_MOE_RUNNER_BACKEND = "triton"
+
+_SGLANG_MOE_RUNNER_BACKEND_FLAG = "--moe-runner-backend"
+
+# Matches space- or equals-separated form without false-matching a longer flag.
+_SGLANG_MOE_RUNNER_BACKEND_RE = re.compile(r"--moe-runner-backend(?:[=\s]|$)")
+
+# sglang MoE schemes whose ``create_moe_runner`` only builds a runner for the
+# aiter backend (the others fall through to a bare ``pass``, so the first
+# forward pass dies on a missing ``runner``). Two are selected online through
+# ``--quantization`` rather than the checkpoint's own config: quark_int4fp8_moe
+# always, and mxfp4 only when the checkpoint is NOT mxfp4-serialized (sglang
+# then routes to its dynamic-quant MoE method, which is aiter-only too).
+_AITER_ONLY_ONLINE_QUANT_METHODS = frozenset({"quark_int4fp8_moe"})
+
+_AITER_ONLY_UNLESS_SERIALIZED_QUANT_METHOD = "mxfp4"
+
+_SGLANG_QUANTIZATION_RE = re.compile(r"--quantization[=\s]+(\S+)")
+
+
+def _online_quant_requires_aiter_moe_runner(server_args: str, model_path: str) -> bool:
+    """Whether ``--quantization`` selects an aiter-only MoE scheme.
+
+    Args:
+        server_args (str): The server-arg string to read ``--quantization`` from.
+        model_path (str): Model path, used to tell a serialized mxfp4
+            checkpoint (which gets the backend-flexible method) from an online
+            dynamic-quant one.
+
+    Returns:
+        bool: ``True`` when the selected scheme only has an aiter MoE runner.
+    """
+    match = _SGLANG_QUANTIZATION_RE.search(server_args or "")
+    if not match:
+        return False
+    quantization = match.group(1).strip().strip("\"'").lower()
+    if quantization in _AITER_ONLY_ONLINE_QUANT_METHODS:
+        return True
+    if quantization != _AITER_ONLY_UNLESS_SERIALIZED_QUANT_METHOD:
+        return False
+    from hyperloom.inference_optimizer.cli.model_gate import _model_declared_quant_method
+
+    # Mirrors sglang: is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method.
+    return "mxfp4" not in _model_declared_quant_method(model_path)
+
+
+def moe_runner_requires_aiter(server_args: str | None, model_path: str | None) -> bool:
+    """Whether this model + server args resolve to an aiter-only MoE scheme.
+
+    Folds the two ways sglang can land on such a scheme: the checkpoint's own
+    Quark MX-FP4 config, and an online ``--quantization`` selection.
+
+    Args:
+        server_args (str | None): Server args, read for ``--quantization``.
+        model_path (str | None): Model path whose ``config.json`` is inspected.
+
+    Returns:
+        bool: ``True`` when only the aiter MoE runner can serve this model.
+    """
+    from hyperloom.inference_optimizer.cli.model_gate import _model_moe_runner_requires_aiter
+
+    path = str(model_path or "")
+    return _model_moe_runner_requires_aiter(path) or _online_quant_requires_aiter_moe_runner(
+        str(server_args or ""),
+        path,
+    )
+
+
+def inject_sglang_moe_runner_backend(
+    server_args: str | None,
+    framework: str | None,
+    model_path: str | None,
+    gpu_type: str | None = None,
+) -> str:
+    """Append a ``--moe-runner-backend`` for MoE sglang models on AMD/ROCm.
+
+    Returns ``server_args`` unchanged when: framework is not sglang, a
+    ``--moe-runner-backend`` is already pinned (operator wins), the GPU is not
+    an AMD/ROCm runner, the model is not Mixture-of-Experts (fail-safe: inject
+    nothing), or the checkpoint carries a quant scheme only the aiter runner
+    implements. Otherwise appends the backend from
+    ``$HYPERLOOM_SGLANG_MOE_RUNNER_BACKEND`` (default ``triton``); only this
+    flag is added.
+
+    Args:
+        server_args (str | None): The server-arg string to augment.
+        framework (str | None): Framework name; empty/unknown treated as sglang.
+        model_path (str | None): Model path checked for Mixture-of-Experts.
+        gpu_type (str | None): Caller-known GPU type; used to gate AMD/ROCm.
+
+    Returns:
+        str: ``server_args`` with ``--moe-runner-backend`` appended, or unchanged
+        for non-sglang frameworks, when already pinned, off AMD/ROCm, for
+        non-MoE models, or for aiter-only MoE quant schemes.
+    """
+    args = str(server_args or "").strip()
+    if server_args_env_name(framework) != "EXTRA_SGLANG_ARGS":
+        return args
+    if _SGLANG_MOE_RUNNER_BACKEND_RE.search(args):
+        return args
+    from hyperloom.inference_optimizer.cli.model_gate import _model_is_moe
+    from hyperloom.inference_optimizer.gpu_types import _resolve_amd_gpu_type
+
+    if not _resolve_amd_gpu_type(gpu_type):
+        return args
+    if not _model_is_moe(str(model_path or "")):
+        return args
+    # An aiter-only MoE scheme has no triton runner: injecting one crashes the
+    # server on the first forward pass. Let sglang resolve the backend itself.
+    if moe_runner_requires_aiter(args, str(model_path or "")):
+        log.info(
+            "MoE model with an aiter-only quant scheme: skipping "
+            "--moe-runner-backend injection (the triton runner has no "
+            "implementation for it)."
+        )
+        return args
+    backend = (
+        os.environ.get(HYPERLOOM_SGLANG_MOE_RUNNER_BACKEND_ENV, "").strip() or DEFAULT_SGLANG_AMD_MOE_RUNNER_BACKEND
+    )
+    log.info(
+        "MoE model on AMD/ROCm: injecting --moe-runner-backend %s (aiter CK "
+        "2-stage fused-MoE JIT build is broken in this image).",
+        backend,
+    )
+    return merge_server_args(
+        args,
+        f"{_SGLANG_MOE_RUNNER_BACKEND_FLAG} {backend}",
+    )
+
+
+# sglang flags that route work through aiter kernels. On a MoE checkpoint whose
+# per-partition intermediate size is not 128-aligned, aiter's assembly MoE path
+# (module_moe_asm) finds no tuned config, falls back to a default one, and reads
+# out of bounds -- ROCm aborts the rank with "Memory access fault by GPU node-N"
+# during init. Qwen3-30B-A3B at TP 4 (768 -> 192) is the observed case.
+# ``--moe-runner-backend triton`` does NOT avoid it: that knob only picks the
+# runner, while these flags still hand the MoE asm module the work.
+_SGLANG_AITER_SELECTING_ARGS = (
+    "--attention-backend aiter",
+    "--enable-aiter-allreduce-fusion",
+)
+
+
+def strip_aiter_args_for_unaligned_moe(
+    server_args: str | None,
+    framework: str | None,
+    model_path: str | None,
+    tp: int | None,
+) -> str:
+    """Drop aiter-selecting sglang flags when the MoE shape cannot feed aiter.
+
+    Returns ``server_args`` unchanged when: framework is not sglang, no model
+    path is known, or the checkpoint's MoE shape is 128-aligned for this TP
+    (including every non-MoE checkpoint, which never reaches the kernel).
+
+    Args:
+        server_args (str | None): The server-arg string to filter.
+        framework (str | None): Framework name; only sglang is affected.
+        model_path (str | None): Model path whose ``config.json`` is inspected.
+        tp (int | None): Tensor-parallel degree the MoE weights shard across.
+
+    Returns:
+        str: ``server_args`` without the aiter-selecting flags, or unchanged.
+    """
+    args = str(server_args or "").strip()
+    if server_args_env_name(framework) != "EXTRA_SGLANG_ARGS":
+        return args
+    path = str(model_path or "").strip()
+    if not path:
+        return args
+    from hyperloom.inference_optimizer.cli.model_gate import model_supports_aiter_ck_fused_moe
+
+    if model_supports_aiter_ck_fused_moe(path, int(tp or 1)):
+        return args
+    stripped = remove_server_args(args, list(_SGLANG_AITER_SELECTING_ARGS))
+    if stripped != args:
+        log.info(
+            "MoE intermediate size is not 128-aligned at TP=%s: dropping aiter-selecting "
+            "server args (%s); aiter's asm MoE path faults on this shape.",
+            tp,
+            ", ".join(_SGLANG_AITER_SELECTING_ARGS),
+        )
+    return stripped
+
+
+def apply_runtime_benchmark_overrides(
+    bench: dict[str, Any],
+    *,
+    model_path: str | None = None,
+    gpu_type: str | None = None,
+    benchmark_script: str | None = None,
+) -> dict[str, Any]:
+    """Apply runtime env/CLI overrides to a Magpie benchmark YAML.
+
+    Single shared path for baseline/profile and grid executors.
+    ``benchmark_script`` (must be pre-sanitized via :func:`sanitize_script_name`)
+    force-selects a specific Magpie script, applied AFTER the
+    ``gpu_type``-derived generic script so the operator pick wins.
+
+    Args:
+        bench (dict[str, Any]): The Magpie ``benchmark`` config to mutate.
+        model_path (str | None): Overrides ``benchmark.model`` when set.
+        gpu_type (str | None): Pins ``runner_type`` and the generic
+            ``{framework}_{gpu_type}.sh`` script.
+        benchmark_script (str | None): Pre-sanitized script name that
+            force-selects a Magpie script (applied last).
+
+    Returns:
+        dict[str, Any]: The mutated ``benchmark["envs"]`` mapping.
+    """
+    if model_path:
+        bench["model"] = str(model_path)
+
+    precision = os.environ.get("PRECISION", "").strip()
+    if precision:
+        bench["precision"] = precision
+
+    if gpu_type:
+        bench["runner_type"] = str(gpu_type)
+        # Force-pin the generic ``{framework}_{gpu_type}.sh`` so Magpie's
+        # resolver doesn't fall through to InferenceX native scripts that
+        # ignore ``EXTRA_*_ARGS``.
+        framework = str(bench.get("framework") or "").lower()
+        if framework:
+            bench["benchmark_script"] = f"{framework}_{gpu_type}.sh"
+        else:
+            bench.pop("benchmark_script", None)
+
+    if benchmark_script:
+        bench["benchmark_script"] = str(benchmark_script)
+
+    # AgentX switch on the shared rebuild path: without this, the gpu_type block
+    # above re-pins the synthetic {framework}_{gpu_type}.sh and silently reverts
+    # a materialize-time AgentX swap (grid/baseline/profile executors rebuild via
+    # this function). No-op when HYPERLOOM_AGENTX is off. Lazy import avoids a
+    # module-load cycle with _workload_envs.
+    from ._workload_envs import apply_agentx_switch
+
+    apply_agentx_switch(bench, model_path)
+
+    envs = bench.setdefault("envs", {})
+    for env_key in ("ISL", "OSL", "MAX_MODEL_LEN", "TP", "CONC"):
+        val = os.environ.get(env_key, "").strip()
+        if not val:
+            continue
+        # TP yaml-explicit wins: a stale state.tp must not downgrade a
+        # YAML-pinned TP.
+        if env_key == "TP":
+            yaml_tp = envs.get("TP")
+            if yaml_tp not in (None, 0, "", "0"):
+                continue
+        envs[env_key] = int(val)
+
+    explicit_rocr = os.environ.get("ROCR_VISIBLE_DEVICES", "").strip()
+    if explicit_rocr:
+        envs["ROCR_VISIBLE_DEVICES"] = explicit_rocr
+    else:
+        tp_val = int(envs.get("TP", 1) or 1)
+        existing_rocr = str(envs.get("ROCR_VISIBLE_DEVICES", "")).strip()
+        existing_count = len([x for x in existing_rocr.split(",") if x.strip()]) if existing_rocr else 0
+        if tp_val > 1 and existing_count < tp_val:
+            envs["ROCR_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(tp_val))
+
+    return envs

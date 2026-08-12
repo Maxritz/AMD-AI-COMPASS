@@ -1,0 +1,66 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16   : require  
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_KHR_shader_subgroup_basic                    : require
+#extension GL_KHR_shader_subgroup_arithmetic               : require
+#extension GL_KHR_shader_subgroup_shuffle                  : require
+#extension GL_KHR_shader_subgroup_ballot                   : require
+#extension GL_KHR_shader_subgroup_clustered                : require
+#extension GL_EXT_subgroup_size_control : enable
+#extension GL_EXT_nonuniform_qualifier                     : require
+#extension GL_EXT_scalar_block_layout                      : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_KHR_memory_scope_semantics                   : require
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+#include "common.glsl"
+
+#define FP16_ROW_STRIDE    (D * 2u)
+#define Q_BYTES            (N_HEADS * HEAD_DIM * FP16_ROW_STRIDE)
+#define K_BYTES            (N_KV_HEADS * HEAD_DIM * FP16_ROW_STRIDE)
+#define V_BYTES            (N_KV_HEADS * HEAD_DIM * FP16_ROW_STRIDE)
+#define O_BYTES            (D * N_HEADS * HEAD_DIM * 2u)
+#define NORM_BYTES         (D * 2u)
+
+#define QK_NORM_BYTES  (HEAD_DIM * 2u)
+#define GATE_BASE  pc.gate_offset
+#define UP_BASE    pc.up_offset
+
+#define SUBGROUPS_PER_WG (WG_SIZE_X / SUBGROUP_SIZE)
+
+float read_f16_w(uint base, uint row, uint col) {
+    uint off = base + row * FP16_ROW_STRIDE + col * 2u;
+    return f16tof32_from_bytes(weight_array[nonuniformEXT(pc.layer_idx)].data[off], weight_array[nonuniformEXT(pc.layer_idx)].data[off + 1u]);
+}
+
+void main() {
+    uint wg_row_base = gl_WorkGroupID.x * SUBGROUPS_PER_WG;
+    uint sg_id       = gl_SubgroupID;
+    uint lane_id     = gl_SubgroupInvocationID;
+    uint out_row     = wg_row_base + sg_id;
+
+    if (out_row >= FFN_DIM) return;
+
+    float gate_accum = 0.0;
+    float up_accum   = 0.0;
+
+    for (uint k = lane_id; k < D; k += SUBGROUP_SIZE) {
+        float x = float(hidden_in.x[k]);
+        gate_accum += x * read_f16_w(GATE_BASE, out_row, k);
+        up_accum   += x * read_f16_w(UP_BASE,   out_row, k);
+    }
+
+    float gate_val = warpReduceSum(gate_accum);
+    float up_val   = warpReduceSum(up_accum);
+
+    float silu_gate = silu_f32(gate_val);
+    float result    = silu_gate * up_val;
+
+    if (lane_id == 0u) {
+        scratch.s[out_row] = float16_t(result);
+    }
+}

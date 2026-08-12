@@ -1,0 +1,78 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_KHR_shader_subgroup_basic                    : require
+#extension GL_KHR_shader_subgroup_arithmetic               : require
+#extension GL_EXT_subgroup_size_control : enable
+#extension GL_EXT_nonuniform_qualifier                     : require
+#extension GL_EXT_scalar_block_layout                      : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_KHR_memory_scope_semantics                   : require
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+#include "common.glsl"
+
+// GGML has two mutually-incompatible RoPE pairing conventions, selected per
+// architecture (never per GGUF key -- see vk_model.cpp's neox_archs table,
+// cross-checked against llama.cpp's llama_model_rope_type()):
+//
+//   NEOX (pc.rope_is_neox=1): head split into two HALVES. Element i pairs
+//   with element i + HEAD_DIM/2:
+//     out[i]           = in[i]*cos(theta_i) - in[i + n/2]*sin(theta_i)
+//     out[i + n/2]      = in[i]*sin(theta_i) + in[i + n/2]*cos(theta_i)
+//   Used by qwen*/gemma*/phi*/stablelm/falcon/gptneox/etc.
+//
+//   NORM (pc.rope_is_neox=0): ADJACENT pairs (2p, 2p+1) -- GPT-J/interleaved.
+//     out[2p]   = in[2p]*cos(theta_p) - in[2p+1]*sin(theta_p)
+//     out[2p+1] = in[2p]*sin(theta_p) + in[2p+1]*cos(theta_p)
+//   Used by llama/minicpm/baichuan/starcoder/internlm2/deepseek*/granite*/etc.
+//
+// Getting the wrong one for a given arch silently corrupts positional
+// encoding for every token past position 0 (both conventions agree at
+// position 0, where theta=0) -- this was a real, confirmed regression this
+// session: a blanket-NEOX rewrite broke llama/minicpm-family models that
+// actually need NORM.
+//
+// One workgroup per (Q head | KV head). Workgroups [0, N_HEADS) rotate Q
+// in-place in qkv_buf; workgroups [N_HEADS, N_HEADS+N_KV_HEADS) rotate K
+// in-place in the KV cache at the current position. V is never rotated.
+
+void main() {
+    uint wg = gl_WorkGroupID.x;
+    uint half_dim = HEAD_DIM / 2u;
+    float pos = float(pc.kv_cache_pos);
+    bool neox = pc.rope_is_neox != 0u;
+
+    if (wg < N_HEADS) {
+        uint base = wg * HEAD_DIM;
+        for (uint i = gl_LocalInvocationID.x; i < half_dim; i += WG_SIZE_X) {
+            float c, s;
+            rope_cos_sin(i, pos, c, s);
+            uint ia = neox ? (base + i)            : (base + 2u * i);
+            uint ib = neox ? (base + i + half_dim) : (base + 2u * i + 1u);
+            float a = float(hidden_out.y[ia]);
+            float b = float(hidden_out.y[ib]);
+            hidden_out.y[ia] = float16_t(a * c - b * s);
+            hidden_out.y[ib] = float16_t(a * s + b * c);
+        }
+    } else {
+        uint kv_head = wg - N_HEADS;
+        if (kv_head >= N_KV_HEADS) return;
+        for (uint i = gl_LocalInvocationID.x; i < half_dim; i += WG_SIZE_X) {
+            float c, s;
+            rope_cos_sin(i, pos, c, s);
+            uint dim_a = neox ? i            : (2u * i);
+            uint dim_b = neox ? (i + half_dim) : (2u * i + 1u);
+            uint off_a = kv_cache_page_offset(kv_head, pc.kv_cache_pos, dim_a, false);
+            uint off_b = kv_cache_page_offset(kv_head, pc.kv_cache_pos, dim_b, false);
+            float a = float(k_cache.k[off_a]);
+            float b = float(k_cache.k[off_b]);
+            k_cache.k[off_a] = float16_t(a * c - b * s);
+            k_cache.k[off_b] = float16_t(a * s + b * c);
+        }
+    }
+}

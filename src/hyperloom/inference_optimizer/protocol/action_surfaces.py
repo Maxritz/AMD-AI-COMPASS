@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Shared action-surface constants.
+
+Keep ownership, transport, and prompt-visibility classifications here so
+PolicyGate, prompt rendering, and CLI wiring do not grow separate
+action-name lists.
+"""
+
+from __future__ import annotations
+
+
+# Actions owned by the Kernel role; requested via request{target_agent="kernel_agent"}.
+KERNEL_AGENT_OWNED_ACTIONS: frozenset[str] = frozenset(
+    {
+        "kernel_opt",
+        "integrate",
+        "deep_kernel_analysis",
+        "operator_tuning",
+        "vendor_kernel_config",
+        "gemm_tuning",
+    }
+)
+
+
+# Request-kind aliases that route to a kernel-owned handler. apply_patch is
+# an alias of integrate (both dispatch to integrate_handler); PolicyGate
+# resolves the alias to its canonical owned action so the phase-action gate
+# applies identically.
+KERNEL_REQUEST_KIND_ALIASES: dict[str, str] = {
+    "apply_patch": "integrate",
+}
+
+
+# Coordinator-managed actions that agents should not directly propose.
+INTERNAL_ONLY_ACTION_NAMES: frozenset[str] = frozenset(
+    {
+        "conc_sweep",
+        "roofline",
+        "profile",
+        "replay_warm_recipe",
+        "conc_sweep",
+    }
+)
+
+
+# Separate set for grouping only; ``framework_agent`` is denied by the same
+# generic ``rule="phase_incompatible"`` path as the other Coordinator-internal
+# actions.
+FRAMEWORK_AGENT_INTERNAL_ACTION_NAMES: frozenset[str] = frozenset(
+    {
+        "framework_agent",
+    }
+)
+
+
+COORDINATOR_INTERNAL_ACTIONS: frozenset[str] = INTERNAL_ONLY_ACTION_NAMES | FRAMEWORK_AGENT_INTERNAL_ACTION_NAMES
+
+
+# Robustness-only actions (driven via its action-ladder); Orchestration must
+# ALERT instead. ``recover`` walks SIGTERM/SIGKILL against server owners.
+ROBUSTNESS_DELEGATE_ONLY_ACTIONS: frozenset[str] = frozenset(
+    {
+        "recover",
+    }
+)
+
+
+# Actions whose prompt catalogue should advertise LLM-supplied grids.
+GRID_INJECTABLE_ACTIONS: frozenset[str] = frozenset(
+    {
+        "explore",
+        "sweep",
+    }
+)
+
+
+# Actions rendered in the Orchestration prompt for full kernel-enabled runs.
+# Prompt visibility only; phase_state and PolicyGate decide legality per tick.
+FULL_ENABLED_ACTIONS: tuple[str, ...] = (
+    "target_analysis",
+    "baseline",
+    "roofline",
+    "deep_kernel_analysis",
+    "explore",
+    "specialist",
+    "integrate_patch",
+    "sweep",
+    "kernel_opt",
+    "integrate",
+    "operator_tuning",
+    "vendor_kernel_config",
+    "gemm_tuning",
+    "report",
+)
+
+
+# Prompt-visible actions for --no-kernel runs. Kernel-owned request actions
+# and analysis actions that only feed kernel optimization stay hidden.
+NO_KERNEL_AGENT_ENABLED_ACTIONS: tuple[str, ...] = (
+    "target_analysis",
+    "baseline",
+    "explore",
+    "specialist",
+    "integrate_patch",
+    "sweep",
+    "report",
+)
+
+
+__all__ = [
+    "COORDINATOR_INTERNAL_ACTIONS",
+    "FRAMEWORK_AGENT_INTERNAL_ACTION_NAMES",
+    "FULL_ENABLED_ACTIONS",
+    "GRID_INJECTABLE_ACTIONS",
+    "INTERNAL_ONLY_ACTION_NAMES",
+    "KERNEL_AGENT_OWNED_ACTIONS",
+    "KERNEL_REQUEST_KIND_ALIASES",
+    "NO_KERNEL_AGENT_ENABLED_ACTIONS",
+    "ROBUSTNESS_DELEGATE_ONLY_ACTIONS",
+]

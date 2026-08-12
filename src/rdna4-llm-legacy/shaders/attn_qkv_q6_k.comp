@@ -1,0 +1,118 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16   : require  
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_KHR_shader_subgroup_basic                    : require
+#extension GL_KHR_shader_subgroup_arithmetic               : require
+#extension GL_KHR_shader_subgroup_shuffle                  : require
+#extension GL_KHR_shader_subgroup_ballot                   : require
+#extension GL_KHR_shader_subgroup_clustered                : require
+#extension GL_EXT_subgroup_size_control : enable
+#extension GL_EXT_nonuniform_qualifier                     : require
+#extension GL_EXT_scalar_block_layout                      : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_KHR_memory_scope_semantics                   : require
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+#include "common.glsl"
+
+#define Q6K_SB_BYTES      210u
+#define Q6K_SBS_PER_D     (D / 256u)
+#define Q6K_ROW_STRIDE    (Q6K_SBS_PER_D * Q6K_SB_BYTES)
+
+#define Q_BYTES  (N_HEADS * HEAD_DIM * Q6K_ROW_STRIDE)
+#define K_BYTES  (N_KV_HEADS * HEAD_DIM * Q6K_ROW_STRIDE)
+#define V_BYTES  (N_KV_HEADS * HEAD_DIM * Q6K_ROW_STRIDE)
+
+#define Q_BASE  pc.q_offset
+#define K_BASE  pc.k_offset
+#define V_BASE  pc.v_offset
+
+#define Q_OUT_ELEMS  (N_HEADS * HEAD_DIM)
+#define K_OUT_ELEMS  (N_KV_HEADS * HEAD_DIM)
+#define V_OUT_ELEMS  (N_KV_HEADS * HEAD_DIM)
+#define TOTAL_ELEMS  (Q_OUT_ELEMS + K_OUT_ELEMS + V_OUT_ELEMS)
+
+float read_q6k_weight(uint base, uint row, uint col) {
+    uint superblock  = col / 256u;
+    uint elem_in_sb  = col & 255u;
+    uint sb_start    = base + row * Q6K_ROW_STRIDE + superblock * Q6K_SB_BYTES;
+    return dequant_q6_k(sb_start, elem_in_sb);
+}
+
+void main() {
+    // One output ELEMENT per SUBGROUP: all 32 lanes reduce the dot product for a
+    // single Q/K/V element. One-thread-per-element + warpReduceSum (the previous
+    // implementation here) mixes the partial dots of 32 DIFFERENT elements —
+    // each lane held a different weight_row but only a strided slice of k, so
+    // the reduction summed unrelated rows together and corrupted every
+    // projected value. Must match the fp16/q8_0 subgroup-per-element pattern.
+    uint sg_id    = gl_SubgroupID;
+    uint lane_id  = gl_SubgroupInvocationID;
+    uint idx      = gl_WorkGroupID.x * (WG_SIZE_X / SUBGROUP_SIZE) + sg_id;
+
+    if (idx >= TOTAL_ELEMS) return;
+
+    bool  is_k, is_v;
+    uint  head, dim, weight_row, weight_base;
+
+    if (idx < Q_OUT_ELEMS) {
+        is_k = false; is_v = false;
+        head        = idx / HEAD_DIM;
+        dim         = idx % HEAD_DIM;
+        weight_row  = idx;
+        weight_base = Q_BASE;
+    } else if (idx < Q_OUT_ELEMS + K_OUT_ELEMS) {
+        is_k = true;  is_v = false;
+        uint k_idx  = idx - Q_OUT_ELEMS;
+        head        = k_idx / HEAD_DIM;
+        dim         = k_idx % HEAD_DIM;
+        weight_row  = k_idx;
+        weight_base = K_BASE;
+    } else {
+        is_k = false; is_v = true;
+        uint v_idx  = idx - Q_OUT_ELEMS - K_OUT_ELEMS;
+        head        = v_idx / HEAD_DIM;
+        dim         = v_idx % HEAD_DIM;
+        weight_row  = v_idx;
+        weight_base = V_BASE;
+    }
+
+    float accum = 0.0;
+    for (uint k = lane_id; k < D; k += SUBGROUP_SIZE) {
+        float x = float(hidden_in.x[k]);
+        accum += x * read_q6k_weight(weight_base, weight_row, k);
+    }
+
+    float out_val = warpReduceSum(accum);
+
+    // Qwen2/Qwen3-family GGUFs train an additive bias into Q/K/V projections
+    // (attn_q.bias/attn_k.bias/attn_v.bias); llama/minicpm-family do not have
+    // these tensors at all. has_qkv_bias is 0 for the latter so this is a
+    // no-op there. Skipping this for models that DO have it silently drops a
+    // per-channel additive term from every Q/K/V value -- a confirmed real
+    // bug (dead has_qkv_bias/*_bias_offset push constants, never read by any
+    // shader) that was corrupting attention on every Qwen-family model.
+    if (pc.has_qkv_bias != 0u) {
+        uint bias_base = is_k ? pc.k_bias_offset : (is_v ? pc.v_bias_offset : pc.q_bias_offset);
+        out_val += read_layer_f16(bias_base + weight_row * 2u);
+    }
+
+    // RoPE is applied by a dedicated pass (rope.comp) after this shader; see
+    // attn_qkv_q8_0.comp for why it cannot be fused in here (NEOX split-half
+    // pairing spans more than one subgroup/workgroup).
+    if (lane_id == 0u) {
+        hidden_out.y[idx] = float16_t(out_val);
+
+        if (is_k) {
+            uint cache_idx = kv_cache_page_offset(head, pc.kv_cache_pos, dim, false);
+            k_cache.k[cache_idx] = float16_t(out_val);
+        } else if (is_v) {
+            uint cache_idx = kv_cache_page_offset(head, pc.kv_cache_pos, dim, true);
+            v_cache.v[cache_idx] = float16_t(out_val);
+        }
+    }
+}

@@ -1,0 +1,257 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Coverage for ``cli_kb``: local KB root resolution, the RecipeKB dispatcher
+across remote-mode branches (degraded / gbrain / local-only), the T0
+bootstrap (success + mid-flight failure), and the KnowledgePlane facade."""
+
+from __future__ import annotations
+
+import argparse
+
+
+from hyperloom.inference_optimizer.cli import kb as cli_kb
+
+
+def _args(**over):
+    base = dict(
+        local_kb_root=None,
+        degraded_kb=False,
+        pr_monitor_enabled=True,
+        pr_monitor_url=None,
+        pr_monitor_mcp_url=None,
+    )
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+def test_resolve_local_kb_root_explicit(tmp_path) -> None:
+    out = cli_kb._resolve_local_kb_root(_args(local_kb_root=str(tmp_path / "kb")))
+    assert out == tmp_path / "kb"
+
+
+def test_resolve_local_kb_root_env(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "envkb"))
+    out = cli_kb._resolve_local_kb_root(_args())
+    assert out == tmp_path / "envkb"
+
+
+def test_resolve_local_kb_root_default(monkeypatch) -> None:
+    monkeypatch.delenv("HYPERLOOM_LOCAL_KB_ROOT", raising=False)
+    out = cli_kb._resolve_local_kb_root(_args())
+    assert out.name == "kb"
+
+
+def test_dispatcher_degraded_kb(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "kb"))
+    kb = cli_kb._build_recipe_kb_dispatcher(_args(degraded_kb=True))
+    assert kb.remote is None
+
+
+def test_dispatcher_local_only_no_gbrain(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "kb"))
+    from hyperloom.orchestrator.knowledge.recipe_kb import gbrain_remote_client as grc
+
+    monkeypatch.setattr(grc, "build_gbrain_remote_from_env", lambda: None)
+    kb = cli_kb._build_recipe_kb_dispatcher(_args())
+    assert kb.remote is None
+
+
+def test_dispatcher_gbrain_enabled(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "kb"))
+    monkeypatch.setenv("RECIPE_KB_MIRROR_MODE", "external")
+
+    class _Remote:
+        enabled = True
+
+    from hyperloom.orchestrator.knowledge.recipe_kb import gbrain_remote_client as grc
+
+    monkeypatch.setattr(grc, "build_gbrain_remote_from_env", lambda: _Remote())
+    kb = cli_kb._build_recipe_kb_dispatcher(_args())
+    assert isinstance(kb.remote, _Remote)
+
+
+def test_dispatcher_gbrain_inline_mirror(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "kb"))
+    monkeypatch.setenv("RECIPE_KB_MIRROR_MODE", "inline")
+
+    class _Remote:
+        enabled = True
+
+    from hyperloom.orchestrator.knowledge.recipe_kb import gbrain_remote_client as grc
+    from hyperloom.orchestrator.knowledge.recipe_kb import gbrain_ingest as gi
+
+    monkeypatch.setattr(grc, "build_gbrain_remote_from_env", lambda: _Remote())
+    monkeypatch.setattr(gi, "build_mirror_mcp_from_env", object)
+    kb = cli_kb._build_recipe_kb_dispatcher(_args())
+    assert isinstance(kb, gi.GbrainMirroringRecipeKB)
+
+
+def test_dispatcher_gbrain_not_configured(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "kb"))
+    from hyperloom.orchestrator.knowledge.recipe_kb import gbrain_remote_client as grc
+
+    monkeypatch.setattr(grc, "build_gbrain_remote_from_env", lambda: None)
+    kb = cli_kb._build_recipe_kb_dispatcher(_args())
+    assert kb.remote is None
+
+
+def test_attach_recipe_audit_hook_appends_jsonl(tmp_path) -> None:
+    import json
+
+    from hyperloom.orchestrator.knowledge.recipe_kb import LocalRecipeStore, RecipeKB
+    from hyperloom.inference_optimizer.session.session_paths import recipe_snapshot_audit_jsonl
+
+    kb = RecipeKB(local=LocalRecipeStore(root=tmp_path / "kb"), remote=None)
+    cli_kb._attach_recipe_audit_hook(kb, tmp_path)
+    assert callable(kb.audit_hook)
+    kb.audit_hook({"method": "get_recipe", "resolution": "local", "hit": False})
+    path = recipe_snapshot_audit_jsonl(tmp_path)
+    assert path.exists()
+    row = json.loads(path.read_text(encoding="utf-8").strip())
+    assert row["method"] == "get_recipe"
+    assert "ts" in row
+
+
+def test_attach_recipe_audit_hook_unwraps_mirror(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "kb"))
+    monkeypatch.setenv("RECIPE_KB_MIRROR_MODE", "inline")
+
+    class _Remote:
+        enabled = True
+
+    from hyperloom.orchestrator.knowledge.recipe_kb import gbrain_ingest as gi
+    from hyperloom.orchestrator.knowledge.recipe_kb import gbrain_remote_client as grc
+
+    monkeypatch.setattr(grc, "build_gbrain_remote_from_env", lambda: _Remote())
+    monkeypatch.setattr(gi, "build_mirror_mcp_from_env", object)
+    kb = cli_kb._build_recipe_kb_dispatcher(_args())
+    assert isinstance(kb, gi.GbrainMirroringRecipeKB)
+    cli_kb._attach_recipe_audit_hook(kb, tmp_path)
+    assert callable(kb._inner.audit_hook)
+
+
+def test_attach_recipe_audit_hook_noop_without_session_dir(tmp_path) -> None:
+    from hyperloom.orchestrator.knowledge.recipe_kb import LocalRecipeStore, RecipeKB
+
+    kb = RecipeKB(local=LocalRecipeStore(root=tmp_path / "kb"), remote=None)
+    cli_kb._attach_recipe_audit_hook(kb, None)
+    assert kb.audit_hook is None
+
+
+def test_bootstrap_recipe_kb_degraded_returns_none(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "kb"))
+    kb = cli_kb._bootstrap_recipe_kb(
+        _args(degraded_kb=True),
+        session_dir=tmp_path,
+        manifest={"model_name": "m"},
+        resume=False,
+    )
+    assert kb is None
+    assert "DISABLED (--degraded-kb)" in capsys.readouterr().out
+
+
+def test_bootstrap_recipe_kb_success(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "kb"))
+    monkeypatch.delenv("RECIPE_KB_REMOTE", raising=False)
+    calls = []
+    monkeypatch.setattr(cli_kb, "run_t0_anchor", lambda *a, **k: calls.append(k))
+    kb = cli_kb._bootstrap_recipe_kb(
+        _args(),
+        session_dir=tmp_path,
+        manifest={"model_name": "m"},
+        resume=False,
+    )
+    assert kb is not None
+    assert calls
+
+
+def test_bootstrap_recipe_kb_t0_failure_continues(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HYPERLOOM_LOCAL_KB_ROOT", str(tmp_path / "kb"))
+    monkeypatch.delenv("RECIPE_KB_REMOTE", raising=False)
+
+    def _boom(*a, **k):
+        raise RuntimeError("t0 down")
+
+    monkeypatch.setattr(cli_kb, "run_t0_anchor", _boom)
+    args = _args()
+    kb = cli_kb._bootstrap_recipe_kb(
+        args,
+        session_dir=tmp_path,
+        manifest={"model_path": "/models/Qwen", "stack_fingerprint": {"rocm": "6.2"}, "image": "img@sha"},
+        resume=False,
+    )
+    assert kb is not None
+    assert args.kb_degraded_reason == "t0_runtime_fail"
+
+
+def test_bootstrap_knowledge_plane_enabled(tmp_path) -> None:
+    plane = cli_kb._bootstrap_knowledge_plane(
+        _args(pr_monitor_enabled=True),
+        session_dir=tmp_path,
+    )
+    assert plane is not None
+
+
+def test_bootstrap_knowledge_plane_disabled(tmp_path) -> None:
+    plane = cli_kb._bootstrap_knowledge_plane(
+        _args(pr_monitor_enabled=False, pr_degraded_reason="explicit_flag"),
+        session_dir=tmp_path,
+    )
+    assert plane is not None
+
+
+class _FailingParent:
+    """A stand-in ``.parent`` whose mkdir always raises OSError."""
+
+    def mkdir(self, *_a, **_k):
+        raise OSError("no space")
+
+
+class _MarkerPath:
+    """Path-like whose parent.mkdir raises, exercising the OSError guard."""
+
+    parent = _FailingParent()
+
+    def write_text(self, *_a, **_k):  # pragma: no cover - never reached
+        raise OSError("no space")
+
+
+def test_bootstrap_knowledge_plane_marker_write_failure(tmp_path, monkeypatch) -> None:
+    """An OSError writing the pr_monitor status marker is swallowed."""
+    from hyperloom.inference_optimizer.session import session_paths as sp
+
+    monkeypatch.setattr(sp, "pr_monitor_status_json", lambda _sd: _MarkerPath())
+    plane = cli_kb._bootstrap_knowledge_plane(_args(pr_monitor_enabled=True), session_dir=tmp_path)
+    assert plane is not None
+
+
+def test_attach_recipe_audit_hook_target_without_hook_attr(tmp_path) -> None:
+    """A target lacking ``audit_hook`` is a no-op."""
+
+    class _NoHook:
+        pass
+
+    obj = _NoHook()
+    cli_kb._attach_recipe_audit_hook(obj, tmp_path)
+    assert not hasattr(obj, "audit_hook")
+
+
+def test_attach_recipe_audit_hook_write_error_is_swallowed(tmp_path, monkeypatch) -> None:
+    """A write failure inside the hook is swallowed, not raised."""
+    from hyperloom.orchestrator.knowledge.recipe_kb import LocalRecipeStore, RecipeKB
+    from hyperloom.inference_optimizer.session import session_paths as sp
+
+    kb = RecipeKB(local=LocalRecipeStore(root=tmp_path / "kb"), remote=None)
+
+    class _BadPath:
+        parent = None
+
+        def mkdir(self, *_a, **_k):
+            raise OSError("boom")
+
+    bad = _BadPath()
+    bad.parent = bad  # type: ignore[assignment]
+    monkeypatch.setattr(sp, "recipe_snapshot_audit_jsonl", lambda _sd: bad)
+    cli_kb._attach_recipe_audit_hook(kb, tmp_path)
+    kb.audit_hook({"method": "search"})

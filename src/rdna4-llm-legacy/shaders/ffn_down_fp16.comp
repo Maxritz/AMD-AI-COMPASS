@@ -1,0 +1,58 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16   : require  
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_KHR_shader_subgroup_basic                    : require
+#extension GL_KHR_shader_subgroup_arithmetic               : require
+#extension GL_KHR_shader_subgroup_shuffle                  : require
+#extension GL_KHR_shader_subgroup_ballot                   : require
+#extension GL_KHR_shader_subgroup_clustered                : require
+#extension GL_EXT_subgroup_size_control : enable
+#extension GL_EXT_nonuniform_qualifier                     : require
+#extension GL_EXT_scalar_block_layout                      : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_KHR_memory_scope_semantics                   : require
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+#include "common.glsl"
+
+#define FP16_ROW_STRIDE    (D * 2u)
+#define Q_BYTES            (N_HEADS * HEAD_DIM * FP16_ROW_STRIDE)
+#define K_BYTES            (N_KV_HEADS * HEAD_DIM * FP16_ROW_STRIDE)
+#define V_BYTES            (N_KV_HEADS * HEAD_DIM * FP16_ROW_STRIDE)
+#define O_BYTES            (D * N_HEADS * HEAD_DIM * 2u)
+#define NORM_BYTES         (D * 2u)
+#define GATE_BYTES         (FFN_DIM * FP16_ROW_STRIDE)
+#define UP_BYTES           (FFN_DIM * FP16_ROW_STRIDE)
+
+#define DOWN_ROW_STRIDE    (FFN_DIM * 2u)
+#define QK_NORM_BYTES      (HEAD_DIM * 2u)
+#define DOWN_BASE          pc.down_offset
+
+float read_down_f16(uint base, uint row, uint col) {
+    uint off = base + row * DOWN_ROW_STRIDE + col * 2u;
+    return f16tof32_from_bytes(weight_array[nonuniformEXT(pc.layer_idx)].data[off], weight_array[nonuniformEXT(pc.layer_idx)].data[off + 1u]);
+}
+
+void main() {
+    // One output row per SUBGROUP (see lm_head_fp16.comp for why).
+    uint lane_id = gl_SubgroupInvocationID;
+    uint out_row = gl_WorkGroupID.x * (WG_SIZE_X / SUBGROUP_SIZE) + gl_SubgroupID;
+
+    if (out_row >= D) return;
+
+    float accum = 0.0;
+    for (uint k = lane_id; k < FFN_DIM; k += SUBGROUP_SIZE) {
+        float x = float(scratch.s[k]);
+        accum += x * read_down_f16(DOWN_BASE, out_row, k);
+    }
+
+    float projected = warpReduceSum(accum);
+    if (lane_id == 0u) {
+        float residual  = float(hidden_out.y[out_row]);
+        hidden_out.y[out_row] = float16_t(projected * pc.residual_scale + residual);
+    }
+}

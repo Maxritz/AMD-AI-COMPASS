@@ -1,0 +1,764 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Idempotent, backward-compatible patchers for the InferenceX checkout.
+
+Each ``ensure_*`` function rewrites one upstream line in place: ``$NUM_PROMPTS``
+support and ``PROFILE_EXTRA_BODY`` consumption for profiling, the eval-artifact
+redirect to ``$RESULT_DIR``, the ``HYPERLOOM_EVAL_START`` phase marker, and the
+generation-pathology probe injected into lm-eval's ``sitecustomize.py``.
+
+Applied in place, once: idempotent via a sentinel substring, serialized across
+processes via ``fcntl.flock``, written atomically. Returns ``False``
+(non-fatal) when the legacy line is missing.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import tempfile
+from functools import partial
+from pathlib import Path
+from typing import Callable
+
+from ._file_lock import best_effort_file_lock
+from ._magpie_patcher import atomic_write_text
+from ._patch_sentinel import file_contains_sentinel
+
+log = logging.getLogger(__name__)
+
+
+# Exact upstream line, whitespace-anchored so we don't match an unrelated
+# ``num_prompts`` reference elsewhere in the file.
+_LEGACY_LINE = '        num_prompts="$max_concurrency"'
+_PATCHED_LINE = '        num_prompts="${NUM_PROMPTS:-$max_concurrency}"'
+# "Already patched?" sentinel.
+_PATCH_SENTINEL = "${NUM_PROMPTS:-$max_concurrency}"
+
+# System-wide lock; cross-reboot persistence is not needed.
+_LOCK_PATH = str(Path(tempfile.gettempdir()) / "hyperloom_benchmark_lib_patcher.lock")
+
+
+# ``benchmark_serving.py`` hardcodes the ``/start_profile`` ``extra_body`` and
+# never reads Hyperloom's ``PROFILE_EXTRA_BODY`` env. Single-line replacement
+# gated on the exact legacy text; sentinel is ``PROFILE_EXTRA_BODY``.
+_BENCH_SERVING_LEGACY = (
+    '                                         extra_body={"num_steps": 1, '
+    '"merge_profiles": True, "profile_by_stage": True},'
+)
+# JSON fallback uses lowercase ``true``; ``json.loads`` maps it back so the
+# dict matches the upstream literal byte-for-byte.
+_BENCH_SERVING_PATCHED = (
+    "                                         extra_body=__import__('json')."
+    "loads(__import__('os').environ.get('PROFILE_EXTRA_BODY') or "
+    '\'{"num_steps": 1, "merge_profiles": true, "profile_by_stage": true}\'),'
+)
+_BENCH_SERVING_SENTINEL = "PROFILE_EXTRA_BODY"
+_BENCH_SERVING_LOCK_PATH = str(Path(tempfile.gettempdir()) / "hyperloom_benchmark_serving_patcher.lock")
+
+# ``append_lm_eval_summary`` does ``mv ./`` — eval artifacts land in the process
+# cwd (the InferenceX checkout), escaping the session. Redirect to ``$RESULT_DIR``
+# (Hyperloom's session dir), falling back to ``.`` when unset.
+_EVAL_DEST_LEGACY = 'mv -f "$jf" ./ || echo "WARN: failed to move ${jf}" >&2'
+_EVAL_DEST_PATCHED = 'mv -f "$jf" "${RESULT_DIR:-.}/" || echo "WARN: failed to move ${jf}" >&2'
+_EVAL_DEST_SENTINEL = '"${RESULT_DIR:-.}/"'
+_EVAL_DEST_LOCK_PATH = str(Path(tempfile.gettempdir()) / "hyperloom_benchmark_lib_eval_dest_patcher.lock")
+
+# The explore overtime kill bounds the throughput phase only, but benchmark and
+# eval share one Magpie subprocess, so Hyperloom cannot see the boundary. Emit a
+# sentinel on the last line before ``lm_eval`` starts; the soft-deadline watcher
+# retires the deadline when it appears. Anchored on the unique
+# ``EVAL_RESULT_DIR`` export — ``set -x`` occurs three times in the file.
+_EVAL_START_LEGACY = '    export EVAL_RESULT_DIR="$results_dir"'
+_EVAL_START_PATCHED = '    export EVAL_RESULT_DIR="$results_dir"\n    echo "HYPERLOOM_EVAL_START" >&2'
+_EVAL_START_SENTINEL = "HYPERLOOM_EVAL_START"
+_EVAL_START_LOCK_PATH = str(Path(tempfile.gettempdir()) / "hyperloom_benchmark_lib_eval_start_patcher.lock")
+
+# Early-exit probe for a model that never emits EOS. InferenceX runs lm-eval
+# with ``--gen_kwargs max_tokens=min(16384, ctx-4096)``, so a degenerate model
+# burns that budget on every one of GSM8K's 1319 docs and takes the whole
+# baseline timeout with it. Injected as source rather than imported: the
+# lm-eval subprocess shares an interpreter with Hyperloom only by accident.
+_EVAL_PROBE_PY = """
+# --- HYPERLOOM_EVAL_PROBE ---------------------------------------------------
+import json as _hl_json
+import os as _hl_os
+import sys as _hl_sys
+
+
+def _hl_eval_probe_install():
+    if (_hl_os.environ.get("HYPERLOOM_EVAL_PROBE") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+
+    def _num(name, default, cast, ok):
+        try:
+            val = cast((_hl_os.environ.get(name) or "").strip())
+        except (TypeError, ValueError):
+            return default
+        return val if ok(val) else default
+
+    # Out of range falls back to the default, not to the nearest legal value:
+    # RATIO=0 means "turn the probe off", and clamping would do the opposite.
+    min_samples = _num("HYPERLOOM_EVAL_PROBE_MIN_SAMPLES", 128, int, lambda v: v >= 8)
+    ratio_limit = _num("HYPERLOOM_EVAL_PROBE_LENGTH_RATIO", 0.75, float, lambda v: 0.0 < v <= 1.0)
+
+    import asyncio as _hl_asyncio
+    from lm_eval.models import api_models as _hl_api
+    from lm_eval.models.openai_completions import LocalChatCompletion as _hl_lcc
+
+    # The imports above prove this is lm-eval, not one of the other python3
+    # invocations sitecustomize runs in, so any sidecar here is a stale one from
+    # the attempt that reused this $RESULT_DIR.
+    _hl_dir = (_hl_os.environ.get("RESULT_DIR") or "").strip()
+    if _hl_dir:
+        try:
+            _hl_os.remove(_hl_os.path.join(_hl_dir, "hyperloom_eval_probe.json"))
+        except OSError:
+            pass
+
+    state = {"observed": 0, "length": 0, "max_tokens_seen": 0, "cap_hits": 0, "tripped": False}
+    # completion_tokens -> count, over responses the server stopped on length.
+    capped = {}
+
+    def _emit():
+        record = {
+            "reason": "model_not_terminating",
+            "observed_samples": state["observed"],
+            "finish_reason_length": state["length"],
+            "cap_hits": state["cap_hits"],
+            "max_completion_tokens_seen": state["max_tokens_seen"],
+            "min_samples": min_samples,
+            "cap_hit_ratio_threshold": ratio_limit,
+        }
+        blob = _hl_json.dumps(record, sort_keys=True)
+        print("HYPERLOOM_EVAL_PROBE_TRIPPED " + blob, file=_hl_sys.stderr, flush=True)
+        # $RESULT_DIR, never $EVAL_RESULT_DIR: append_lm_eval_summary rm -rf's
+        # the latter. The name must not match results*.json -- that glob is how
+        # parse_eval_results finds the accuracy score.
+        out_dir = (_hl_os.environ.get("RESULT_DIR") or "").strip()
+        if not out_dir:
+            # The cwd is InferenceX's checkout; stderr above already has it all.
+            return
+        _hl_os.makedirs(out_dir, exist_ok=True)
+        with open(_hl_os.path.join(out_dir, "hyperloom_eval_probe.json"), "w", encoding="utf-8") as fh:
+            fh.write(blob)
+
+    def _observe(outputs):
+        for out in outputs if isinstance(outputs, list) else [outputs]:
+            seen = int((out.get("usage") or {}).get("completion_tokens") or 0)
+            state["max_tokens_seen"] = max(state["max_tokens_seen"], seen)
+            for choice in out.get("choices") or []:
+                state["observed"] += 1
+                if choice.get("finish_reason") == "length":
+                    state["length"] += 1
+                    capped[seen] = capped.get(seen, 0) + 1
+        if state["observed"] < min_samples:
+            return
+        # A model that never terminates piles every capped response onto the
+        # same ceiling; cap 0 means no usage was reported, so it is unknown.
+        cap = max(capped) if capped else 0
+        state["cap_hits"] = capped.get(cap, 0)
+        if cap > 0 and float(state["cap_hits"]) / state["observed"] >= ratio_limit:
+            state["tripped"] = True
+            _emit()
+
+    # Wrap whatever is installed now so InferenceX's own parse_generations
+    # patch (appended just above) stays in effect. Observation must never break
+    # the eval it is watching, hence the guard.
+    _hl_prev_parse = _hl_lcc.parse_generations
+
+    def _hl_probe_parse_generations(outputs, **kwargs):
+        if not state["tripped"]:
+            try:
+                _observe(outputs)
+            except Exception:
+                pass
+        return _hl_prev_parse(outputs, **kwargs)
+
+    _hl_lcc.parse_generations = staticmethod(_hl_probe_parse_generations)
+
+    # get_batched_requests creates one task per request up front, and
+    # amodel_call builds its payload BEFORE awaiting the inner semaphore, so
+    # every payload already carries the large max_tokens by the time the probe
+    # trips. Park the tasks in an equally sized outer gate instead. asyncio.run
+    # builds a fresh loop per batch and a Semaphore binds to the first loop
+    # that awaits it, so the gate is loop-keyed.
+    _hl_prev_amodel_call = _hl_api.TemplateAPI.amodel_call
+    gate = {"loop": None, "sem": None}
+
+    async def _hl_probe_amodel_call(self, session, sem, messages, **kwargs):
+        loop = _hl_asyncio.get_running_loop()
+        if gate["loop"] is not loop:
+            gate["loop"] = loop
+            gate["sem"] = _hl_asyncio.Semaphore(max(1, int(self._concurrent or 1)))
+        async with gate["sem"]:
+            if not (state["tripped"] and kwargs.get("generate", True)):
+                return await _hl_prev_amodel_call(self, session, sem, messages, **kwargs)
+            answers = [""] * len(messages)
+            for answer, cache_key in zip(answers, kwargs.get("cache_keys") or []):
+                self.cache_hook.add_partial("generate_until", cache_key, answer)
+            return answers
+
+    _hl_api.TemplateAPI.amodel_call = _hl_probe_amodel_call
+
+
+# sitecustomize runs at interpreter startup: raising here would break every
+# python3 the benchmark shells out to, not just lm-eval.
+try:
+    _hl_eval_probe_install()
+except Exception:
+    pass
+# --- end HYPERLOOM_EVAL_PROBE -----------------------------------------------
+"""
+
+# Anchored on the unique ``export PYTHONPATH`` line that closes
+# ``_patch_lm_eval``. The heredoc is quoted so nothing inside it is
+# shell-expanded, and its terminator must sit at column 0.
+_EVAL_PROBE_LEGACY = '    export PYTHONPATH="${patch_dir}:${PYTHONPATH:-}"'
+_EVAL_PROBE_PATCHED = (
+    "    cat >> \"$patch_dir/sitecustomize.py\" <<'HYPERLOOM_PY'\n"
+    + _EVAL_PROBE_PY.lstrip("\n")
+    + "HYPERLOOM_PY\n"
+    + _EVAL_PROBE_LEGACY
+)
+_EVAL_PROBE_SENTINEL = "HYPERLOOM_EVAL_PROBE"
+_EVAL_PROBE_LOCK_PATH = str(Path(tempfile.gettempdir()) / "hyperloom_benchmark_lib_eval_probe_patcher.lock")
+
+
+def _discover_inferencex_roots(
+    inferencex_path: Path | str | None,
+) -> list[Path]:
+    """Return every InferenceX checkout root Hyperloom should patch.
+
+    Magpie loads its bundled ``$MAGPIE_PATH/InferenceX`` at runtime, not
+    ``$INFERENCEX_PATH``, so all discovered roots (deduped by resolved path)
+    are patched: ``inferencex_path`` arg, ``$INFERENCEX_PATH``,
+    ``$MAGPIE_PATH/InferenceX``. Returns ``[]`` when none resolve.
+
+    Args:
+        inferencex_path: Caller-provided override root to include in the scan.
+
+    Returns:
+        A deduped list of resolved InferenceX checkout directories, or ``[]``
+        when none resolve.
+    """
+    roots: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(candidate: Path | str | None) -> None:
+        """Resolve and append a candidate root if it is a new directory.
+
+        Args:
+            candidate (Path | str | None): A candidate InferenceX root.
+
+        Returns:
+            None: Mutates the enclosing ``roots``/``seen`` collections.
+        """
+        if not candidate:
+            return
+        try:
+            resolved = Path(candidate).expanduser().resolve()
+        except OSError:
+            return
+        if not resolved.is_dir():
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        roots.append(resolved)
+
+    _add(inferencex_path)
+    _add(os.environ.get("INFERENCEX_PATH", "").strip() or None)
+    magpie_dir = (os.environ.get("MAGPIE_PATH") or "").strip()
+    if magpie_dir:
+        _add(Path(magpie_dir) / "InferenceX")
+    return roots
+
+
+def _resolve_inferencex_files(
+    inferencex_path: Path | str | None,
+    *rel_parts: str,
+) -> list[Path]:
+    """Return every existing ``<root>/<*rel_parts>`` across discovered roots.
+
+    One entry per :func:`_discover_inferencex_roots` root whose joined relative
+    path is an existing file. ``[]`` = skip patching.
+
+    Args:
+        inferencex_path: Caller-provided override root to include in the scan.
+        *rel_parts: Relative path components joined onto each discovered root.
+
+    Returns:
+        A list of existing files, or ``[]`` when none exist.
+    """
+    out: list[Path] = []
+    for root in _discover_inferencex_roots(inferencex_path):
+        candidate = root.joinpath(*rel_parts)
+        if candidate.is_file():
+            out.append(candidate)
+    return out
+
+
+def _resolve_benchmark_lib_paths(
+    inferencex_path: Path | str | None,
+) -> list[Path]:
+    """Return every existing ``<root>/benchmarks/benchmark_lib.sh`` to patch
+    (one per :func:`_discover_inferencex_roots` root). ``[]`` = skip patching.
+
+    Args:
+        inferencex_path: Caller-provided override root to include in the scan.
+
+    Returns:
+        A list of existing ``benchmark_lib.sh`` paths, or ``[]`` when none
+        exist.
+    """
+    return _resolve_inferencex_files(inferencex_path, "benchmarks", "benchmark_lib.sh")
+
+
+def _is_patched(src: Path) -> bool:
+    """Return whether ``benchmark_lib.sh`` already carries the patch.
+
+    Args:
+        src (Path): The ``benchmark_lib.sh`` file to inspect.
+
+    Returns:
+        bool: ``True`` if the patch sentinel is present; ``False`` on a
+        miss or read error.
+    """
+    return file_contains_sentinel(src, _PATCH_SENTINEL, log, "_inferencex_patcher")
+
+
+def _apply_line_replacement_atomic(
+    src: Path,
+    legacy: str,
+    patched_line: str,
+    *,
+    tmp_prefix: str,
+    missing_msg: str,
+    success_msg: str,
+) -> bool:
+    """Replace a single exact ``legacy`` line with ``patched_line`` in ``src``
+    via temp-file + atomic rename so a crash mid-write cannot leave a corrupt
+    file.
+
+    Shared by both InferenceX patches (``benchmark_lib.sh`` and
+    ``benchmark_serving.py``); they differ only in the legacy/patched text,
+    temp-file prefix, and log messages.
+
+    Args:
+        src: The file to patch in place.
+        legacy: Exact legacy line that must be present to patch.
+        patched_line: Replacement text for ``legacy`` (first occurrence).
+        tmp_prefix: Temp-file prefix for the atomic write.
+        missing_msg: Warning (one ``%s`` for ``src``) when ``legacy`` is absent.
+        success_msg: Info (one ``%s`` for ``src``) logged on a successful write.
+
+    Returns:
+        bool: ``True`` when the patched bytes were written; ``False`` when the
+        legacy line is missing or any IO step fails.
+    """
+    try:
+        original = src.read_text(encoding="utf-8")
+    except OSError as e:
+        log.warning("_inferencex_patcher: cannot read %s: %s", src, e)
+        return False
+
+    if legacy not in original:
+        log.warning(missing_msg, src)
+        return False
+
+    patched = original.replace(legacy, patched_line, 1)
+    if patched == original:
+        return False
+
+    if not atomic_write_text(
+        src,
+        patched,
+        tmp_prefix=tmp_prefix,
+        log_prefix="_inferencex_patcher",
+    ):
+        return False
+
+    log.info(success_msg, src)
+    return True
+
+
+def _ensure_patched(
+    sources: list[Path],
+    is_patched: Callable[[Path], bool],
+    apply_patch: Callable[[Path], bool],
+    lock_path: str,
+    *,
+    empty_msg: str,
+    failure_msg: str,
+) -> bool:
+    """Drive a set of discovered files to patched state.
+
+    Empty fast-path: ``log.info(empty_msg)`` + ``False``. All-already-patched
+    fast-path skips the lock. Otherwise, under the lock, each source is
+    re-checked and patched; a failed apply emits ``log.warning(failure_msg,
+    src)`` and the remaining roots are still attempted.
+
+    Args:
+        sources: Discovered files to patch.
+        is_patched: "Already patched?" predicate for one file.
+        apply_patch: In-place atomic patcher for one file (True on success).
+        lock_path: Cross-process lock file path.
+        empty_msg: Info message logged when ``sources`` is empty.
+        failure_msg: Warning message (one ``%s`` for ``src``) on apply failure.
+
+    Returns:
+        True when at least one source is patched (or already patched), False
+        when none could be patched.
+    """
+    if not sources:
+        log.info(empty_msg)
+        return False
+
+    # Patch every discovered InferenceX root, not just the first.
+    if all(is_patched(s) for s in sources):
+        return True  # all already patched, fast-path no lock
+
+    any_patched = False
+    with best_effort_file_lock(lock_path, label="_inferencex_patcher"):
+        for src in sources:
+            # Re-check under the lock (another process may have patched).
+            if is_patched(src):
+                any_patched = True
+                continue
+            if apply_patch(src):
+                any_patched = True
+            else:
+                log.warning(failure_msg, src)
+    return any_patched
+
+
+def ensure_benchmark_lib_patched(
+    inferencex_path: Path | str | None = None,
+) -> bool:
+    """Ensure InferenceX ``benchmark_lib.sh`` honours ``$NUM_PROMPTS``.
+
+    Returns ``True`` when patched at exit, ``False`` (non-fatal) when the file
+    is missing or the legacy line is absent. Concurrency-safe (flock +
+    atomic rename; already-patched fast-path skips the lock).
+
+    Args:
+        inferencex_path: Caller-provided override root; defaults to env-based
+            discovery when ``None``.
+
+    Returns:
+        True when at least one discovered ``benchmark_lib.sh`` is patched (or
+        already patched), False when none could be patched.
+    """
+    return _ensure_patched(
+        _resolve_benchmark_lib_paths(inferencex_path),
+        _is_patched,
+        # Preserve perms so the patched file stays runnable as a sourced lib.
+        partial(
+            _apply_line_replacement_atomic,
+            legacy=_LEGACY_LINE,
+            patched_line=_PATCHED_LINE,
+            tmp_prefix=".benchmark_lib.sh.hyperloom_",
+            missing_msg=(
+                "_inferencex_patcher: expected legacy line not found in %s; "
+                "the file may already have been hand-patched to a "
+                "different shape, or the upstream layout has changed. "
+                "Manual review needed."
+            ),
+            success_msg=("_inferencex_patcher: applied NUM_PROMPTS-respecting patch to %s (Hyperloom issue #194 §2)"),
+        ),
+        _LOCK_PATH,
+        empty_msg=(
+            "_inferencex_patcher: no InferenceX root discovered "
+            "(checked $INFERENCEX_PATH, $MAGPIE_PATH/InferenceX) or "
+            "benchmark_lib.sh missing — skipping patch (this is fine "
+            "for tests and dry-runs without a real InferenceX tree)"
+        ),
+        failure_msg=("_inferencex_patcher: failed to patch %s; other discovered roots will still be attempted"),
+    )
+
+
+# =====================================================================
+# PROFILE_EXTRA_BODY consumer patch for benchmark_serving.py
+# =====================================================================
+def _resolve_benchmark_serving_paths(
+    inferencex_path: Path | str | None,
+) -> list[Path]:
+    """Return every existing
+    ``<root>/utils/bench_serving/benchmark_serving.py`` to patch (one per
+    :func:`_discover_inferencex_roots` root, including Magpie's bundled copy).
+    Independent of the benchmark_lib.sh resolver.
+
+    Args:
+        inferencex_path: Caller-provided override root to include in the scan.
+
+    Returns:
+        A list of existing ``benchmark_serving.py`` paths, or ``[]`` when none
+        exist.
+    """
+    return _resolve_inferencex_files(inferencex_path, "utils", "bench_serving", "benchmark_serving.py")
+
+
+def _is_benchmark_serving_patched(src: Path) -> bool:
+    """Return whether ``benchmark_serving.py`` already carries the patch.
+
+    Args:
+        src (Path): The ``benchmark_serving.py`` file to inspect.
+
+    Returns:
+        bool: ``True`` if the ``PROFILE_EXTRA_BODY`` sentinel is present;
+        ``False`` on a miss or read error.
+    """
+    return file_contains_sentinel(src, _BENCH_SERVING_SENTINEL, log, "_inferencex_patcher")
+
+
+def ensure_benchmark_serving_patched(
+    inferencex_path: Path | str | None = None,
+) -> bool:
+    """Ensure InferenceX ``benchmark_serving.py`` reads ``PROFILE_EXTRA_BODY``
+    on ``/start_profile``.
+
+    Returns ``True`` when patched at exit, ``False`` (non-fatal) when missing.
+    Concurrency-safe; independent lock file from
+    :func:`ensure_benchmark_lib_patched` so the two patches don't serialize.
+
+    Args:
+        inferencex_path: Caller-provided override root; defaults to env-based
+            discovery when ``None``.
+
+    Returns:
+        True when at least one discovered ``benchmark_serving.py`` is patched
+        (or already patched), False when none could be patched.
+    """
+    return _ensure_patched(
+        _resolve_benchmark_serving_paths(inferencex_path),
+        _is_benchmark_serving_patched,
+        partial(
+            _apply_line_replacement_atomic,
+            legacy=_BENCH_SERVING_LEGACY,
+            patched_line=_BENCH_SERVING_PATCHED,
+            tmp_prefix=".benchmark_serving.py.hyperloom_",
+            missing_msg=(
+                "_inferencex_patcher: expected legacy `extra_body=` line not "
+                "found in %s; InferenceX layout may have changed and Hyperloom "
+                "needs an updated patch. PROFILE_EXTRA_BODY env var will be "
+                "ignored — TraceLens shape_discovery / roofline_annotations / "
+                "steady-state start_step won't reach the server. Manual review "
+                "needed."
+            ),
+            success_msg=(
+                "_inferencex_patcher: patched %s to consume PROFILE_EXTRA_BODY env "
+                "var (PR-D §2: fixes silently-ignored shape_discovery / "
+                "roofline_annotations / steady-state start_step from "
+                "_workload_envs.py)"
+            ),
+        ),
+        _BENCH_SERVING_LOCK_PATH,
+        empty_msg=(
+            "_inferencex_patcher: no InferenceX root discovered "
+            "(checked $INFERENCEX_PATH, $MAGPIE_PATH/InferenceX) or "
+            "benchmark_serving.py missing — skipping PROFILE_EXTRA_BODY "
+            "patch (this is fine for tests and dry-runs without a real "
+            "InferenceX tree)"
+        ),
+        failure_msg=(
+            "_inferencex_patcher: failed to PROFILE_EXTRA_BODY-patch %s; other discovered roots will still be attempted"
+        ),
+    )
+
+
+def _is_eval_dest_patched(src: Path) -> bool:
+    """Return whether ``benchmark_lib.sh`` already redirects eval artifacts to
+    ``$RESULT_DIR`` (the eval-dest sentinel is present).
+
+    Args:
+        src (Path): The ``benchmark_lib.sh`` file to inspect.
+
+    Returns:
+        bool: ``True`` if the eval-dest sentinel is present; ``False`` on a
+        miss or read error.
+    """
+    return file_contains_sentinel(src, _EVAL_DEST_SENTINEL, log, "_inferencex_patcher")
+
+
+def ensure_benchmark_lib_eval_dest_patched(
+    inferencex_path: Path | str | None = None,
+) -> bool:
+    """Ensure ``append_lm_eval_summary`` moves eval artifacts to ``$RESULT_DIR``
+    instead of the process cwd (the InferenceX checkout).
+
+    Returns ``True`` when patched at exit, ``False`` (non-fatal) when the file
+    is missing or the legacy line is absent (falls back to the scan-side
+    salvage in :mod:`benchmark_result`). Concurrency-safe; independent lock so
+    it does not serialize with the NUM_PROMPTS patch on the same file.
+
+    Args:
+        inferencex_path: Caller-provided override root; defaults to env-based
+            discovery when ``None``.
+
+    Returns:
+        True when at least one discovered ``benchmark_lib.sh`` is patched (or
+        already patched), False when none could be patched.
+    """
+    return _ensure_patched(
+        _resolve_benchmark_lib_paths(inferencex_path),
+        _is_eval_dest_patched,
+        partial(
+            _apply_line_replacement_atomic,
+            legacy=_EVAL_DEST_LEGACY,
+            patched_line=_EVAL_DEST_PATCHED,
+            tmp_prefix=".benchmark_lib.sh.eval_dest_",
+            missing_msg=(
+                "_inferencex_patcher: expected eval-artifact ``mv ./`` line not "
+                "found in %s; upstream layout may have changed. Eval artifacts "
+                "will land in the process cwd (InferenceX checkout) and be "
+                "recovered by the benchmark_result scan-side salvage instead."
+            ),
+            success_msg=("_inferencex_patcher: redirected eval artifacts to $RESULT_DIR in %s"),
+        ),
+        _EVAL_DEST_LOCK_PATH,
+        empty_msg=(
+            "_inferencex_patcher: no InferenceX root discovered "
+            "(checked $INFERENCEX_PATH, $MAGPIE_PATH/InferenceX) or "
+            "benchmark_lib.sh missing — skipping eval-dest patch (fine for "
+            "tests and dry-runs without a real InferenceX tree)"
+        ),
+        failure_msg=(
+            "_inferencex_patcher: failed to eval-dest-patch %s; other discovered roots will still be attempted"
+        ),
+    )
+
+
+def _is_eval_start_patched(src: Path) -> bool:
+    """Return whether ``benchmark_lib.sh`` already emits the eval-start sentinel.
+
+    Args:
+        src (Path): The ``benchmark_lib.sh`` file to inspect.
+
+    Returns:
+        bool: ``True`` if the eval-start sentinel is present; ``False`` on a
+        miss or read error.
+    """
+    return file_contains_sentinel(src, _EVAL_START_SENTINEL, log, "_inferencex_patcher")
+
+
+def ensure_benchmark_lib_eval_start_patched(
+    inferencex_path: Path | str | None = None,
+) -> bool:
+    """Ensure ``run_eval`` announces the benchmark→eval boundary on stderr.
+
+    The explore overtime kill bounds the throughput phase only; without this
+    marker the eval's wall-clock is charged against a throughput-only anchor and
+    every gated variant is killed. Returns ``True`` when patched at exit,
+    ``False`` (non-fatal) when the file is missing or the anchor line is absent —
+    the deadline then behaves as before. Concurrency-safe; independent lock so it
+    does not serialize with the other patches on the same file.
+
+    Args:
+        inferencex_path: Caller-provided override root; defaults to env-based
+            discovery when ``None``.
+
+    Returns:
+        True when at least one discovered ``benchmark_lib.sh`` is patched (or
+        already patched), False when none could be patched.
+    """
+    return _ensure_patched(
+        _resolve_benchmark_lib_paths(inferencex_path),
+        _is_eval_start_patched,
+        partial(
+            _apply_line_replacement_atomic,
+            legacy=_EVAL_START_LEGACY,
+            patched_line=_EVAL_START_PATCHED,
+            tmp_prefix=".benchmark_lib.sh.eval_start_",
+            missing_msg=(
+                "_inferencex_patcher: expected EVAL_RESULT_DIR export not found "
+                "in %s; upstream layout may have changed. The overtime kill will "
+                "keep charging accuracy-eval time against the throughput anchor."
+            ),
+            success_msg=("_inferencex_patcher: added eval-start marker to %s"),
+        ),
+        _EVAL_START_LOCK_PATH,
+        empty_msg=(
+            "_inferencex_patcher: no InferenceX root discovered "
+            "(checked $INFERENCEX_PATH, $MAGPIE_PATH/InferenceX) or "
+            "benchmark_lib.sh missing — skipping eval-start patch (fine for "
+            "tests and dry-runs without a real InferenceX tree)"
+        ),
+        failure_msg=(
+            "_inferencex_patcher: failed to eval-start-patch %s; other discovered roots will still be attempted"
+        ),
+    )
+
+
+def _is_eval_probe_patched(src: Path) -> bool:
+    """Return whether ``benchmark_lib.sh`` already injects the eval probe.
+
+    Args:
+        src (Path): The ``benchmark_lib.sh`` file to inspect.
+
+    Returns:
+        bool: ``True`` if the eval-probe sentinel is present; ``False`` on a
+        miss or read error.
+    """
+    return file_contains_sentinel(src, _EVAL_PROBE_SENTINEL, log, "_inferencex_patcher")
+
+
+def ensure_benchmark_lib_eval_probe_patched(
+    inferencex_path: Path | str | None = None,
+) -> bool:
+    """Ensure ``_patch_lm_eval`` also installs Hyperloom's early-exit probe.
+
+    The probe watches ``finish_reason`` on completed responses; once the sample
+    is decisive it answers the remaining requests with an empty string, so
+    lm-eval still finishes normally and writes a ``results*.json`` scoring ~0 --
+    the verdict a non-terminating model would have earned hours later anyway.
+    Returns ``True`` when patched at exit, ``False`` (non-fatal) when the file
+    is missing or the anchor line is absent — the eval then runs unbounded as
+    before. Concurrency-safe; independent lock so it does not serialize with
+    the other patches on the same file.
+
+    Args:
+        inferencex_path: Caller-provided override root; defaults to env-based
+            discovery when ``None``.
+
+    Returns:
+        True when at least one discovered ``benchmark_lib.sh`` is patched (or
+        already patched), False when none could be patched.
+    """
+    return _ensure_patched(
+        _resolve_benchmark_lib_paths(inferencex_path),
+        _is_eval_probe_patched,
+        partial(
+            _apply_line_replacement_atomic,
+            legacy=_EVAL_PROBE_LEGACY,
+            patched_line=_EVAL_PROBE_PATCHED,
+            tmp_prefix=".benchmark_lib.sh.eval_probe_",
+            missing_msg=(
+                "_inferencex_patcher: expected _patch_lm_eval PYTHONPATH export "
+                "not found in %s; upstream layout may have changed. A model that "
+                "never emits EOS will run the accuracy eval to the full "
+                "max_tokens budget on every sample instead of exiting early."
+            ),
+            success_msg=("_inferencex_patcher: installed eval generation-pathology probe in %s"),
+        ),
+        _EVAL_PROBE_LOCK_PATH,
+        empty_msg=(
+            "_inferencex_patcher: no InferenceX root discovered "
+            "(checked $INFERENCEX_PATH, $MAGPIE_PATH/InferenceX) or "
+            "benchmark_lib.sh missing — skipping eval-probe patch (fine for "
+            "tests and dry-runs without a real InferenceX tree)"
+        ),
+        failure_msg=(
+            "_inferencex_patcher: failed to eval-probe-patch %s; other discovered roots will still be attempted"
+        ),
+    )
+
+
+__all__ = [
+    "ensure_benchmark_lib_patched",
+    "ensure_benchmark_lib_eval_dest_patched",
+    "ensure_benchmark_lib_eval_probe_patched",
+    "ensure_benchmark_lib_eval_start_patched",
+    "ensure_benchmark_serving_patched",
+]

@@ -1,0 +1,1422 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""SWEEP phase auto-dispatch tests.
+
+SWEEP entry dispatches ``conc_sweep`` directly; the full-workload ``sweep``
+helper is covered as a manual compatibility path.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from hyperloom.orchestrator.roles.agent_role import default_role_registry
+from hyperloom.orchestrator.roles.mock_backend import (
+    MockBackend,
+    MockTurn,
+    ScriptedPlan,
+)
+from hyperloom.orchestrator.loop.coordinator import Coordinator
+from hyperloom.orchestrator.state.shared_state import SharedState
+
+
+# Fixtures
+@dataclass
+class _BareState:
+    """SharedState stand-in covering every attribute the SWEEP hook + helper read."""
+
+    warm_start_recipe: dict | None = None
+    baseline_config_path: str = ""
+    current_best: dict[str, Any] = field(default_factory=dict)
+    last_baseline: dict[str, Any] = field(default_factory=dict)
+    phase_history: list[dict[str, Any]] = field(default_factory=list)
+    pending_stack_validation_result: dict[str, Any] = field(default_factory=dict)
+    pending_stack_validation_apply_results: list[dict[str, Any]] = field(default_factory=list)
+    kernel_integrate_attempts: dict[str, Any] = field(default_factory=dict)
+    optimization_stack: list[dict[str, Any]] = field(default_factory=list)
+    last_sweep: dict[str, Any] = field(default_factory=dict)
+    last_conc_sweep: dict[str, Any] = field(default_factory=dict)
+    last_conc_sweep_watermark: dict[str, Any] = field(default_factory=dict)
+    cumulative_gain_validated: float = 0.0
+    conc_sweep_enabled: bool = True
+    conc_sweep_concs: list[int] = field(default_factory=lambda: [1, 2, 4])
+    conc_sweep_total_budget_sec: int = 60
+    conc_sweep_variant_timeout_sec: int = 30
+    save_count: int = 0
+
+    def save(self, _session_dir: Path | None) -> None:
+        self.save_count += 1
+
+    def record_conc_sweep(self, result: dict[str, Any]) -> None:
+        self.last_conc_sweep = {
+            "status": str(result.get("status") or "succeeded"),
+            "skip_reason": str(result.get("skip_reason") or ""),
+            "was_skipped": bool(result.get("was_skipped", False)),
+        }
+
+
+class _StubTaskRegistry:
+    """create_or_return_existing double, keyed by idempotency_key."""
+
+    def __init__(self):
+        self._tasks: dict[str, Any] = {}
+
+    async def create_or_return_existing(
+        self,
+        *,
+        kind: str,
+        params: dict,
+        idempotency_key: str,
+        requires_lanes: list | None = None,
+        allowed_tools: list | None = None,
+        side_effects: list | None = None,
+        lease_ttl_sec: int = 0,
+        task_id: str | None = None,
+    ):
+        from hyperloom.orchestrator.state.task_registry import Task
+
+        existing = self._tasks.get(idempotency_key)
+        if existing is not None:
+            return existing, True
+        import uuid as _uuid
+
+        task = Task(
+            task_id=task_id or _uuid.uuid4().hex,
+            kind=kind,
+            state="queued",
+            params=dict(params),
+            idempotency_key=idempotency_key,
+        )
+        self._tasks[idempotency_key] = task
+        return task, False
+
+
+@pytest.fixture
+def coord(tmp_path: Path):
+    """Lean Coordinator stub for hook unit tests."""
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    c.shared_state = _BareState()
+    c.tasks = _StubTaskRegistry()
+    c.knowledge_plane = None
+    c.role_registry = {"kernel_agent": object()}
+    return c
+
+
+@pytest.mark.asyncio
+async def test_drain_pending_keep_integrates_records_result_once(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """SWEEP entry drain must record integrate results so the same KEEP is not retried until cap."""
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    c.shared_state = SharedState(
+        baseline_tput=100.0,
+        current_best={"action": "baseline", "tput": 100.0},
+    )
+    c.shared_state.kernel_opt_attempts = {
+        "k004": {
+            "last_decision": "KEEP",
+            "last_micro_speedup": 4.21,
+            "last_source_file": "/tmp/kernel.cu",
+        },
+    }
+    calls: list[str] = []
+
+    async def _fake_integrate_handler(payload, *, session_dir):
+        calls.append(payload["kernel_id"])
+        return {
+            "status": "ok",
+            "decision": "KEEP",
+            "kernel_id": payload["kernel_id"],
+            "patch_path": "/tmp/optimized.cu",
+            "target_file": "/tmp/kernel.cu",
+            "base_tput": 100.0,
+            "new_tput": 102.0,
+            "gain_pct": 2.0,
+            "workspace": str(tmp_path / "integrate-k004"),
+        }
+
+    async def _noop_roofline(*, reason: str):
+        return None
+
+    monkeypatch.setattr(
+        "hyperloom.orchestrator.kernel.request_handlers.integrate_handler",
+        _fake_integrate_handler,
+    )
+    c.phase_kernel._maybe_enqueue_watermark_roofline = _noop_roofline
+
+    await c._drain_pending_keep_integrates()
+
+    assert calls == ["k004"]
+    assert c.shared_state.kernel_integrate_attempts
+    assert c.shared_state.next_pending_keep_kernel_id() == ""
+    assert c.shared_state.current_best["action"] == "integrate"
+    assert c.shared_state.current_best["kernel_id"] == "k004"
+
+
+def test_pending_keep_kernel_ids_prioritize_trace_impact_over_micro():
+    """E2E integrate order should prefer trace impact over isolated micro speedup."""
+    state = SharedState()
+    state.last_trace_analyze = {
+        "hot_kernels_top15": [
+            {"kernel_id": "k001", "gpu_pct": 60.0},
+            {"kernel_id": "k004", "gpu_pct": 10.0},
+        ],
+    }
+    state.kernel_opt_attempts = {
+        "k004": {
+            "last_decision": "KEEP",
+            "last_micro_speedup": 4.21,
+            "last_source_file": "/tmp/rmsnorm.cu",
+        },
+        "k001": {
+            "last_decision": "KEEP",
+            "last_micro_speedup": 1.51,
+            "last_source_file": "/tmp/moe.cu",
+        },
+    }
+
+    assert state.pending_keep_kernel_ids() == ["k001", "k004"]
+    assert state.next_pending_keep_kernel_id() == "k001"
+
+
+def test_pending_keep_kernel_ids_do_not_retry_needs_review():
+    """A recorded NEEDS_REVIEW attempt should not auto-rerun the same patch."""
+    state = SharedState()
+    state.kernel_opt_attempts = {
+        "k004": {
+            "last_decision": "KEEP",
+            "last_micro_speedup": 4.21,
+            "last_source_file": "/tmp/rmsnorm.cu",
+        },
+        "k001": {
+            "last_decision": "KEEP",
+            "last_micro_speedup": 1.51,
+            "last_source_file": "/tmp/moe.cu",
+        },
+    }
+    state.record_kernel_integrate_result(
+        {
+            "status": "ok",
+            "decision": "NEEDS_REVIEW",
+            "kernel_id": "k004",
+            "patch_path": "/tmp/k004_opt.cu",
+            "target_file": "/tmp/rmsnorm.cu",
+            "new_tput": 100.8,
+            "gain_pct": 0.8,
+            "workspace": "/tmp/integrate-k004",
+        }
+    )
+
+    assert state.pending_keep_kernel_ids() == ["k001"]
+    assert state.next_pending_keep_kernel_id() == "k001"
+
+
+def _patch_stack_validation_internals(monkeypatch, *, new_tput: float, revert_status: str = "ok"):
+    """Stub apply/revert/bench so the real stack-validation decision path runs."""
+    import hyperloom.orchestrator.kernel.request_handlers as krh
+    import hyperloom.orchestrator.actions.executors.baseline as baseline_mod
+    import hyperloom.orchestrator.actions.executors.benchmark_result as br
+
+    def _fake_apply(payload, *, session_dir, kernel_id):
+        return {"status": "ok", "kernel_id": kernel_id, "manifest_path": None}
+
+    def _fake_revert(applied):
+        return {"status": revert_status}
+
+    class _FakeBaselineExecutor:
+        default_timeout_sec = baseline_mod.BASELINE_DEFAULT_TIMEOUT_SEC
+
+        def __init__(self, *, session_dir):
+            self.session_dir = session_dir
+
+        async def __call__(self, ctx):
+            return {
+                "output_throughput": new_tput,
+                "report_path": "/tmp/report",
+                "workspace": "/tmp/workspace",
+            }
+
+    monkeypatch.setattr(krh, "_maybe_apply_kernel_patch", _fake_apply)
+    monkeypatch.setattr(krh, "_maybe_revert_kernel_patch", _fake_revert)
+    monkeypatch.setattr(baseline_mod, "BaselineExecutor", _FakeBaselineExecutor)
+    monkeypatch.setattr(br, "is_valid_measurement", lambda result: True)
+
+
+def _stack_validation_coordinator(tmp_path: Path) -> Coordinator:
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    # current_best already banks a +10% KEEP'd kernel
+    c.shared_state = SharedState(
+        baseline_tput=100.0,
+        baseline_config_path=str(tmp_path / "base.yaml"),
+        current_best={"action": "integrate", "tput": 110.0, "kernel_id": "k_prev"},
+    )
+    c.shared_state.optimization_stack = [
+        {"action": "integrate", "kernel_id": "k_prev", "tput": 110.0},
+    ]
+    for kid, gain in (("k001", 0.6), ("k004", 0.8)):
+        c.shared_state.record_kernel_integrate_result(
+            {
+                "status": "ok",
+                "decision": "NEEDS_REVIEW",
+                "kernel_id": kid,
+                "patch_path": f"/tmp/{kid}_opt.cu",
+                "target_file": f"/tmp/{kid}.cu",
+                "new_tput": 100.0 + gain,
+                "gain_pct": gain,
+                "workspace": f"/tmp/integrate-{kid}",
+            }
+        )
+    return c
+
+
+@pytest.mark.asyncio
+async def test_stack_validation_reverts_when_no_gain_over_current_best(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Stack worse than current_best (110) but above baseline (100) must REVERT.
+
+    The KEEP decision is incremental over current_best, not total over baseline:
+    new_tput=109 is +9% vs baseline yet -0.9% vs current_best, so the stack adds
+    no value and must be reverted.
+    """
+    c = _stack_validation_coordinator(tmp_path)
+    stack = c._stack_entries_for_validation(["k001", "k004"])
+    _patch_stack_validation_internals(monkeypatch, new_tput=109.0)
+
+    result = await c._run_kernel_stack_validation_e2e(stack)
+
+    assert result["decision"] == "REVERT"
+    assert result["gain_pct"] == pytest.approx(9.0)
+    assert result["stack_incremental_gain_pct"] == pytest.approx(-0.9090909, rel=1e-3)
+    assert result["revert_result"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_stack_validation_surfaces_partial_inner_revert(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A tampered inner manifest can make one stack revert partial; surface it."""
+    c = _stack_validation_coordinator(tmp_path)
+    stack = c._stack_entries_for_validation(["k001", "k004"])
+    _patch_stack_validation_internals(monkeypatch, new_tput=109.0, revert_status="partial")
+
+    result = await c._run_kernel_stack_validation_e2e(stack)
+
+    assert result["decision"] == "REVERT"
+    assert result["revert_result"]["status"] == "partial"
+    assert all(r["status"] == "partial" for r in result["revert_result"]["stack_reverts"])
+
+
+@pytest.mark.asyncio
+async def test_stack_validation_keeps_on_positive_increment_over_current_best(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A real increment over current_best (110 -> 112, +1.8%) must KEEP."""
+    c = _stack_validation_coordinator(tmp_path)
+    stack = c._stack_entries_for_validation(["k001", "k004"])
+    _patch_stack_validation_internals(monkeypatch, new_tput=112.0)
+
+    result = await c._run_kernel_stack_validation_e2e(stack)
+
+    assert result["decision"] == "KEEP"
+    assert result["gain_pct"] == pytest.approx(12.0)
+    assert result["stack_incremental_gain_pct"] == pytest.approx(1.8181818, rel=1e-3)
+    assert result["revert_result"]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_positive_needs_review_stack_validation_promotes_combo(tmp_path: Path):
+    """Two positive sub-threshold kernel patches should get one combined E2E validation."""
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    c.shared_state = SharedState(
+        baseline_tput=100.0,
+        current_best={"action": "baseline", "tput": 100.0},
+    )
+    for kid, gain in (("k001", 0.6), ("k004", 0.8)):
+        c.shared_state.record_kernel_integrate_result(
+            {
+                "status": "ok",
+                "decision": "NEEDS_REVIEW",
+                "kernel_id": kid,
+                "patch_path": f"/tmp/{kid}_opt.cu",
+                "target_file": f"/tmp/{kid}.cu",
+                "new_tput": 100.0 + gain,
+                "gain_pct": gain,
+                "workspace": f"/tmp/integrate-{kid}",
+            }
+        )
+
+    validation_calls = 0
+
+    async def _fake_stack_validation(entries):
+        nonlocal validation_calls
+        validation_calls += 1
+        assert {e["kernel_id"] for e in entries} == {"k001", "k004"}
+        return {
+            "status": "ok",
+            "decision": "KEEP",
+            "kernel_id": "k001+k004",
+            "patch_path": "/tmp/k001_opt.cu+/tmp/k004_opt.cu",
+            "target_file": "/tmp/k001.cu+/tmp/k004.cu",
+            "base_tput": 100.0,
+            "new_tput": 102.0,
+            "gain_pct": 2.0,
+            "workspace": str(tmp_path / "integrate-stack"),
+            "apply_result": {"status": "ok"},
+            "stack_kernel_ids": ["k001", "k004"],
+            "stack_validation": True,
+        }
+
+    async def _noop_roofline(*, reason: str):
+        return None
+
+    c.phase_kernel_stack._run_kernel_stack_validation_e2e = _fake_stack_validation
+    c.phase_kernel._maybe_enqueue_watermark_roofline = _noop_roofline
+
+    await c._maybe_validate_positive_needs_review_stack()
+
+    assert c.shared_state.current_best["action"] == "integrate"
+    assert c.shared_state.current_best["kernel_id"] == "k001+k004"
+    assert c.shared_state.cumulative_gain_validated == pytest.approx(2.0)
+    assert validation_calls == 1
+    resolved_entries = [
+        entry
+        for entry in c.shared_state.kernel_integrate_attempts.values()
+        if entry.get("kernel_id") in {"k001", "k004"}
+    ]
+    assert all(entry["stack_resolved"] is True for entry in resolved_entries)
+    assert {entry["stack_validation_kernel_id"] for entry in resolved_entries} == {"k001+k004"}
+
+    # Re-invoking must be a no-op (idempotent): the call count must not advance.
+    calls_before_recall = validation_calls
+    await c._maybe_validate_positive_needs_review_stack()
+
+    assert validation_calls == calls_before_recall
+    stack_entries = [
+        item
+        for item in c.shared_state.optimization_stack
+        if isinstance(item, dict) and item.get("kernel_id") == "k001+k004"
+    ]
+    assert stack_entries
+    assert stack_entries[0].get("stack_kernel_ids") == ["k001", "k004"]
+
+
+@pytest.mark.asyncio
+async def test_recovers_pending_stack_validation_after_crash(tmp_path: Path):
+    """A saved pending stack result should finish promotion without re-applying."""
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    c.shared_state = SharedState(
+        baseline_tput=100.0,
+        current_best={"action": "baseline", "tput": 100.0},
+    )
+    for kid, gain in (("k001", 0.6), ("k004", 0.8)):
+        c.shared_state.record_kernel_integrate_result(
+            {
+                "status": "ok",
+                "decision": "NEEDS_REVIEW",
+                "kernel_id": kid,
+                "patch_path": f"/tmp/{kid}_opt.cu",
+                "target_file": f"/tmp/{kid}.cu",
+                "new_tput": 100.0 + gain,
+                "gain_pct": gain,
+                "workspace": f"/tmp/integrate-{kid}",
+            }
+        )
+    stack = c._stack_entries_for_validation(["k001", "k004"])
+    c._mark_stack_validation_in_progress(stack, "k001+k004")
+    c.shared_state.pending_stack_validation_result = {
+        "status": "ok",
+        "decision": "KEEP",
+        "kernel_id": "k001+k004",
+        "patch_path": "/tmp/k001_opt.cu+/tmp/k004_opt.cu",
+        "target_file": "/tmp/k001.cu+/tmp/k004.cu",
+        "base_tput": 100.0,
+        "new_tput": 102.0,
+        "gain_pct": 2.0,
+        "workspace": str(tmp_path / "integrate-stack"),
+        "apply_result": {"status": "ok"},
+        "stack_kernel_ids": ["k001", "k004"],
+        "stack_validation": True,
+    }
+    c.shared_state.save(tmp_path)
+
+    validation_calls = 0
+
+    async def _should_not_run(entries):
+        nonlocal validation_calls
+        validation_calls += 1
+        raise AssertionError("stack validation should not re-run during recovery")
+
+    async def _noop_roofline(*, reason: str):
+        return None
+
+    c.phase_kernel_stack._run_kernel_stack_validation_e2e = _should_not_run
+    c.phase_kernel._maybe_enqueue_watermark_roofline = _noop_roofline
+
+    await c._recover_interrupted_stack_validation()
+
+    assert validation_calls == 0
+    assert c.shared_state.current_best["kernel_id"] == "k001+k004"
+    assert not c.shared_state.pending_stack_validation_result
+    resolved = [
+        entry
+        for entry in c.shared_state.kernel_integrate_attempts.values()
+        if entry.get("kernel_id") in {"k001", "k004"}
+    ]
+    assert all(entry.get("stack_resolved") for entry in resolved)
+
+
+def test_positive_needs_review_integrates_skip_in_progress_entries():
+    """In-flight stack members must not be re-selected for another validation."""
+    c = Coordinator.__new__(Coordinator)
+    c.shared_state = SharedState()
+    c.shared_state.kernel_integrate_attempts = {
+        "k001": {
+            "kernel_id": "k001",
+            "patch_path": "/tmp/k001_opt.cu",
+            "target_file": "/tmp/k001.cu",
+            "last_decision": "NEEDS_REVIEW",
+            "best_gain_pct": 0.6,
+            "stack_validation_in_progress": True,
+        },
+        "k004": {
+            "kernel_id": "k004",
+            "patch_path": "/tmp/k004_opt.cu",
+            "target_file": "/tmp/k004.cu",
+            "last_decision": "NEEDS_REVIEW",
+            "best_gain_pct": 0.8,
+        },
+    }
+
+    eligible = c._positive_needs_review_integrates()
+    assert len(eligible) == 1
+    assert eligible[0]["kernel_id"] == "k004"
+
+
+@pytest.mark.asyncio
+async def test_on_enter_sweep_triggers_stack_validation_without_pending_keeps(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Stack validation must run even when has_keep_pending_integrate is False."""
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    c.shared_state = SharedState(
+        baseline_tput=100.0,
+        current_best={"action": "baseline", "tput": 100.0},
+    )
+    c.tasks = _StubTaskRegistry()
+    c.knowledge_plane = None
+    c.role_registry = {"kernel_agent": object()}
+    # All KEEPs already integrated as NEEDS_REVIEW — no pending KEEP.
+    for kid, gain in (("k001", 0.6), ("k004", 0.8)):
+        c.shared_state.record_kernel_integrate_result(
+            {
+                "status": "ok",
+                "decision": "NEEDS_REVIEW",
+                "kernel_id": kid,
+                "patch_path": f"/tmp/{kid}_opt.cu",
+                "target_file": f"/tmp/{kid}.cu",
+                "new_tput": 100.0 + gain,
+                "gain_pct": gain,
+                "workspace": f"/tmp/integrate-{kid}",
+            }
+        )
+    assert not c.shared_state.has_keep_pending_integrate
+
+    validation_calls = []
+
+    async def _fake_stack_validation(entries):
+        validation_calls.append([e["kernel_id"] for e in entries])
+        return {
+            "status": "ok",
+            "decision": "KEEP",
+            "kernel_id": "k001+k004",
+            "patch_path": "/tmp/k001_opt.cu+/tmp/k004_opt.cu",
+            "target_file": "/tmp/k001.cu+/tmp/k004.cu",
+            "base_tput": 100.0,
+            "new_tput": 102.0,
+            "gain_pct": 2.0,
+            "workspace": str(tmp_path / "integrate-stack"),
+            "apply_result": {"status": "ok"},
+            "stack_kernel_ids": ["k001", "k004"],
+            "stack_validation": True,
+        }
+
+    async def _noop_roofline(*, reason: str):
+        return None
+
+    c.phase_kernel_stack._run_kernel_stack_validation_e2e = _fake_stack_validation
+    c.phase_kernel._maybe_enqueue_watermark_roofline = _noop_roofline
+
+    await c._on_enter_sweep(from_phase="KERNEL")
+
+    assert len(validation_calls) == 1
+    assert c.shared_state.current_best["kernel_id"] == "k001+k004"
+
+
+@pytest.mark.asyncio
+async def test_drain_uses_current_best_tput_not_baseline(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Drain should pass current_best.tput (not baseline) so multi-KEEP gain is incremental."""
+    c = Coordinator.__new__(Coordinator)
+    c.session_dir = tmp_path
+    c.shared_state = SharedState(
+        baseline_tput=100.0,
+        current_best={"action": "integrate", "tput": 110.0, "kernel_id": "k_prev"},
+    )
+    c.shared_state.optimization_stack = [
+        {"action": "integrate", "kernel_id": "k_prev", "tput": 110.0},
+    ]
+    c.shared_state.kernel_opt_attempts = {
+        "k_new": {
+            "last_decision": "KEEP",
+            "last_micro_speedup": 2.0,
+            "last_source_file": "/tmp/new.cu",
+        },
+    }
+    captured_payloads = []
+
+    async def _fake_integrate_handler(payload, *, session_dir):
+        captured_payloads.append(payload)
+        return {
+            "status": "ok",
+            "decision": "KEEP",
+            "kernel_id": payload["kernel_id"],
+            "patch_path": "/tmp/new_opt.cu",
+            "target_file": "/tmp/new.cu",
+            "base_tput": payload.get("base_tput", 0.0),
+            "new_tput": 112.0,
+            "gain_pct": (112.0 / payload.get("base_tput", 100.0) - 1) * 100,
+            "workspace": str(tmp_path / "integrate-k_new"),
+        }
+
+    async def _noop_roofline(*, reason: str):
+        return None
+
+    monkeypatch.setattr(
+        "hyperloom.orchestrator.kernel.request_handlers.integrate_handler",
+        _fake_integrate_handler,
+    )
+    c.phase_kernel._maybe_enqueue_watermark_roofline = _noop_roofline
+
+    await c._drain_pending_keep_integrates()
+
+    assert len(captured_payloads) == 1
+    # use current_best.tput (110.0), not baseline (100.0)
+    assert captured_payloads[0]["base_tput"] == 110.0
+
+
+def test_build_sweep_params_defaults_when_no_recipe():
+    """No warm_start_recipe → SKILL.md defaults + source='skill_md_default'."""
+    from hyperloom.orchestrator.actions.executors.sweep import (
+        DEFAULT_CONC_VALUES,
+        DEFAULT_ISL_OSL,
+        DEFAULT_NUM_PROMPTS_FACTOR,
+    )
+
+    state = _BareState()
+    out = Coordinator._build_sweep_params_from_recipe(state)
+    assert out["source"] == "skill_md_default"
+    assert out["conc_values"] == DEFAULT_CONC_VALUES
+    assert out["isl_osl_configs"] == DEFAULT_ISL_OSL
+    assert out["num_prompts_factor"] == DEFAULT_NUM_PROMPTS_FACTOR
+
+
+def test_build_sweep_params_full_recipe_override():
+    """Recipe with all three fields → all three overridden + source=recipe_kb."""
+    state = _BareState(
+        warm_start_recipe={
+            "sweep_grid": {
+                "conc_values": [8, 32, 128],
+                "isl_osl_configs": ["1024:1024", "4096:4096"],
+                "num_prompts_factor": 7,
+            },
+        },
+    )
+    out = Coordinator._build_sweep_params_from_recipe(state)
+    assert out["source"] == "recipe_kb"
+    assert out["conc_values"] == [8, 32, 128]
+    assert out["isl_osl_configs"] == ["1024:1024", "4096:4096"]
+    assert out["num_prompts_factor"] == 7
+
+
+def test_build_sweep_params_partial_recipe_per_field_fallback():
+    """Recipe overriding only conc_values → that field from recipe, the rest from defaults, source=recipe_kb."""
+    from hyperloom.orchestrator.actions.executors.sweep import (
+        DEFAULT_ISL_OSL,
+        DEFAULT_NUM_PROMPTS_FACTOR,
+    )
+
+    state = _BareState(
+        warm_start_recipe={"sweep_grid": {"conc_values": [256]}},
+    )
+    out = Coordinator._build_sweep_params_from_recipe(state)
+    assert out["source"] == "recipe_kb"
+    assert out["conc_values"] == [256]
+    assert out["isl_osl_configs"] == DEFAULT_ISL_OSL
+    assert out["num_prompts_factor"] == DEFAULT_NUM_PROMPTS_FACTOR
+
+
+def test_build_sweep_params_accepts_isl_osl_as_pair_lists():
+    """[[isl, osl], [isl, osl]] form converts to ['isl:osl', ...]."""
+    state = _BareState(
+        warm_start_recipe={
+            "sweep_grid": {"isl_osl_configs": [[2048, 512], [8192, 1024]]},
+        },
+    )
+    out = Coordinator._build_sweep_params_from_recipe(state)
+    assert out["isl_osl_configs"] == ["2048:512", "8192:1024"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [None, [], "foo", [None], ["a", "b"], "1,2,3"],
+    ids=["none", "empty", "string", "list_of_none", "non_int_strings", "csv_string"],
+)
+def test_build_sweep_params_rejects_malformed_conc_values(bad):
+    """conc_values must be a non-empty list of int-coercible values;
+    anything else → fallback to default."""
+    from hyperloom.orchestrator.actions.executors.sweep import (
+        DEFAULT_CONC_VALUES,
+    )
+
+    state = _BareState(warm_start_recipe={"sweep_grid": {"conc_values": bad}})
+    out = Coordinator._build_sweep_params_from_recipe(state)
+    assert out["conc_values"] == DEFAULT_CONC_VALUES
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [None, [], "1024:1024", [None], [{"isl": 1024}], [[1024]]],
+    ids=["none", "empty", "string", "list_of_none", "dict_inside", "list_wrong_arity"],
+)
+def test_build_sweep_params_rejects_malformed_isl_osl(bad):
+    """Non-list / wrong-shape isl_osl_configs → default fallback."""
+    from hyperloom.orchestrator.actions.executors.sweep import (
+        DEFAULT_ISL_OSL,
+    )
+
+    state = _BareState(warm_start_recipe={"sweep_grid": {"isl_osl_configs": bad}})
+    out = Coordinator._build_sweep_params_from_recipe(state)
+    assert out["isl_osl_configs"] == DEFAULT_ISL_OSL
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [0, -1, "x", None],
+    ids=["zero", "negative", "string", "none"],
+)
+def test_build_sweep_params_rejects_non_positive_num_prompts_factor(bad):
+    """num_prompts_factor must be a positive int; zero / negative / non-int
+    → default fallback."""
+    from hyperloom.orchestrator.actions.executors.sweep import (
+        DEFAULT_NUM_PROMPTS_FACTOR,
+    )
+
+    state = _BareState(
+        warm_start_recipe={"sweep_grid": {"num_prompts_factor": bad}},
+    )
+    out = Coordinator._build_sweep_params_from_recipe(state)
+    assert out["num_prompts_factor"] == DEFAULT_NUM_PROMPTS_FACTOR
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [None, "raw text", 42, [], {"sweep_grid": "not a dict"}],
+    ids=["none", "string", "int", "list", "sweep_grid_not_dict"],
+)
+def test_build_sweep_params_non_dict_recipe_falls_back(bad):
+    """A non-dict recipe (or non-dict sweep_grid) → defaults."""
+    state = _BareState(warm_start_recipe=bad)  # type: ignore[arg-type]
+    out = Coordinator._build_sweep_params_from_recipe(state)
+    assert out["source"] == "skill_md_default"
+
+
+# 2. _enqueue_internal_sweep_task — params inheritance
+@pytest.mark.asyncio
+async def test_enqueue_internal_sweep_task_inherits_baseline_config(coord):
+    coord.shared_state.baseline_config_path = "/tmp/baseline.yaml"
+    coord.shared_state.current_best = {"extra_server_args": "--mla 1"}
+    coord.shared_state.last_baseline = {"benchmark_script": "sglang_mi300x.sh"}
+    task = await coord._enqueue_internal_sweep_task(reason="phase_entry")
+    assert task.kind == "sweep"
+    assert task.idempotency_key == "internal-sweep-phase_entry"
+    assert task.params["source"] == "skill_md_default"
+    assert task.params["reason"] == "phase_entry"
+    assert task.params["config_path"] == "/tmp/baseline.yaml"
+    assert task.params["base_extra_args"] == "--mla 1"
+    assert task.params["benchmark_script"] == "sglang_mi300x.sh"
+    # Grid params present so executor doesn't fall back to its own defaults
+    assert isinstance(task.params["conc_values"], list)
+    assert isinstance(task.params["isl_osl_configs"], list)
+    assert isinstance(task.params["num_prompts_factor"], int)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_internal_sweep_task_omits_empty_strings(coord):
+    """Empty extra_server_args / benchmark_script must not land in params."""
+    coord.shared_state.current_best = {"extra_server_args": ""}
+    coord.shared_state.last_baseline = {"benchmark_script": ""}
+    task = await coord._enqueue_internal_sweep_task(reason="phase_entry")
+    assert "base_extra_args" not in task.params
+    assert "benchmark_script" not in task.params
+
+
+@pytest.mark.asyncio
+async def test_enqueue_internal_sweep_task_carries_the_arg_mode_controls(coord):
+    """A ``replace`` current_best reaches the sweep, which assembles variants from it.
+
+    ``_build_grid`` honours ``base_args_mode`` / ``base_remove_args``, so omitting
+    them made the sweep append onto flags the champion had deliberately replaced.
+    """
+    coord.shared_state.current_best = {
+        "tput": 1000.0,
+        "extra_server_args": "--mla 1",
+        "remove_args": ["--chunked-prefill-size"],
+        "args_mode": "replace",
+    }
+    task = await coord._enqueue_internal_sweep_task(reason="phase_entry")
+    assert task.params["base_extra_args"] == "--mla 1"
+    assert task.params["base_remove_args"] == ["--chunked-prefill-size"]
+    assert task.params["base_args_mode"] == "replace"
+
+
+@pytest.mark.asyncio
+async def test_enqueue_internal_sweep_task_recipe_kb_recipe_propagates(coord):
+    """Recipe-driven grid surfaces as source='recipe_kb' on the task."""
+    coord.shared_state.warm_start_recipe = {
+        "sweep_grid": {
+            "conc_values": [128],
+            "isl_osl_configs": ["1024:1024"],
+        },
+    }
+    task = await coord._enqueue_internal_sweep_task(reason="phase_entry")
+    assert task.params["source"] == "recipe_kb"
+    assert task.params["conc_values"] == [128]
+    assert task.params["isl_osl_configs"] == ["1024:1024"]
+
+
+# 3. _on_enter_sweep hook
+@pytest.mark.asyncio
+async def test_on_enter_sweep_enqueues_and_stamps_evidence(coord):
+    """Happy path: the hook enqueues conc_sweep and stamps phase evidence."""
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "reason": "plateau_kernel", "evidence": {}},
+    ]
+    await coord._on_enter_sweep(from_phase="KERNEL")
+    assert "internal-conc_sweep-phase_entry" in coord.tasks._tasks
+    task = coord.tasks._tasks["internal-conc_sweep-phase_entry"]
+    assert task.kind == "conc_sweep"
+
+    evidence = coord.shared_state.phase_history[-1]["evidence"]
+    assert evidence["auto_conc_sweep_enqueued"] is True
+    assert evidence["auto_conc_sweep_task_id"] == task.task_id
+    assert evidence["auto_conc_sweep_concs"] == [1, 2, 4]
+
+
+@pytest.mark.asyncio
+async def test_on_enter_sweep_ignores_full_sweep_recipe_for_auto_path(coord):
+    """The automatic path goes straight to conc_sweep; recipe sweep_grid is manual-only."""
+    coord.shared_state.warm_start_recipe = {
+        "sweep_grid": {
+            "conc_values": [8, 32],
+            "isl_osl_configs": ["1024:1024", "4096:4096", "8192:1024"],
+        },
+    }
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "reason": "plateau_kernel", "evidence": {}},
+    ]
+    await coord._on_enter_sweep(from_phase="KERNEL")
+    assert "internal-conc_sweep-phase_entry" in coord.tasks._tasks
+    assert "internal-sweep-phase_entry" not in coord.tasks._tasks
+    evidence = coord.shared_state.phase_history[-1]["evidence"]
+    assert evidence["auto_conc_sweep_concs"] == [1, 2, 4]
+    assert "auto_sweep_grid_source" not in evidence
+
+
+@pytest.mark.asyncio
+async def test_on_enter_sweep_idempotent_on_reentry(coord):
+    """Re-entering SWEEP twice hits the same conc_sweep idempotency_key."""
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "reason": "plateau_kernel", "evidence": {}},
+    ]
+    await coord._on_enter_sweep(from_phase="KERNEL")
+    task1 = coord.tasks._tasks["internal-conc_sweep-phase_entry"]
+    coord.shared_state.phase_history.append(
+        {"to_phase": "SWEEP", "reason": "re_entry_test", "evidence": {}},
+    )
+    await coord._on_enter_sweep(from_phase="SWEEP")
+    task2 = coord.tasks._tasks["internal-conc_sweep-phase_entry"]
+    assert task1 is task2
+    assert len(coord.tasks._tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_enter_sweep_failure_records_evidence(coord, monkeypatch):
+    """If conc_sweep enqueue raises, the hook records a terminal skip."""
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("simulated DB outage")
+
+    monkeypatch.setattr(coord.phase_sweep, "_enqueue_internal_conc_sweep_task", _boom)
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "reason": "plateau_kernel", "evidence": {}},
+    ]
+    # Should not raise
+    await coord._on_enter_sweep(from_phase="KERNEL")
+    evidence = coord.shared_state.phase_history[-1]["evidence"]
+    assert "auto_conc_sweep_error" in evidence
+    assert "simulated DB outage" in evidence["auto_conc_sweep_error"]
+    # No task was enqueued
+    assert coord.tasks._tasks == {}
+    assert coord.shared_state.last_conc_sweep["status"] == "skipped"
+    assert coord.shared_state.last_conc_sweep["skip_reason"] == "enqueue_failed"
+    assert coord.shared_state.save_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_on_enter_sweep_none_records_terminal_skip(coord, monkeypatch):
+    """If the enqueue helper returns None, SWEEP records a terminal skip."""
+
+    async def _none(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(coord.phase_sweep, "_enqueue_internal_conc_sweep_task", _none)
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "reason": "plateau_kernel", "evidence": {}},
+    ]
+    await coord._on_enter_sweep(from_phase="KERNEL")
+    evidence = coord.shared_state.phase_history[-1]["evidence"]
+    assert evidence["auto_conc_sweep_error"] == "enqueue_returned_none"
+    assert coord.tasks._tasks == {}
+    assert coord.shared_state.last_conc_sweep["status"] == "skipped"
+    assert coord.shared_state.last_conc_sweep["skip_reason"] == "enqueue_returned_none"
+
+
+@pytest.mark.asyncio
+async def test_on_enter_sweep_skips_when_conc_sweep_disabled(coord):
+    """If conc_sweep is disabled, SWEEP records a terminal skip instead of idling."""
+    coord.shared_state.conc_sweep_enabled = False
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "reason": "cycle_reloop", "evidence": {}},
+    ]
+    await coord._on_enter_sweep(from_phase="KERNEL")
+    assert coord.tasks._tasks == {}
+    evidence = coord.shared_state.phase_history[-1]["evidence"]
+    assert evidence["auto_conc_sweep_skipped"] == "disabled"
+    assert "auto_sweep_enqueued" not in evidence
+    assert coord.shared_state.last_conc_sweep["status"] == "skipped"
+    assert coord.shared_state.last_conc_sweep["skip_reason"] == "disabled"
+    assert coord.shared_state.last_conc_sweep["was_skipped"] is True
+    assert coord.shared_state.save_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_on_enter_sweep_skips_when_no_validated_gain_since_last_conc_sweep(coord):
+    """Cyclic reloop does not rerun conc_sweep without a new validated gain."""
+    coord.shared_state.cumulative_gain_validated = 12.5
+    coord.shared_state.last_conc_sweep_watermark = {
+        "ts": "2026-01-01T00:00:00Z",
+        "cumulative_gain_validated_at_record": 12.5,
+    }
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "reason": "cycle_reloop", "evidence": {}},
+    ]
+    await coord._on_enter_sweep(from_phase="KERNEL")
+    assert coord.tasks._tasks == {}
+    evidence = coord.shared_state.phase_history[-1]["evidence"]
+    assert evidence["auto_conc_sweep_skipped"] == "no_validated_gain_since_last_conc_sweep"
+    assert evidence["auto_conc_sweep_skipped_validated_gain"] == 12.5
+    assert coord.shared_state.last_conc_sweep["status"] == "skipped"
+    assert coord.shared_state.last_conc_sweep["skip_reason"] == "no_validated_gain_since_last_conc_sweep"
+    assert coord.shared_state.save_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_on_enter_sweep_runs_when_validated_gain_improved(coord):
+    """A new validated gain after the last conc_sweep watermark dispatches conc_sweep."""
+    coord.shared_state.cumulative_gain_validated = 15.0
+    coord.shared_state.last_conc_sweep_watermark = {
+        "ts": "2026-01-01T00:00:00Z",
+        "cumulative_gain_validated_at_record": 12.5,
+    }
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "reason": "cycle_reloop", "evidence": {}},
+    ]
+    await coord._on_enter_sweep(from_phase="KERNEL")
+    assert "internal-conc_sweep-phase_entry" in coord.tasks._tasks
+    evidence = coord.shared_state.phase_history[-1]["evidence"]
+    assert evidence["auto_conc_sweep_enqueued"] is True
+
+
+@pytest.mark.asyncio
+async def test_on_enter_sweep_first_sweep_runs_without_prior_watermark(coord):
+    """The first SWEEP entry dispatches conc_sweep directly."""
+    coord.shared_state.cumulative_gain_validated = 0.0
+    coord.shared_state.last_sweep = {}
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "reason": "plateau_kernel", "evidence": {}},
+    ]
+    await coord._on_enter_sweep(from_phase="KERNEL")
+    assert "internal-conc_sweep-phase_entry" in coord.tasks._tasks
+
+
+# 4. End-to-end via real Coordinator
+@pytest.mark.asyncio
+async def test_phase_transition_into_sweep_enqueues_conc_sweep_e2e(tmp_path: Path):
+    """End-to-end: a SWEEP transition persists the conc_sweep task."""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    idle_plan = ScriptedPlan(turns=[MockTurn(intents=[])])
+    backends = {
+        "orchestration": MockBackend(idle_plan),
+        "kernel_agent": MockBackend(idle_plan),
+        "critic": MockBackend(idle_plan),
+        "robustness": MockBackend(idle_plan),
+    }
+    coord = Coordinator(
+        session_dir=session_dir,
+        backends=backends,
+        role_registry=default_role_registry(),
+        recipe_kb=None,
+        knowledge_plane=None,
+    )
+    # Seed state at KERNEL boundary as if a plateau_kernel just fired
+    coord.shared_state.phase = "KERNEL"
+    coord.shared_state.kernel_enabled = True
+    coord.shared_state.baseline_tput = 100.0
+    coord.shared_state.cumulative_gain = 12.0
+    coord.shared_state.last_profile_trace = "/tmp/dummy.trace.json.gz"
+    coord.shared_state.phase_history = [
+        {"to_phase": "EXPLORE", "evidence": {}, "reason": "prelude_done"},
+        {"to_phase": "KERNEL", "evidence": {}, "reason": "plateau_explore"},
+    ]
+
+    coord.shared_state.record_phase_transition(
+        to_phase="SWEEP",
+        reason="plateau_kernel",
+        evidence={"trigger": "test_e2e"},
+    )
+    await coord._on_phase_entered(from_phase="KERNEL", to_phase="SWEEP")
+
+    rows = await coord.tasks.db.fetchall(
+        "SELECT * FROM tasks WHERE idempotency_key=?",
+        ("internal-conc_sweep-phase_entry",),
+    )
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "conc_sweep"
+    assert rows[0]["state"] == "queued"
+
+    last_history = coord.shared_state.phase_history[-1]
+    assert last_history["to_phase"] == "SWEEP"
+    evidence = last_history.get("evidence") or {}
+    assert evidence.get("auto_conc_sweep_enqueued") is True
+    assert evidence.get("auto_conc_sweep_task_id")
+
+
+@pytest.mark.asyncio
+async def test_phase_transition_explore_to_sweep_no_kernel_mode(tmp_path: Path):
+    """``--no-kernel`` runs go EXPLORE → SWEEP directly; conc_sweep still enqueues."""
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    idle_plan = ScriptedPlan(turns=[MockTurn(intents=[])])
+    backends = {
+        "orchestration": MockBackend(idle_plan),
+        "critic": MockBackend(idle_plan),
+        "robustness": MockBackend(idle_plan),
+    }
+    role_registry = {k: v for k, v in default_role_registry().items() if k != "kernel_agent"}
+    coord = Coordinator(
+        session_dir=session_dir,
+        backends=backends,
+        role_registry=role_registry,
+        recipe_kb=None,
+        knowledge_plane=None,
+    )
+    coord.shared_state.kernel_enabled = False
+    coord.shared_state.phase_history = [
+        {"to_phase": "SWEEP", "evidence": {}, "reason": "test_forced"},
+    ]
+    await coord._on_phase_entered(from_phase="EXPLORE", to_phase="SWEEP")
+    rows = await coord.tasks.db.fetchall(
+        "SELECT * FROM tasks WHERE idempotency_key=?",
+        ("internal-conc_sweep-phase_entry",),
+    )
+    assert len(rows) == 1, "conc_sweep auto-enqueue must run in --no-kernel mode too"
+
+
+# 5. Idempotency key structural cross-check
+def test_internal_sweep_idempotency_key_does_not_collide_with_llm_path():
+    """The manual sweep helper key must never collide with the LLM approved key."""
+    internal_key = "internal-sweep-phase_entry"
+    # Mirror the format _materialize_approved_proposal builds
+    llm_key = "approved-msg_abc123"
+    assert internal_key != llm_key
+    assert not llm_key.startswith("internal-")
+    assert not internal_key.startswith("approved-")
+
+
+# 6. PolicyGate sweep_phase_singleton rule
+class _SweepSingletonState:
+    """SharedState stand-in carrying just the fields the ``sweep_phase_singleton`` rule reads."""
+
+    def __init__(self, phase_history=None):
+        self.phase_history = list(phase_history or [])
+
+
+def _sweep_phase_row(*, auto_sweep_task_id: str = "") -> dict:
+    """Build a SWEEP phase row carrying the auto conc_sweep evidence."""
+    evidence: dict = {}
+    if auto_sweep_task_id:
+        evidence["auto_conc_sweep_task_id"] = auto_sweep_task_id
+        evidence["auto_conc_sweep_enqueued"] = True
+    return {
+        "to_phase": "SWEEP",
+        "from_phase": "EXPLORE",
+        "reason": "explore_done",
+        "evidence": evidence,
+    }
+
+
+def _make_policy_gate(*, shared_state):
+    """Plain PolicyGate wired to the role registry + the test's SharedState double."""
+    from hyperloom.orchestrator.roles.agent_role import (
+        default_role_registry,
+    )
+    from hyperloom.orchestrator.policy.gate import PolicyGate
+
+    return PolicyGate(
+        role_registry=default_role_registry(),
+        shared_state=shared_state,
+    )
+
+
+def test_sweep_singleton_denies_delegate_after_auto_enqueue_stamped():
+    """Once auto conc_sweep is stamped, LLM full sweep is denied."""
+    from hyperloom.orchestrator.policy.gate import PolicyDenied
+
+    state = _SweepSingletonState(
+        phase_history=[_sweep_phase_row(auto_sweep_task_id="auto-sweep-abc123")],
+    )
+    gate = _make_policy_gate(shared_state=state)
+
+    with pytest.raises(PolicyDenied) as excinfo:
+        gate._validate_sweep_singleton(
+            payload={"action_name": "sweep", "params": {}},
+            intent_kind="delegate",
+        )
+    assert excinfo.value.rule == "sweep_phase_singleton"
+    # Hint must mention the bypass switch
+    assert "bypass_sweep_singleton" in (excinfo.value.hint or "")
+
+
+def test_sweep_singleton_denies_propose_action_after_auto_enqueue_stamped():
+    """Same shape on the propose_action channel — defense in depth."""
+    from hyperloom.orchestrator.policy.gate import PolicyDenied
+
+    state = _SweepSingletonState(
+        phase_history=[_sweep_phase_row(auto_sweep_task_id="auto-sweep-xyz")],
+    )
+    gate = _make_policy_gate(shared_state=state)
+
+    with pytest.raises(PolicyDenied) as excinfo:
+        gate._validate_sweep_singleton(
+            payload={"action_name": "sweep", "params": {}},
+            intent_kind="propose_action",
+        )
+    assert excinfo.value.rule == "sweep_phase_singleton"
+
+
+def test_sweep_singleton_inert_before_auto_enqueue_stamps_evidence():
+    """Race-window: a SWEEP row without auto conc_sweep evidence keeps the rule inert."""
+    state = _SweepSingletonState(
+        phase_history=[_sweep_phase_row(auto_sweep_task_id="")],
+    )
+    gate = _make_policy_gate(shared_state=state)
+
+    # Must NOT raise.
+    gate._validate_sweep_singleton(
+        payload={"action_name": "sweep", "params": {}},
+        intent_kind="delegate",
+    )
+
+
+def test_sweep_singleton_inert_outside_sweep_phase():
+    """When the latest phase row isn't SWEEP, the rule stays silent (``_validate_phase_action`` fires instead)."""
+    explore_row = {
+        "to_phase": "EXPLORE",
+        "from_phase": "PRELUDE",
+        "reason": "prelude_done",
+        "evidence": {"auto_conc_sweep_task_id": "stale"},
+    }
+    state = _SweepSingletonState(phase_history=[explore_row])
+    gate = _make_policy_gate(shared_state=state)
+    # rule keys on phase_history[-1].to_phase=="SWEEP", so the stale id is inert
+    gate._validate_sweep_singleton(
+        payload={"action_name": "sweep"},
+        intent_kind="delegate",
+    )
+
+
+def test_sweep_singleton_inert_when_phase_history_empty():
+    """Defensive: an empty phase_history must not raise."""
+    state = _SweepSingletonState(phase_history=[])
+    gate = _make_policy_gate(shared_state=state)
+    gate._validate_sweep_singleton(
+        payload={"action_name": "sweep"},
+        intent_kind="delegate",
+    )
+
+
+def test_sweep_singleton_inert_when_shared_state_is_none():
+    """PolicyGate without a SharedState reference self-defends with an early return."""
+    from hyperloom.orchestrator.roles.agent_role import (
+        default_role_registry,
+    )
+    from hyperloom.orchestrator.policy.gate import PolicyGate
+
+    gate = PolicyGate(role_registry=default_role_registry())
+    assert gate.shared_state is None
+    gate._validate_sweep_singleton(
+        payload={"action_name": "sweep"},
+        intent_kind="delegate",
+    )
+
+
+def test_sweep_singleton_self_clears_at_sweep_to_close_transition():
+    """Once SWEEP→CLOSE happens, the latest row is CLOSE so the singleton rule stops firing."""
+    state = _SweepSingletonState(
+        phase_history=[
+            _sweep_phase_row(auto_sweep_task_id="auto-sweep-abc"),
+            {
+                "to_phase": "CLOSE",
+                "from_phase": "SWEEP",
+                "reason": "sweep_done",
+                "evidence": {},
+            },
+        ],
+    )
+    gate = _make_policy_gate(shared_state=state)
+    # Must NOT raise — the singleton rule looks at phase_history[-1] (now CLOSE)
+    gate._validate_sweep_singleton(
+        payload={"action_name": "sweep"},
+        intent_kind="delegate",
+    )
+
+
+def test_sweep_singleton_bypass_flag_lets_operator_force_second_sweep():
+    """Operator escape hatch: ``params.bypass_sweep_singleton=True`` silences the rule for a second sweep."""
+    state = _SweepSingletonState(
+        phase_history=[_sweep_phase_row(auto_sweep_task_id="auto-sweep-abc")],
+    )
+    gate = _make_policy_gate(shared_state=state)
+    # Must NOT raise.
+    gate._validate_sweep_singleton(
+        payload={
+            "action_name": "sweep",
+            "params": {
+                "bypass_sweep_singleton": True,
+                "grid": {"conc_values": [128]},
+            },
+        },
+        intent_kind="delegate",
+    )
+
+
+# 6a. PolicyGate baseline_phase_singleton rule
+class _BaselineSingletonState:
+    """SharedState stand-in carrying just the field the ``baseline_phase_singleton`` rule reads."""
+
+    def __init__(self, baseline_tput: float = 0.0):
+        self.baseline_tput = baseline_tput
+
+
+def test_baseline_singleton_denies_once_anchor_is_established():
+    """Both channels refuse a repeat baseline after baseline_tput turns positive."""
+    from hyperloom.orchestrator.policy.gate import PolicyDenied
+
+    gate = _make_policy_gate(shared_state=_BaselineSingletonState(2195.86))
+
+    with pytest.raises(PolicyDenied) as excinfo:
+        gate._validate_baseline_singleton(
+            payload={"action_name": "baseline", "params": {}},
+        )
+    assert excinfo.value.rule == "baseline_phase_singleton"
+    assert "PRELUDE is done with baseline" in (excinfo.value.hint or "")
+
+
+def test_baseline_singleton_inert_before_the_anchor_exists():
+    """PRELUDE must still be able to reach baseline_tput > 0."""
+    gate = _make_policy_gate(shared_state=_BaselineSingletonState(0.0))
+    gate._validate_baseline_singleton(
+        payload={"action_name": "baseline", "params": {}},
+    )
+
+
+def test_baseline_singleton_inert_when_shared_state_is_none():
+    gate = _make_policy_gate(shared_state=None)
+    gate._validate_baseline_singleton(
+        payload={"action_name": "baseline"},
+    )
+
+
+def test_baseline_singleton_bypass_flag_is_rejected():
+    from hyperloom.orchestrator.policy.gate import PolicyDenied
+
+    gate = _make_policy_gate(shared_state=_BaselineSingletonState(2195.86))
+    with pytest.raises(PolicyDenied):
+        gate._validate_baseline_singleton(
+            payload={
+                "action_name": "baseline",
+                "params": {"bypass_baseline_singleton": True},
+            },
+        )
+
+
+# 6b. End-to-end through full validate_intent (delegate / propose_action)
+def test_validate_intent_denies_llm_sweep_delegate_in_active_sweep_phase():
+    """Through full ``validate_intent``: a sweep delegate in active SWEEP fires the singleton rule before ``_validate_phase_action``."""
+    from hyperloom.inference_optimizer.protocol.intent import (
+        Intent,
+        IntentType,
+    )
+    from hyperloom.orchestrator.policy.gate import PolicyDenied
+
+    state = _SweepSingletonState(
+        phase_history=[_sweep_phase_row(auto_sweep_task_id="auto-sweep-abc")],
+    )
+    gate = _make_policy_gate(shared_state=state)
+    intent = Intent(
+        type=IntentType.DELEGATE,
+        payload={
+            "action_name": "sweep",
+            "predicted_gain_pct": 1.0,
+            "params": {"grid": {"conc_values": [64]}},
+        },
+    )
+    with pytest.raises(PolicyDenied) as excinfo:
+        gate.validate_intent("orchestration", intent)
+    assert excinfo.value.rule == "sweep_phase_singleton"
+
+
+def test_validate_intent_denies_llm_sweep_propose_in_active_sweep_phase():
+    """Same shape on propose_action."""
+    from hyperloom.inference_optimizer.protocol.intent import (
+        Intent,
+        IntentType,
+    )
+    from hyperloom.orchestrator.policy.gate import PolicyDenied
+
+    state = _SweepSingletonState(
+        phase_history=[_sweep_phase_row(auto_sweep_task_id="auto-sweep-abc")],
+    )
+    gate = _make_policy_gate(shared_state=state)
+    intent = Intent(
+        type=IntentType.PROPOSE_ACTION,
+        payload={"action_name": "sweep"},
+    )
+    with pytest.raises(PolicyDenied) as excinfo:
+        gate.validate_intent("orchestration", intent)
+    assert excinfo.value.rule == "sweep_phase_singleton"
+
+
+# 7. conc_sweep is Coordinator-internal — dispatch re-validation must not
+# collide the sole auto-enqueued conc_sweep with its own singleton evidence.
+def test_conc_sweep_is_coordinator_internal_action():
+    """conc_sweep belongs to the Coordinator-internal class and is never LLM-proposable."""
+    from hyperloom.inference_optimizer.protocol.action_surfaces import (
+        COORDINATOR_INTERNAL_ACTIONS,
+    )
+    from hyperloom.orchestrator.phases import machine_state as phase_state
+
+    assert "conc_sweep" in COORDINATOR_INTERNAL_ACTIONS
+    # It is phase-allowed in SWEEP but stripped from the LLM-proposable set.
+    assert phase_state.is_action_allowed_in_phase("conc_sweep", "SWEEP")
+    assert not phase_state.is_action_llm_proposable_in_phase("conc_sweep", "SWEEP")
+
+
+def test_validate_dispatched_task_allows_auto_conc_sweep_against_own_evidence():
+    """Regression: the SWEEP-entry auto-enqueued conc_sweep must pass dispatch re-validation.
+
+    Before the fix, ``validate_dispatched_task`` fell through to the
+    delegate-body sweep-family singleton guard, which keys on
+    ``auto_conc_sweep_task_id`` — the auto-enqueued task's OWN id — and denied
+    the sole conc_sweep against itself, surfacing as a spurious
+    ``conc_sweep_failed`` that closed the session at 0% gain. Now conc_sweep is
+    a Coordinator-internal action, so it receives path checks only and is not
+    re-validated against the singleton guard.
+    """
+    state = _SweepSingletonState(
+        phase_history=[_sweep_phase_row(auto_sweep_task_id="conc-sweep-self-id")],
+    )
+    gate = _make_policy_gate(shared_state=state)
+    # Must NOT raise, even though SWEEP evidence already carries the auto id.
+    gate.validate_dispatched_task(
+        "conc_sweep",
+        {"source": "coordinator_internal", "concs": [64, 32], "total_budget_sec": 9000},
+    )
+
+
+def test_validate_intent_denies_llm_conc_sweep_propose_as_coordinator_managed():
+    """An LLM-proposed conc_sweep is rejected as Coordinator-managed even with no singleton evidence.
+
+    Using a SWEEP row WITHOUT the auto conc_sweep id keeps the singleton guard
+    inert, so the denial must come from the ``phase_incompatible`` /
+    Coordinator-managed gate — proving conc_sweep is genuinely internal, not
+    merely singleton-blocked.
+    """
+    from hyperloom.inference_optimizer.protocol.intent import (
+        Intent,
+        IntentType,
+    )
+    from hyperloom.orchestrator.policy.gate import PolicyDenied
+
+    state = _SweepSingletonState(
+        phase_history=[_sweep_phase_row(auto_sweep_task_id="")],
+    )
+    gate = _make_policy_gate(shared_state=state)
+    intent = Intent(
+        type=IntentType.PROPOSE_ACTION,
+        payload={"action_name": "conc_sweep"},
+    )
+    with pytest.raises(PolicyDenied) as excinfo:
+        gate.validate_intent("orchestration", intent)
+    assert excinfo.value.rule == "phase_incompatible"
+
+
+def test_validate_intent_denies_llm_conc_sweep_delegate_as_coordinator_managed():
+    """An LLM-delegated conc_sweep is rejected through the internal-action gate."""
+    from hyperloom.inference_optimizer.protocol.intent import (
+        Intent,
+        IntentType,
+    )
+    from hyperloom.orchestrator.policy.gate import PolicyDenied
+
+    state = _SweepSingletonState(
+        phase_history=[_sweep_phase_row(auto_sweep_task_id="")],
+    )
+    gate = _make_policy_gate(shared_state=state)
+    intent = Intent(
+        type=IntentType.DELEGATE,
+        payload={"action_name": "conc_sweep"},
+    )
+    with pytest.raises(PolicyDenied) as excinfo:
+        gate.validate_intent("orchestration", intent)
+    assert excinfo.value.rule == "phase_incompatible"

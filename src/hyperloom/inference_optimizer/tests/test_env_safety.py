@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Unit tests for multi-node SSH env key validation.
+
+``env_safety`` is the last-mile gate on keys that already entered a forward
+dict: it blocks shell/loader injection vectors (``_DENY_KEYS``) and invalid
+key shapes. Credential exclusion (``*_API_KEY``, ``SAFE_API_KEY``, ``*_BASE_URL``)
+happens upstream in ``infera._collect_forward_env`` (prefix whitelist) and
+the platform's pod env (operator ``--extra-env`` only); those keys are never placed
+into the forward dict, so they are not SSH-forwarded to inference pods.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from hyperloom.inference_optimizer.multi_node._internal import env_safety
+from hyperloom.common import env_safety as common_env_safety
+
+
+def test_valid_mori_and_sglang_keys_allowed():
+    assert env_safety.is_forward_env_key_allowed("MORI_DISPATCH_FOO")
+    assert env_safety.is_forward_env_key_allowed("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK")
+    assert env_safety.is_forward_env_key_allowed("SGLANG_USE_AITER")
+    assert env_safety.is_forward_env_key_allowed("SGLANG_TORCH_PROFILER_DIR")
+
+
+def test_invalid_key_shape_rejected():
+    assert not env_safety.is_forward_env_key_allowed("X Y")
+    assert not env_safety.is_forward_env_key_allowed("bad-key")
+
+
+def test_denylist_keys_rejected():
+    """Only exact _DENY_KEYS entries are blocked (loader/python/PATH/shell vectors)."""
+    assert not env_safety.is_forward_env_key_allowed("LD_PRELOAD")
+    assert not env_safety.is_forward_env_key_allowed("PYTHONPATH")
+    assert not env_safety.is_forward_env_key_allowed("PATH")
+    assert not env_safety.is_forward_env_key_allowed("IFS")
+
+
+def test_non_denylist_tuning_keys_pass_shape_gate():
+    """Keys outside _DENY_KEYS pass the low-level forward gate when present."""
+    assert env_safety.is_forward_env_key_allowed("NCCL_IB_HCA")
+    assert env_safety.is_forward_env_key_allowed("SGLANG_USE_AITER")
+
+
+def test_filter_forward_env_drops_bad_keys():
+    out = env_safety.filter_forward_env(
+        {
+            "MORI_FOO": "1",
+            "LD_PRELOAD": "/evil.so",
+            "X Y": "nope",
+        },
+        warn_on_drop=False,
+    )
+    assert out == {"MORI_FOO": "1"}
+
+
+def test_assert_forward_env_keys_raises():
+    with pytest.raises(ValueError, match="disallowed SSH forward env keys"):
+        env_safety.assert_forward_env_keys({"LD_PRELOAD": "/tmp/x.so"})
+
+
+def test_common_env_safety_filters_dotenv_and_kernel_agent_keys_only():
+    assert common_env_safety.is_allowed_dotenv_key("OPENAI_API_KEY")
+    assert common_env_safety.is_allowed_dotenv_key("HF_TOKEN")
+    assert common_env_safety.is_allowed_dotenv_key("HTTPS_PROXY")
+    assert common_env_safety.is_allowed_dotenv_key("HYPERLOOM_RUNTIME_DIR")
+    assert not common_env_safety.is_allowed_dotenv_key("PYTHONPATH")
+    assert not common_env_safety.is_allowed_dotenv_key("BAD-NAME")
+
+    assert common_env_safety.is_allowed_kernel_agent_env_key("TRACELENS_ROOT")
+    assert common_env_safety.is_allowed_kernel_agent_env_key("HYPERLOOM_SPECIALIST_INHERIT_SECRET_ENV")
+    assert common_env_safety.is_allowed_kernel_agent_env_key("INFERENCE_OPTIMIZER_FRAMEWORK_SOURCE_ROOTS")
+    assert not common_env_safety.is_allowed_kernel_agent_env_key("TRACELENS_TOKEN")
+
+    allowed, dropped = common_env_safety.filter_untrusted_env_mapping(
+        {
+            "bench_foo": 1,
+            "custom_tuning_knob": "enabled",
+            "ANTHROPIC_API_KEY": "anthropic-secret",
+            "LD_PRELOAD": "/tmp/agent-provided.so",
+            "OPENAI_API_KEY": "secret",
+            "PYTHONPATH": "/tmp/agent-provided",
+            "SAFE_API_KEY": "safe-secret",
+            "bad key": "nope",
+            "": "empty",
+        },
+        allow_predicate=common_env_safety.valid_env_key,
+    )
+    assert allowed == {
+        "bench_foo": "1",
+        "custom_tuning_knob": "enabled",
+        "ANTHROPIC_API_KEY": "anthropic-secret",
+        "LD_PRELOAD": "/tmp/agent-provided.so",
+        "OPENAI_API_KEY": "secret",
+        "PYTHONPATH": "/tmp/agent-provided",
+        "SAFE_API_KEY": "safe-secret",
+    }
+    assert dropped == {
+        "bad key": "invalid_env_key",
+        "<empty>": "invalid_env_key",
+    }
+
+    env = {"LD_PRELOAD": "evil.so", "PATH": "/bin", "SAFE": "1"}
+    assert common_env_safety.scrub_child_process_env(env) is env
+    assert env == {"PATH": "/bin", "SAFE": "1"}
+
+
+def test_scrub_benchmark_process_env_removes_control_plane_credentials():
+    env = {
+        "AMD_API_KEY": "amd-secret",
+        "AMD_LLM_API_KEY": "amd-llm-secret",
+        "ANTHROPIC_API_KEY": "anthropic-secret",
+        "LLM_GATEWAY_KEY": "gateway-secret",
+        "LLM_PROXY_API_KEY": "proxy-secret",
+        "OPENAI_API_KEY": "openai-secret",
+        "SAFE_API_KEY": "safe-secret",
+        "HF_TOKEN": "model-download-token",
+        "PATH": "/bin",
+        "RUN_EVAL": "true",
+    }
+
+    assert common_env_safety.scrub_benchmark_process_env(env) is env
+    assert env == {
+        "HF_TOKEN": "model-download-token",
+        "PATH": "/bin",
+        "RUN_EVAL": "true",
+    }
+
+
+def test_redact_secret_values_masks_assignments_and_bearer_tokens():
+    text = "SAFE_API_KEY=ak-sensitive-value Authorization: Bearer sensitive-token"
+
+    redacted = common_env_safety.redact_secret_values(text)
+
+    assert "sensitive-value" not in redacted
+    assert "sensitive-token" not in redacted
+    assert redacted.count("[REDACTED]") == 2
