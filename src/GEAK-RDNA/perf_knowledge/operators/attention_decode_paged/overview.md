@@ -2,7 +2,7 @@
 title: attention_decode_paged — overview
 kind: operator_overview
 operator: attention_decode_paged
-gens: [gfx90a, gfx942, gfx950]
+gens: [gfx90a, gfx942, gfx950, gfx1201, gfx1203, gfx1206, gfx1207]
 dtypes: [bf16, fp16, fp8_e4m3_fnuz, fp8_e4m3]
 regimes: [decode]
 updated: 2026-06-08
