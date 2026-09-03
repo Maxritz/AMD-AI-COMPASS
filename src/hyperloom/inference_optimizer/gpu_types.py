@@ -11,12 +11,16 @@ import sys
 
 _AMD_GPU_TYPES = frozenset({
     "mi300x", "mi308x", "mi325x", "mi355x",
-    "rx9070xt", "rx9070", "rx9060xt", "r9000"
+    "rx6700xt", "rx6750xt", "rx6800", "rx6800xt", "rx6900xt",
+    "rx9070xt", "rx9070", "rx9060xt", "r9000",
 })
 
 _GFX_TO_RUNNER: dict[str, str] = {
     "gfx942": "mi300x",
     "gfx950": "mi355x",
+    "gfx1030": "rx6800xt",
+    "gfx1031": "rx6700xt",
+    "gfx1032": "rx6600xt",
     "gfx1201": "rx9070xt",
     "gfx1203": "r9000",
     "gfx1206": "rx9060xt",
@@ -28,6 +32,14 @@ _AMD_GPU_DISPATCH_IDENTITIES: dict[str, tuple[str, int]] = {
     "mi308x": ("gfx942", 304),
     "mi325x": ("gfx942", 304),
     "mi355x": ("gfx950", 256),
+    "rx6900xt": ("gfx1030", 80),
+    "rx6800xt": ("gfx1030", 72),
+    "rx6800": ("gfx1030", 60),
+    "rx6750xt": ("gfx1031", 40),
+    "rx6700xt": ("gfx1031", 40),
+    "rx6650xt": ("gfx1032", 32),
+    "rx6600xt": ("gfx1032", 32),
+    "rx6600": ("gfx1032", 28),
     "rx9070xt": ("gfx1201", 64),
     "r9000": ("gfx1203", 64),
     "rx9070": ("gfx1207", 56),
@@ -36,10 +48,11 @@ _AMD_GPU_DISPATCH_IDENTITIES: dict[str, tuple[str, int]] = {
 
 # GPU types for which Magpie ships a benchmark runner script (sglang_<runner>.sh).
 # MI308X/MI325X are mapped to the MI300X runner by _gpu_runner_type(); every
-# RDNA4 SKU resolves to itself. The matching rx9xxx runner scripts are shipped
-# by the AMD-AGI/Magpie package (see docs/components/magpie.md).
+# RDNA2/RDNA4 SKU resolves to itself. The matching rx6xxx/rx9xxx runner scripts
+# are shipped by the AMD-AGI/Magpie package (see docs/components/magpie.md).
 _SHIPPED_MAGPIE_RUNNERS: frozenset[str] = frozenset({
     "mi300x", "mi355x",
+    "rx6700xt", "rx6800xt", "rx6900xt",
     "rx9070xt", "rx9070", "rx9060xt", "r9000",
 })
 
@@ -74,7 +87,7 @@ def _resolve_gpu_type(
 
 
 def _autodetect_gpu_type() -> str | None:
-    """Return mi300x|mi308x|mi325x|mi355x|rx9070xt|rx9070|rx9060xt|r9000 or None."""
+    """Return mi300x|mi308x|mi325x|mi355x|rx6700xt|rx6800xt|rx6900xt|rx9070xt|rx9070|rx9060xt|r9000 or None."""
     import subprocess
 
     try:
@@ -90,6 +103,7 @@ def _autodetect_gpu_type() -> str | None:
             for tag in (
                 "RX 9070 XT", "R9000", "RX 9060 XT",
                 "RX 9070 ", "RX 9070", "RX 9060",
+                "RX 6900 XT", "RX 6800 XT", "RX 6700 XT",
                 "MI355X", "MI300X",
             ):
                 if tag in out:
@@ -108,7 +122,8 @@ def _autodetect_gpu_type() -> str | None:
                 text=True,
                 timeout=5,
             ).stdout.upper()
-            for tag in ("MI355X", "MI325X", "MI308X", "MI300X", "RX9070XT", "RX9070", "RX9060XT", "R9000"):
+            for tag in ("MI355X", "MI325X", "MI308X", "MI300X", "RX9070XT", "RX9070", "RX9060XT", "R9000",
+                        "RX6900XT", "RX6800XT", "RX6700XT"):
                 if tag in out:
                     return tag.lower()
     except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError, OSError):

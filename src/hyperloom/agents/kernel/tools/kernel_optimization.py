@@ -591,6 +591,46 @@ _GPU_HW: dict[str, dict[str, Any]] = {
         "mem": "HBM3E (~8.0 TB/s peak)",
         "build_flag": "--offload-arch=gfx950",
     },
+    "rx6700xt": {
+        "name": "Radeon RX 6700 XT",
+        "arch": "gfx1031",
+        "uarch": "RDNA2",
+        "cus": 40,
+        "mem": "12 GB GDDR6 (~384 GB/s peak)",
+        "build_flag": "--offload-arch=gfx1031",
+    },
+    "rx6800xt": {
+        "name": "Radeon RX 6800 XT",
+        "arch": "gfx1030",
+        "uarch": "RDNA2",
+        "cus": 72,
+        "mem": "16 GB GDDR6 (~512 GB/s peak)",
+        "build_flag": "--offload-arch=gfx1030",
+    },
+    "rx6900xt": {
+        "name": "Radeon RX 6900 XT",
+        "arch": "gfx1030",
+        "uarch": "RDNA2",
+        "cus": 80,
+        "mem": "16 GB GDDR6 (~512 GB/s peak)",
+        "build_flag": "--offload-arch=gfx1030",
+    },
+    "rx9070xt": {
+        "name": "Radeon RX 9070 XT",
+        "arch": "gfx1201",
+        "uarch": "RDNA4",
+        "cus": 64,
+        "mem": "16 GB GDDR6 (~640 GB/s peak), 80 MB Infinity Cache",
+        "build_flag": "--offload-arch=gfx1201",
+    },
+    "rx9060xt": {
+        "name": "Radeon RX 9060 XT",
+        "arch": "gfx1206",
+        "uarch": "RDNA4",
+        "cus": 40,
+        "mem": "16 GB GDDR6 (~640 GB/s peak), 80 MB Infinity Cache",
+        "build_flag": "--offload-arch=gfx1206",
+    },
 }
 
 

@@ -5089,6 +5089,20 @@ _FLYDSL_TARGET_ARCH_BY_PLATFORM = {
     "mi308x": "gfx942",
     "mi325x": "gfx942",
     "mi355x": "gfx950",
+    "rx6900xt": "gfx1030",
+    "rx6800xt": "gfx1030",
+    "rx6800": "gfx1030",
+    "rx6750xt": "gfx1031",
+    "rx6700xt": "gfx1031",
+    "rx6650xt": "gfx1032",
+    "rx6600xt": "gfx1032",
+    "rx6600": "gfx1032",
+    "rdna2": "gfx1031",
+    "rx9070xt": "gfx1201",
+    "rx9070": "gfx1207",
+    "rx9060xt": "gfx1206",
+    "r9000": "gfx1203",
+    "rdna4": "gfx1201",
 }
 _FLYDSL_SMEM_MARKERS = ("SmemAllocator", "SmemPtr", "smem_alloc")
 _FLYDSL_BUFFER_LOAD_MARKERS = (

@@ -45,11 +45,26 @@ def _derive_gpu_arch(gpu_type: str) -> str:
         "mi250x": "gfx90a",
         "mi250": "gfx90a",
         "mi210": "gfx90a",
+        "rx6900xt": "gfx1030",
+        "rx6800xt": "gfx1030",
+        "rx6800": "gfx1030",
+        "rx6750xt": "gfx1031",
+        "rx6700xt": "gfx1031",
+        "rx6650xt": "gfx1032",
+        "rx6600xt": "gfx1032",
+        "rx6600": "gfx1032",
+        "rdna2": "gfx1031",
+        "rx9070xt": "gfx1201",
+        "rx9070": "gfx1207",
+        "rx9060xt": "gfx1206",
+        "rdna4": "gfx1201",
     }
     gt = (gpu_type or "").strip().lower()
     for key, arch in _MAP.items():
         if key in gt:
             return arch
+    if gt.startswith("gfx"):
+        return gt
     return ""
 
 
