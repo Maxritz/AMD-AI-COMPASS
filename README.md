@@ -17,6 +17,7 @@ and validates the performance and correctness of the optimizations without requi
 |------------|--------|-------|
 | Instinct MI300 | MI300X, MI308X, MI325X | CDNA3, ROCm native |
 | Instinct MI350 | MI355X | CDNA4, ROCm native |
+| Radeon RX 6000 series | RX 6900 XT, RX 6800 XT, RX 6800, RX 6700 XT, RX 6750 XT, RX 6700 XT, RX 6650 XT, RX 6600 XT | RDNA2 (gfx1030/gfx1031/gfx1032), Linux ROCm |
 | Radeon RX 9000 series | RX 9070 XT, RX 9070, RX 9060 XT, RX 9000 XT | RDNA4 WMMA FP8 support, Windows ROCm 7.3+ |
 
 The system operates through a sophisticated multi-stage pipeline. First TraceLens, the profiling brain of
