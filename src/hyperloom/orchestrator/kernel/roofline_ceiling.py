@@ -92,6 +92,22 @@ def _rdna4_peak_tflops(cu_count: int, boost_ghz: float, base: dict[str, float]) 
 _RDNA4_PEAK_TFLOPS_R9000: dict[str, float] = _RDNA4_PEAK_TFLOPS_RX9070XT
 _RDNA4_PEAK_TFLOPS_RX9070: dict[str, float] = _rdna4_peak_tflops(56, 2.07, _RDNA4_PEAK_TFLOPS_RX9070XT)
 _RDNA4_PEAK_TFLOPS_RX9060XT: dict[str, float] = _rdna4_peak_tflops(32, 2.53, _RDNA4_PEAK_TFLOPS_RX9070XT)
+
+#: RDNA2 vendor-dense peak TFLOPS — per SKU. RX 6800 XT (72 CU @ 2.25 GHz) is the
+#: baseline; the other rows are scaled by (CUs * boost_clock). RDNA2 has no
+#: matrix/FP4 unit — only vector SIMD throughput. BF16 is emulated (~FP32 cost).
+_RDNA2_PEAK_TFLOPS_RX6800XT: dict[str, float] = {
+    "fp16": 41.5,
+    "float16": 41.5,
+    "bf16": 15.5,
+    "bfloat16": 15.5,
+    "int8": 83.0,
+    "fp32": 20.7,
+    "float32": 20.7,
+}
+_RDNA2_PEAK_TFLOPS_RX6900XT: dict[str, float] = {"fp16": 46.0, "float16": 46.0, "bf16": 17.0, "bfloat16": 17.0, "int8": 92.0, "fp32": 23.0, "float32": 23.0}
+_RDNA2_PEAK_TFLOPS_RX6700XT: dict[str, float] = {"fp16": 24.8, "float16": 24.8, "bf16": 9.0, "bfloat16": 9.0, "int8": 49.6, "fp32": 12.4, "float32": 12.4}
+
 HW_SPECS: dict[str, dict[str, Any]] = {
     "mi300x": {
         "hbm_gb": 192.0,
@@ -132,6 +148,21 @@ HW_SPECS: dict[str, dict[str, Any]] = {
         "gddr_gb": 32.0,
         "hbm_bw_gbps": 640.0,
         "peak_tflops": _RDNA4_PEAK_TFLOPS_R9000,
+    },
+    "rx6800xt": {
+        "gddr_gb": 16.0,
+        "hbm_bw_gbps": 512.0,
+        "peak_tflops": _RDNA2_PEAK_TFLOPS_RX6800XT,
+    },
+    "rx6900xt": {
+        "gddr_gb": 16.0,
+        "hbm_bw_gbps": 512.0,
+        "peak_tflops": _RDNA2_PEAK_TFLOPS_RX6900XT,
+    },
+    "rx6700xt": {
+        "gddr_gb": 12.0,
+        "hbm_bw_gbps": 448.0,
+        "peak_tflops": _RDNA2_PEAK_TFLOPS_RX6700XT,
     },
 }
 
@@ -1650,7 +1681,11 @@ _RDNA4_ACHIEVABLE_TFLOPS_RX9070XT: dict[str, float] = {
 _RDNA4_ACHIEVABLE_TFLOPS_R9000: dict[str, float] = _RDNA4_ACHIEVABLE_TFLOPS_RX9070XT
 _RDNA4_ACHIEVABLE_TFLOPS_RX9070: dict[str, float] = _rdna4_peak_tflops(56, 2.07, _RDNA4_ACHIEVABLE_TFLOPS_RX9070XT)
 _RDNA4_ACHIEVABLE_TFLOPS_RX9060XT: dict[str, float] = _rdna4_peak_tflops(32, 2.53, _RDNA4_ACHIEVABLE_TFLOPS_RX9070XT)
-
+#: RDNA2 max-achievable (sustained) TFLOPS — ~70-80% of vendor-dense peak. No
+#: matrix unit; BF16 emulated via FP32. Values per the rdna2_rx6000 KB.
+_RDNA2_ACHIEVABLE_TFLOPS_RX6800XT: dict[str, float] = {"fp16": 28.0, "float16": 28.0, "bf16": 15.5, "bfloat16": 15.5, "int8": 58.0, "fp32": 15.5, "float32": 15.5}
+_RDNA2_ACHIEVABLE_TFLOPS_RX6900XT: dict[str, float] = {"fp16": 31.0, "float16": 31.0, "bf16": 17.0, "bfloat16": 17.0, "int8": 64.0, "fp32": 17.0, "float32": 17.0}
+_RDNA2_ACHIEVABLE_TFLOPS_RX6700XT: dict[str, float] = {"fp16": 18.0, "float16": 18.0, "bf16": 9.0, "bfloat16": 9.0, "int8": 35.0, "fp32": 9.0, "float32": 9.0}
 HW_SPECS_ACHIEVABLE: dict[str, dict[str, Any]] = {
     "mi300x": {
         "hbm_bw_gbps": 5300.0,
@@ -1686,6 +1721,21 @@ HW_SPECS_ACHIEVABLE: dict[str, dict[str, Any]] = {
         "hbm_bw_gbps": 640.0,
         "hbm_gb": 32.0,
         "peak_tflops": _RDNA4_ACHIEVABLE_TFLOPS_R9000,
+    },
+    "rx6800xt": {
+        "hbm_bw_gbps": 512.0,
+        "hbm_gb": 16.0,
+        "peak_tflops": _RDNA2_ACHIEVABLE_TFLOPS_RX6800XT,
+    },
+    "rx6900xt": {
+        "hbm_bw_gbps": 512.0,
+        "hbm_gb": 16.0,
+        "peak_tflops": _RDNA2_ACHIEVABLE_TFLOPS_RX6900XT,
+    },
+    "rx6700xt": {
+        "hbm_bw_gbps": 448.0,
+        "hbm_gb": 12.0,
+        "peak_tflops": _RDNA2_ACHIEVABLE_TFLOPS_RX6700XT,
     },
 }
 

@@ -1,0 +1,16 @@
+{
+  "name": "RX 6700 XT",
+  "mem_bw_gbps": 448,
+  "memory_gb": 12,
+  "max_achievable_tflops": {
+    "vector_fp16": 18,
+    "vector_bf16": 9,
+    "vector_fp32": 9,
+    "vector_int8": 35,
+    "vector_int4": 18,
+    "matrix_fp16": 0,
+    "matrix_bf16": 0,
+    "matrix_fp8": 0,
+    "matrix_int4": 0
+  }
+}

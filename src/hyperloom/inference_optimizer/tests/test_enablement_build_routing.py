@@ -65,6 +65,31 @@ def test_derive_gpu_arch_mi355x():
 def test_derive_gpu_arch_mi300x():
     assert _derive_gpu_arch("mi300x") == "gfx942"
 
+def test_derive_gpu_arch_rx6700xt():
+    assert _derive_gpu_arch("rx6700xt") == "gfx1031"
+
+def test_derive_gpu_arch_rx6800xt():
+    assert _derive_gpu_arch("rx6800xt") == "gfx1030"
+
+def test_derive_gpu_arch_rx6900xt():
+    assert _derive_gpu_arch("rx6900xt") == "gfx1030"
+
+def test_derive_gpu_arch_rx9070xt():
+    assert _derive_gpu_arch("rx9070xt") == "gfx1201"
+
+def test_derive_gpu_arch_rx9060xt():
+    assert _derive_gpu_arch("rx9060xt") == "gfx1206"
+
+def test_derive_gpu_arch_rdna2():
+    assert _derive_gpu_arch("rdna2") == "gfx1031"
+
+def test_derive_gpu_arch_rdna4():
+    assert _derive_gpu_arch("rdna4") == "gfx1201"
+
+def test_derive_gpu_arch_raw_gfx():
+    assert _derive_gpu_arch("gfx1031") == "gfx1031"
+    assert _derive_gpu_arch("gfx1201") == "gfx1201"
+
 def test_derive_gpu_arch_unknown():
     assert _derive_gpu_arch("unknown_gpu") == ""
 

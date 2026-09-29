@@ -1,0 +1,15 @@
+{
+  "name": "RX 9070 XT",
+  "mem_bw_gbps": 640,
+  "memory_gb": 16,
+  "max_achievable_tflops": {
+    "matrix_fp16": 170,
+    "matrix_bf16": 170,
+    "matrix_fp8": 340,
+    "matrix_int4": 1300,
+    "matrix_fp32": 0.1,
+    "vector_fp16": 2.9,
+    "vector_bf16": 2.9,
+    "vector_fp32": 0.1
+  }
+}

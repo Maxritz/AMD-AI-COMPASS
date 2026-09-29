@@ -72,11 +72,40 @@ _PEAK_TFLOPS_MI355: dict[str, float] = {
     "f32": 137.0,
     "float32": 137.0,
 }
+_PEAK_TFLOPS_RDNA2: dict[str, float] = {
+    "fp16": 18.0,
+    "f16": 18.0,
+    "float16": 18.0,
+    "bf16": 9.0,
+    "bfloat16": 9.0,
+    "int8": 35.0,
+    "int4": 18.0,
+    "fp32": 9.0,
+    "f32": 9.0,
+    "float32": 9.0,
+}
+_PEAK_TFLOPS_RDNA4: dict[str, float] = {
+    "fp16": 170.0,
+    "f16": 170.0,
+    "float16": 170.0,
+    "bf16": 170.0,
+    "bfloat16": 170.0,
+    "fp8": 340.0,
+    "f8": 340.0,
+    "float8_e4m3fn": 340.0,
+    "float8_e5m2": 340.0,
+    "int4": 1300.0,
+    "fp32": 0.1,
+    "f32": 0.1,
+    "float32": 0.1,
+}
 _HW_SPECS: dict[str, dict[str, Any]] = {
     "mi300x": {"hbm_bw_gbps": 5300.0, "peak_tflops": _PEAK_TFLOPS_MI300},
     "mi308x": {"hbm_bw_gbps": 5300.0, "peak_tflops": _PEAK_TFLOPS_MI300},
     "mi325x": {"hbm_bw_gbps": 6000.0, "peak_tflops": _PEAK_TFLOPS_MI325},
     "mi355x": {"hbm_bw_gbps": 8000.0, "peak_tflops": _PEAK_TFLOPS_MI355},
+    "rx6700xt": {"hbm_bw_gbps": 448.0, "peak_tflops": _PEAK_TFLOPS_RDNA2},
+    "rx9070xt": {"hbm_bw_gbps": 640.0, "peak_tflops": _PEAK_TFLOPS_RDNA4},
 }
 _DEFAULT_GPU = "mi300x"
 
