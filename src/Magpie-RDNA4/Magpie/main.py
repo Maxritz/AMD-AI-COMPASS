@@ -1228,7 +1228,7 @@ def create_parser() -> argparse.ArgumentParser:
         "framework",
         type=str,
         nargs="?",
-        choices=["vllm", "sglang", "atom"],
+        choices=["vllm", "sglang", "atom", "xdit", "strata"],
         help="Framework to benchmark",
     )
     benchmark_parser.add_argument(

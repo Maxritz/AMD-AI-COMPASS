@@ -19,6 +19,7 @@ class BenchmarkFramework(Enum):
     SGLANG = "sglang"
     ATOM = "atom"
     XDIT = "xdit"
+    STRATA = "strata"
 
 
 class BenchmarkRunMode(Enum):
@@ -34,7 +35,7 @@ class BenchmarkRunMode(Enum):
 # OpenAI server + GSM8K eval. For these the quality gate is the only
 # correctness signal, so a missing/un-passed gate must fail the benchmark
 # (see result.py / benchmarker.py) rather than silently pass.
-SCRIPTABLE_FRAMEWORKS = frozenset({"xdit"})
+SCRIPTABLE_FRAMEWORKS = frozenset({"xdit", "strata"})
 
 
 class TraceLensExportFormat(Enum):
@@ -727,10 +728,13 @@ class BenchmarkConfig:
         # ``xdit`` is a server-less (scriptable) diffusion framework: it runs a
         # single-command bench script (no OpenAI server) and reports img/s plus
         # an image-quality gate.
+        # ``strata`` is the same shape for a text engine: a custom C++/HIP
+        # binary serves no OpenAI endpoint, so its bench script drives the
+        # binary directly and reports tok/s plus a quality gate.
         self.framework = self.framework.lower()
-        if self.framework not in ["vllm", "sglang", "atom", "xdit"]:
+        if self.framework not in ["vllm", "sglang", "atom", "xdit", "strata"]:
             raise ValueError(
-                f"Unsupported framework: {self.framework}. Use 'vllm', 'sglang', 'atom', or 'xdit'."
+                f"Unsupported framework: {self.framework}. Use 'vllm', 'sglang', 'atom', 'xdit', or 'strata'."
             )
 
         # Validate run_mode
@@ -740,12 +744,12 @@ class BenchmarkConfig:
                 f"Unsupported run_mode: {self.run_mode}. Use 'docker', 'local', or 'ray'."
             )
 
-        # ``xdit`` is server-less (scriptable) with no Docker image, so it must
+        # Server-less (scriptable) frameworks have no Docker image, so they must
         # run locally. Reject docker/ray here so benchmark_images.yaml stays a
         # pure Docker-image mapping and the scriptable contract is explicit.
-        if self.framework == "xdit" and self.run_mode != "local":
+        if self.framework in SCRIPTABLE_FRAMEWORKS and self.run_mode != "local":
             raise ValueError(
-                "Framework 'xdit' is server-less (scriptable) and requires "
+                f"Framework '{self.framework}' is server-less (scriptable) and requires "
                 f"run_mode='local', got run_mode='{self.run_mode}'."
             )
 
@@ -833,8 +837,12 @@ class BenchmarkConfig:
         if self.benchmark_script:
             return self.benchmark_script
 
-        # Auto-generate based on config
         runner = self.runner_type or "mi300x"
+        # Server-less (scriptable) frameworks ship ``{framework}_{runner}.sh``
+        # (the same name benchmarker._get_benchmark_script resolves as its
+        # Priority-3 generic script), not a ``generic_{precision}_{runner}.sh``.
+        if self.framework in SCRIPTABLE_FRAMEWORKS:
+            return f"{self.framework}_{runner}.sh"
         # Format: {exp_name}_{precision}_{runner}.sh
         # For now, use a generic experiment name
         return f"generic_{self.precision}_{runner}.sh"

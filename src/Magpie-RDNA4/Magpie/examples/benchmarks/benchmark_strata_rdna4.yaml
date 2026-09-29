@@ -1,0 +1,70 @@
+# Strata (custom C++/HIP engine) benchmark profile for Magpie.
+#
+# Strata is server-less like xDiT: it serves no OpenAI endpoint, so the
+# `strata_rdna4.sh` bench script drives the engine binary directly, parses the
+# engine's own timing lines, runs a correctness gate, and writes the
+# InferenceX-shaped result JSON Magpie reads.
+#
+# Run from the Magpie repo root:
+#   python -m Magpie benchmark --benchmark-config examples/benchmarks/benchmark_strata_rdna4.yaml
+#
+# This profile points at the Swift-Qwen3.8-Flash-Next IQ2_XS pack built on this
+# host. Point STRATA_* at your own pack / shard / token file to benchmark another
+# model. Paths may be Windows ('H:\...') or POSIX.
+#
+# NOTE (WSL): Magpie's local runner shells out to `bash`. On Windows that is
+# WSL's bash, which runs the POSIX script in Linux, so STRATA_EXE is given in
+# its POSIX (/mnt/...) form and the data paths are translated back to Windows
+# for the engine. Launching a Windows GPU binary from WSL still needs its ROCm
+# DLL directory on the child's PATH; if that cannot be arranged, run Magpie on a
+# native Linux host (where the script runs the engine directly).
+benchmark:
+  framework: strata
+  # MODEL is recorded in the result; the engine's actual inputs are STRATA_PACK /
+  # STRATA_NATIVE / STRATA_PLE below.
+  model: 'H:\OLLAMA-Models\GGUF\Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf'
+  # The engine's quantization is per-tensor (from the pack); this is informational.
+  precision: bf16
+  # Server-less (scriptable) frameworks run locally; docker/ray is rejected.
+  run_mode: local
+
+  envs:
+    # Workload knobs: CONC -> iterations, OSL -> --max-new, ISL unused (token file).
+    CONC: 4
+    OSL: 32
+    ISL: 0
+    # Engine wiring (the bench script reads these). Windows or POSIX paths are
+    # both accepted; the script converts to whatever form the engine and the
+    # running shell need.
+    STRATA_EXE: 'C:\Users\rr\OneDrive\Desktop\Strata-rocm\build_gfx1201\strata.exe'
+    STRATA_PACK: 'H:\OLLAMA-Models\strata-pack-swift'
+    STRATA_NATIVE: 'H:\OLLAMA-Models\GGUF\Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf'
+    STRATA_PLE: 'H:\OLLAMA-Models\GGUF\Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf'
+    STRATA_PROFILE: 'C:\Users\rr\OneDrive\Desktop\Strata-rocm\data\expert-profile.bin'
+    STRATA_TOKENS: 'H:\OLLAMA-Models\strata-pack-reap288\tokenizer\real_prompt_ids.txt'
+    # Engine tuning (the optimizer may sweep these).
+    STRATA_SPEC: 2
+    STRATA_PREFILL: 128
+    STRATA_CACHE: 2600
+    STRATA_MAX_CONTEXT: 4096
+    STRATA_GATE: 1
+    # The interpreter the script uses to write the result JSON. Git Bash's
+    # `python3` on Windows is the Store alias, which is not usable; `python`
+    # resolves to the real interpreter.
+    PYTHON: python
+
+  # This Windows host has no rocm-smi, so auto GPU selection cannot probe; pin
+  # nothing and let the engine use device 0.
+  gpu_selection:
+    auto: false
+
+  profiler:
+    torch_profiler:
+      enabled: false
+    system_profiler:
+      enabled: false
+
+  gap_analysis:
+    enabled: false
+
+  timeout_seconds: 3600

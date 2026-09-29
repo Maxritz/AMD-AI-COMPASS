@@ -746,6 +746,21 @@ class BenchmarkMode:
         except OSError as e:
             logger.warning(f"Could not remove symlink {symlink}: {e}")
 
+    @staticmethod
+    def _bash_path(path: str) -> str:
+        """A path the local ``bash`` can use, from a Windows path.
+
+        On Windows ``bash`` is either MSYS (Git Bash) or WSL. A native Windows
+        path like ``C:\\Users\\x`` is not usable by either when it reaches the
+        shell through ``bash -c`` (the backslashes are eaten), so it is written
+        as ``C:/Users/x``: MSYS accepts the drive form directly, and it also
+        avoids the backslash problem on any shell. A POSIX path -- a Linux host,
+        or a form a caller already gave -- is returned unchanged.
+        """
+        if os.name == "nt" and len(path) >= 2 and path[1] == ":" and path[0].isalpha():
+            return path[:2] + "/" + path[2:].lstrip("\\/").replace("\\", "/")
+        return path
+
     def _build_local_command(
         self,
         workspace: Path,
@@ -770,14 +785,14 @@ class BenchmarkMode:
 
         cmd = [
             "bash", "-c",
-            f"cd {inferencex_path} && bash {benchmark_script}",
+            f"cd {self._bash_path(inferencex_path)} && bash {benchmark_script}",
         ]
 
         env = os.environ.copy()
 
         env_vars = self.config.get_env_vars()
         env_vars["RESULT_FILENAME"] = "inferencex_result"
-        env_vars["RESULT_DIR"] = str(workspace)
+        env_vars["RESULT_DIR"] = self._bash_path(str(workspace))
         env_vars["RUNNER_TYPE"] = runner_type
         env_vars["MAGPIE_RUN_PHASE"] = phase
         if phase == "server" and server_pid_file is not None:
@@ -787,15 +802,15 @@ class BenchmarkMode:
             torch_trace_dir = workspace / "torch_trace"
             torch_trace_dir.mkdir(parents=True, exist_ok=True)
             env_vars["PROFILE"] = "1"
-            env_vars["VLLM_TORCH_PROFILER_DIR"] = str(torch_trace_dir)
-            env_vars["SGLANG_TORCH_PROFILER_DIR"] = str(torch_trace_dir)
-            env_vars["ATOM_TORCH_PROFILER_DIR"] = str(torch_trace_dir)
+            env_vars["VLLM_TORCH_PROFILER_DIR"] = self._bash_path(str(torch_trace_dir))
+            env_vars["SGLANG_TORCH_PROFILER_DIR"] = self._bash_path(str(torch_trace_dir))
+            env_vars["ATOM_TORCH_PROFILER_DIR"] = self._bash_path(str(torch_trace_dir))
 
         hf_token = os.environ.get("HF_TOKEN", "")
         if hf_token:
             env_vars["HF_TOKEN"] = hf_token
 
-        env_vars["SERVER_LOG"] = str(workspace / "server.log")
+        env_vars["SERVER_LOG"] = self._bash_path(str(workspace / "server.log"))
 
         for key, value in env_vars.items():
             env[key] = str(value)
