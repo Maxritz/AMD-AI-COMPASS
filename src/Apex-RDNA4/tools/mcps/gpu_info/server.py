@@ -194,8 +194,53 @@ ARCH_SPECS = {
             "Leverage larger LDS (128KB)",
             "Optimize for RDNA3 cache hierarchy"
         ]
+    },
+    # RDNA2 (gfx1030/gfx1031/gfx1032): vector SIMD only — no matrix unit, no MFMA,
+    # no WMMA, no FP8. Wave64 is fixed (no Wave32). FP16 native (2x FP32), BF16
+    # emulated (≈ FP32), INT8 native. The RX 6700 XT (gfx1031) is the reference SKU.
+    "gfx1030": {
+        "name": "AMD Radeon RX 6700 XT (RDNA2, gfx1031)",
+        "architecture": "RDNA2",
+        "compute_units": 40,
+        "wavefront_size": 64,
+        "lds_size_kb": 64,
+        "l2_cache_mb": 3,
+        "infinity_cache_mb": 96,
+        "effective_memory_bandwidth_gb_s": 1278,
+        "memory_bandwidth_gb_s": 384,
+        "memory_capacity_gb": 12,
+        "fp32_tflops": 12.4,
+        "fp16_tflops": 24.8,
+        "int8_tflops": 49.6,
+        "bf16_support": False,
+        "fp8_support": False,
+        "mfma_support": False,
+        "wmma_support": False,
+        "optimal_tile_sizes": {
+            "gemm_m": [64, 128, 256],
+            "gemm_n": [64, 128, 256],
+            "gemm_k": [16, 32, 64]
+        },
+        "memory_coalescing_bytes": 64,
+        "optimal_block_sizes": [256, 128, 64],
+        "max_workgroup_size": 1024,
+        "optimization_priorities": [
+            "No matrix/MFMA/WMMA units on RDNA2 — GEMM uses scalar/vector FMA + packed dot-product intrinsics",
+            "Wave64 fixed (no Wave32); size workgroups as multiples of 64 threads",
+            "Use GL_KHR_shader_integer_dot_product (dot4add_u8packed 4x8-bit INT8; v_dot2_f32_f16 2xFP16) or v_fma_f32; no FP8/WMMA/coopmat/MFMA/int4 on RDNA2",
+            "Pure FP32 GEMM via v_fma_f32; BF16 must emulate (load bf16, accumulate fp32)",
+            "Exploit the 96 MB Infinity Cache: tile GEMM so weights reuse in IC (up to ~1278 GB/s effective) instead of streaming 384 GB/s GDDR6",
+            "Target <= 48 VGPRs/thread to keep 2 concurrent waves/CU on Wave64"
+        ]
     }
 }
+
+# gfx1031 (RX 6700/6750/6800 XT) and gfx1032 (RX 66xx) share the RDNA2 profile.
+# The dispatch identity (gpu_types.py) already maps these to distinct SKUs; the
+# hardware limits (wave, LDS, matrix absence) are identical across the family, so
+# they alias the gfx1030 block (no matrix unit, Wave64, 3 MB L2 on the 6700 XT).
+ARCH_SPECS["gfx1031"] = ARCH_SPECS["gfx1030"]
+ARCH_SPECS["gfx1032"] = ARCH_SPECS["gfx1030"]
 
 # Default arch for fallback
 DEFAULT_ARCH = "gfx950"
@@ -246,19 +291,17 @@ class GPUDetector:
             # Look for GPU agent
             in_gpu_section = False
             for line in output.split('\n'):
-                # Look for GPU vendor (skip CPU agents)
-                if 'Vendor Name:' in line and 'AMD' in line and 'CPU' not in line:
+                if 'Name:' in line and 'gfx' in line and 'amdgcn' not in line:
+                    in_gpu_section = True
+                    match = re.search(r'gfx\d+[a-z]?', line)
+                    if match:
+                        arch = match.group()
+                elif 'Vendor Name:' in line and 'AMD' in line and 'CPU' not in line:
                     in_gpu_section = True
                 elif 'Vendor Name:' in line and 'CPU' in line:
                     in_gpu_section = False
                 elif in_gpu_section:
-                    # Match architecture name like "gfx950", "gfx942", "gfx90a"
-                    # Exclude ISA strings like "amdgcn-amd-amdhsa--gfx950:..."
-                    if 'Name:' in line and 'gfx' in line and 'amdgcn' not in line:
-                        match = re.search(r'gfx\d+[a-z]?', line)
-                        if match:
-                            arch = match.group()
-                    elif 'Marketing Name:' in line:
+                    if 'Marketing Name:' in line:
                         marketing_name = line.split(':', 1)[1].strip()
                     elif 'Compute Unit:' in line:
                         cu_match = re.search(r'Compute Unit:\s*(\d+)', line)
@@ -461,11 +504,15 @@ async def get_gpu_info(include_full_specs: bool) -> list[TextContent]:
         output += f"| Wavefront Size | {specs.get('wavefront_size', 64)} |\n"
         output += f"| LDS per CU | {specs.get('lds_size_kb', 'N/A')} KB |\n"
         output += f"| L2 Cache | {specs.get('l2_cache_mb', 'N/A')} MB |\n"
+        if specs.get('infinity_cache_mb'):
+            output += f"| Infinity Cache (MALL) | {specs['infinity_cache_mb']} MB |\n"
         
         if 'hbm_bandwidth_tb_s' in specs:
             output += f"| HBM Bandwidth | {specs['hbm_bandwidth_tb_s']} TB/s |\n"
         elif 'memory_bandwidth_gb_s' in specs:
             output += f"| Memory Bandwidth | {specs['memory_bandwidth_gb_s']} GB/s |\n"
+        if specs.get('effective_memory_bandwidth_gb_s'):
+            output += f"| Effective BW (with IC) | {specs['effective_memory_bandwidth_gb_s']} GB/s |\n"
             
         output += f"| Max Workgroup Size | {specs.get('max_workgroup_size', 1024)} |\n"
         output += f"| Memory Coalescing | {specs.get('memory_coalescing_bytes', 128)} bytes |\n\n"

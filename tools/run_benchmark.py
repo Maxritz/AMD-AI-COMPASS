@@ -26,6 +26,58 @@ import cpu_tune
 AI_COMPASS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def find_rocprofv3():
+    """Find rocprofv3 for Linux ROCm tracing (hip_tracer is Windows-only)."""
+    import shutil
+    return shutil.which("rocprofv3")
+
+
+def convert_rocprof_csv_to_aicompass(rocpd_csv_path, output_csv_path):
+    """Convert a rocprofv3 kernel_trace.csv to AI-COMPASS parse_trace-compatible format.
+
+    rocprofv3 --sys-trace -f csv produces kernel_trace.csv with columns:
+      Kind, Agent_Id, Queue_Id, Stream_Id, Thread_Id, Dispatch_Id, Kernel_Id,
+      Kernel_Name, Correlation_Id, Start_Timestamp, End_Timestamp,
+      LDS_Block_Size, Scratch_Size, VGPR_Count, Accum_VGPR_Count, SGGR_Count,
+      Workgroup_Size_X/Y/Z, Grid_Size_X/Y/Z
+
+    AI-COMPASS parse_trace expects:
+      dispatch_id, kernel_name, grid_x, grid_y, grid_z, block_x, block_y,
+      block_z, shared_mem, duration_us
+    """
+    import csv
+
+    with open(rocpd_csv_path, newline="") as fin:
+        reader = csv.DictReader(fin)
+        rows = list(reader)
+
+    with open(output_csv_path, "w", newline="") as fout:
+        writer = csv.writer(fout)
+        writer.writerow([
+            "dispatch_id", "kernel_name", "grid_x", "grid_y", "grid_z",
+            "block_x", "block_y", "block_z", "shared_mem", "duration_us",
+        ])
+        for row in rows:
+            if row.get("Kind", "") != "KERNEL_DISPATCH":
+                continue
+            start = int(row["Start_Timestamp"])
+            end = int(row["End_Timestamp"])
+            duration_us = (end - start) / 1000.0  # timestamps are in ns
+            writer.writerow([
+                row.get("Dispatch_Id", ""),
+                row.get("Kernel_Name", ""),
+                row.get("Grid_Size_X", ""),
+                row.get("Grid_Size_Y", ""),
+                row.get("Grid_Size_Z", ""),
+                row.get("Workgroup_Size_X", ""),
+                row.get("Workgroup_Size_Y", ""),
+                row.get("Workgroup_Size_Z", ""),
+                row.get("LDS_Block_Size", ""),
+                f"{duration_us:.3f}",
+            ])
+    return True
+
+
 def find_llama_bench():
     """
     Find llama-bench using only generic, portable discovery:
@@ -167,12 +219,26 @@ def main():
         print("  [AICOMPASS] --gpu-timing: real per-kernel GPU timing enabled, HIP graph capture "
               "disabled for this run (required -- see --help). t/s numbers below will be lower than normal.")
     launcher = os.path.join(AI_COMPASS_ROOT, "..", "hip_tracer", "build", "hip_tracer_launcher.exe")
-    if not os.path.exists(launcher) or args.no_tracer:
-        print(f"  Running without tracer (--no-tracer or launcher not found).")
+    rocprofv3 = find_rocprofv3()
+
+    if args.no_tracer:
+        print("  Running without tracer (--no-tracer).")
         cmd = [lb, "-m", args.model, "-p", str(args.pp), "-n", str(args.tg), "-ngl", str(args.ngl)]
-    else:
+    elif os.path.exists(launcher):
         cmd = [launcher, "--output", trace_csv, lb, "-m", args.model,
                "-p", str(args.pp), "-n", str(args.tg), "-ngl", str(args.ngl)]
+    elif rocprofv3:
+        # Linux ROCm fallback: use rocprofv3 for kernel tracing
+        rocprof_out = os.path.join(out_dir, "rocprofv3_raw")
+        os.makedirs(rocprof_out, exist_ok=True)
+        print(f"  [AICOMPASS] hip_tracer launcher not found. Using rocprofv3 for kernel tracing.")
+        env["HIP_TRACER_GPU_TIMING"] = "1"
+        env["GGML_CUDA_DISABLE_GRAPHS"] = "1"
+        cmd = [rocprofv3, "-s", "-f", "csv", "-d", rocprof_out, "--",
+               lb, "-m", args.model, "-p", str(args.pp), "-n", str(args.tg), "-ngl", str(args.ngl)]
+    else:
+        print("  Running without tracer (no launcher found and rocprofv3 not available).")
+        cmd = [lb, "-m", args.model, "-p", str(args.pp), "-n", str(args.tg), "-ngl", str(args.ngl)]
     print(f"   {' '.join(cmd)}")
 
     # Set up CPU affinity pinning if enabled
@@ -242,6 +308,13 @@ def main():
                     pass
 
     print(f"\n Analyzing trace: {trace_csv}")
+    # If rocprofv3 was used, convert its kernel_trace.csv to AI-COMPASS format
+    if rocprofv3 and not os.path.exists(trace_csv):
+        import glob
+        kernel_csvs = glob.glob(os.path.join(out_dir, "rocprofv3_raw", "**", "*_kernel_trace.csv"), recursive=True)
+        if kernel_csvs:
+            convert_rocprof_csv_to_aicompass(kernel_csvs[0], trace_csv)
+            print(f"  [AICOMPASS] Converted rocprofv3 kernel trace to {trace_csv}")
     if os.path.exists(trace_csv):
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from analyze import parse_trace, analyze_trace, generate_html_report, compare_traces

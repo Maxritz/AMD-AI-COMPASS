@@ -121,7 +121,7 @@ def _autodetect_gpu_type() -> str | None:
                 capture_output=True,
                 text=True,
                 timeout=5,
-            ).stdout.upper()
+            ).stdout.upper().replace(" ", "")
             for tag in ("MI355X", "MI325X", "MI308X", "MI300X", "RX9070XT", "RX9070", "RX9060XT", "R9000",
                         "RX6900XT", "RX6800XT", "RX6700XT"):
                 if tag in out:

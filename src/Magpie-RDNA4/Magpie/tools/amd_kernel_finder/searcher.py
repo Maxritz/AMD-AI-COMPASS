@@ -1412,6 +1412,10 @@ class KernelSourceSearcher:
             "wvSplitK": ("projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/", "hipBLASLt WMMA kernel", "$ROCM_LIBRARIES_DIR"),
             "wvSpltK": ("projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/", "hipBLASLt WMMA kernel", "$ROCM_LIBRARIES_DIR"),
             "DeviceGemmWmma": ("projects/composablekernel/include/ck/tensor_operation/gpu/device/impl/", "CK WMMA GEMM", "$ROCM_LIBRARIES_DIR"),
+            # RDNA2 fallback: no WMMA/MFMA hardware — FMA + packed-dot paths.
+            # MFMA kernels map to vector FMA (FP16) / dot4add_u8packed (INT8).
+            "MmaLayerDesc": ("projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/", "hipBLASLt RDNA2 FMA/dot2 fallback", "$ROCM_LIBRARIES_DIR"),
+            "DeviceGemm": ("projects/composablekernel/include/ck/tensor_operation/gpu/device/impl/", "CK RDNA2 FP16 v_dot2_f32_f16 / INT8 dot4add_u8packed GEMM", "$ROCM_LIBRARIES_DIR"),
             # vLLM kernels
             "reshape_and_cache": ("csrc/cache_kernels.cu", "reshape_and_cache_flash_kernel", "$VLLM_DIR"),
             "paged_attention": ("csrc/attention/paged_attention_v1.cu", "paged_attention_kernel", "$VLLM_DIR"),

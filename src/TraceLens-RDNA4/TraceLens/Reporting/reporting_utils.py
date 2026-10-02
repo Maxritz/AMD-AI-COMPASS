@@ -19,6 +19,66 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+# GFX string → arch JSON filename (in TraceLens/Agent/Analysis/utils/arch/)
+_GFX_TO_PLATFORM = {
+    "gfx1150": "MI300X",
+    "gfx1152": "MI325X",
+    "gfx950": "MI355X",
+    "gfx942": "MI300X",
+    "gfx940": "MI300A",
+    "gfx90a": "MI250X",
+    "gfx1031": "RX6700XT",
+    "gfx1201": "RX9070XT",
+}
+
+
+def _detect_gpu_platform() -> Optional[str]:
+    """Auto-detect the AMD GPU platform name from rocminfo/rocm-smi.
+
+    Maps gfx strings and product names to arch JSON filenames. Returns None
+    if detection fails or we're not on an AMD GPU.
+    """
+    try:
+        result = subprocess.run(
+            ["rocminfo"], capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                m = re.match(r"Name:\s+(gfx\d+)", line)
+                if m and m.group(1) in _GFX_TO_PLATFORM:
+                    plat = _GFX_TO_PLATFORM[m.group(1)]
+                    logger.debug(f"Auto-detected GPU platform: {plat} (from rocminfo)")
+                    return plat
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showproductname"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            text = result.stdout.upper()
+            if "6700" in text:
+                return "RX6700XT"
+            if "9070" in text:
+                return "RX9070XT"
+            if "7900" in text:
+                return "RX7900XTX"
+            if "MI325" in text:
+                return "MI325X"
+            if "MI355" in text or "MI350" in text:
+                return "MI355X"
+            if "MI300X" in text or "MI300" in text:
+                return "MI300X"
+            if "MI250" in text:
+                return "MI250X"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return None
+
+
 def resolve_gpu_arch(
     *,
     gpu_arch_json_path: Optional[str] = None,
@@ -30,6 +90,8 @@ def resolve_gpu_arch(
     Exactly one of ``gpu_arch_json_path``, ``gpu_arch_platform``, or ``gpu_arch``
     may be set. ``gpu_arch_platform`` is loaded via
     ``TraceLens.Agent.Analysis.utils.arch_utils.load_arch``.
+
+    If none is set, attempts auto-detection via ``rocminfo``/``rocm-smi``.
     """
     sources = [
         gpu_arch_json_path is not None,
@@ -50,6 +112,16 @@ def resolve_gpu_arch(
         from TraceLens.Agent.Analysis.utils.arch_utils import load_arch
 
         return load_arch(gpu_arch_platform)
+    detected = _detect_gpu_platform()
+    if detected is not None:
+        try:
+            from TraceLens.Agent.Analysis.utils.arch_utils import list_platforms
+
+            if detected in list_platforms():
+                from TraceLens.Agent.Analysis.utils.arch_utils import load_arch
+                return load_arch(detected)
+        except Exception:
+            pass
     return None
 
 
@@ -72,7 +144,7 @@ def add_gpu_arch_cli_args(parser: argparse.ArgumentParser) -> None:
         metavar="PLATFORM",
         help=(
             "Bundled or TL_EXTENSION platform name loaded via load_arch "
-            f"(available: {platforms})"
+            f"(available: {platforms}). If unset, auto-detected via rocminfo/rocm-smi."
         ),
     )
 

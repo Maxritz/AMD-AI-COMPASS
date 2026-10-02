@@ -33,6 +33,62 @@ CLI_GENERATE_REPORT = "TraceLens_generate_perf_report_pytorch"
 CLI_MULTI_RANK_COLLECTIVE = "TraceLens_generate_multi_rank_collective_report_pytorch"
 CLI_COMPARE_REPORTS = "TraceLens_compare_perf_reports_pytorch"
 
+# GFX string → TraceLens arch platform name
+_GFX_TO_PLATFORM = {
+    "gfx1150": "MI300X",
+    "gfx1152": "MI325X",
+    "gfx950": "MI355X",
+    "gfx942": "MI300X",
+    "gfx940": "MI300A",
+    "gfx90a": "MI250X",
+    "gfx1031": "RX6700XT",
+    "gfx1201": "RX9070XT",
+}
+
+
+def _try_autodetect_gpu_platform(cmd: list) -> bool:
+    """Append ``--gpu_arch_platform`` to *cmd* if a supported AMD GPU is detected.
+
+    Uses ``rocminfo`` first (most authoritative), falling back to
+    ``rocm-smi --showproductname``. Returns True if appended, False otherwise.
+    """
+    import re
+
+    platform = None
+
+    try:
+        result = subprocess.run(
+            ["rocminfo"], capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                m = re.match(r"Name:\s+(gfx\d+)", line)
+                if m and m.group(1) in _GFX_TO_PLATFORM:
+                    platform = _GFX_TO_PLATFORM[m.group(1)]
+                    break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    if platform is None:
+        try:
+            result = subprocess.run(
+                ["rocm-smi", "--showproductname"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                text = result.stdout.upper()
+                if "6700" in text:
+                    platform = "RX6700XT"
+                elif "9070" in text:
+                    platform = "RX9070XT"
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    if platform is not None:
+        cmd.extend(["--gpu_arch_platform", platform])
+        return True
+    return False
+
 
 def ensure_tracelens_installed() -> bool:
     """
@@ -367,7 +423,9 @@ class TraceLensAnalyzer:
         
         if self.config.gpu_arch_config:
             cmd.extend(["--gpu_arch_json_path", self.config.gpu_arch_config])
-        
+        elif _try_autodetect_gpu_platform(cmd):
+            logger.info("Auto-detected GPU platform for TraceLens roofline")
+
         logger.info(f"Running TraceLens: {' '.join(cmd)}")
         
         try:

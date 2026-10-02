@@ -123,9 +123,17 @@ def _classify_gpu_architecture(name, pnp):
     # Check RDNA 3
     if "rx 7" in n or any(k in n for k in ("780m", "760m", "740m", "phoenix", "hawk point", "strix point")):
         return "gfx1103", "RDNA3", True
-    # Check RDNA 2
-    if "rx 6" in n or any(k in n for k in ("680m", "660m", "rembrandt")):
+     # Check RDNA 2
+    if "rx 6" in n:
+        if "6700" in n or "6750" in n:
+            return "gfx1031", "RDNA2", True
+        if "6600" in n:
+            return "gfx1032", "RDNA2", True
+        if "6800" in n or "6900" in n:
+            return "gfx1030", "RDNA2", True
         return "gfx1030", "RDNA2", True
+    if any(k in n for k in ("680m", "660m", "rembrandt")):
+        return "gfx1032", "RDNA2", True
     
     return "unknown", "unknown", True
 

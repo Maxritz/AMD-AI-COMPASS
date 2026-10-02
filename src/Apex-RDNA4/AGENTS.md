@@ -12,7 +12,7 @@ prompt constructor → LLM agent → output/ → grader (Magpie) → score
 
 The agent receives a baseline kernel, writes an optimized version to `output/<task_id>/solution.{py,hip}`, and is scored on compilation (+20 pts), correctness (+100 pts), and speedup (×100 pts).
 
-Default target: **MI355X / gfx950 (CDNA4)**. Also supports gfx942 (MI300X), gfx940 (MI300A), gfx90a (MI250X), gfx1201 (RDNA4/RX 9070 series).
+Default target: **MI355X / gfx950 (CDNA4)**. Also supports gfx942 (MI300X), gfx940 (MI300A), gfx90a (MI250X), gfx1201 (RDNA4/RX 9070 series), gfx1031 (RDNA2/RX 6700 XT — FMA + INT8/FP16 packed-dot, no MFMA/WMMA/FP8/int4).
 
 ## Environment (always set first)
 

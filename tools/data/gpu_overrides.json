@@ -48,6 +48,20 @@
       "workarounds": [
         {"id": "vllm-34641", "description": "FP4BMM=0 mandatory on gfx942 (MI300X crash bug)"}
       ]
+    },
+    "gfx1031": {
+      "gpu_family": "AMD Radeon RX 6700 XT (RDNA2)",
+      "vram_gb": 12,
+      "env_defaults": {
+        "VLLM_ROCM_USE_AITER": "0"
+      },
+      "precision": {
+        "native": ["fp16", "int8"],
+        "emulated": ["bf16"],
+        "unsupported": ["fp8_ocp", "fp8_fnuz", "mxfp4", "mxfp6", "nvfp4"],
+        "notes": "RDNA2 has no matrix hardware (no MFMA/WMMA/FP8/int4). FP16 native 2x via v_dot2_f32_f16; INT8 accelerated via dot4add_u8packed; BF16 emulated via FMA. AITER disabled — use CK/Tensile FMA + dp4a/dp2a paths."
+      },
+      "workarounds": []
     }
   },
   "legacy_models": {

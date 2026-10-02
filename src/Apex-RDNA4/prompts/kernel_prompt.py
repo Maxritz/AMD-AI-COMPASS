@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -49,23 +50,24 @@ ARCH_MAP = {
 
 
 def detect_gpu() -> str:
-    """Try to detect the installed GPU via rocm-smi or hipConfig; fall back to default."""
-    # First try Windows HIP-ROCm 7.3+ hipConfig
+    """Detect the installed GPU gcn arch (e.g. gfx1031) via hipConfig/rocm-smi/rocminfo;
+    fall back to DEFAULT_TARGET. Works on headless Linux where rocm-smi is absent/broken."""
+    # Windows HIP-ROCm 7.3+ hipConfig
     try:
         out = subprocess.check_output(
-            ["hipConfig", "--show-device"], text=True, timeout=5
+            ["hipConfig", "--show-device"], text=True, timeout=5, stderr=subprocess.DEVNULL
         )
         if "9070" in out or "9060" in out:
             return "gfx1201"  # RX 9000 / RDNA4
     except Exception:
         pass
 
-    # Fall back to rocm-smi for AMD Instinct GPUs
+    # Linux: rocm-smi --showproductname (space-insensitive SKU matching)
     try:
         out = subprocess.check_output(
-            ["rocm-smi", "--showproductname"], text=True, timeout=5
-        )
-        if any(k in out for k in ["MI355", "MI350"]):
+            ["rocm-smi", "--showproductname"], text=True, timeout=5, stderr=subprocess.DEVNULL
+        ).upper().replace(" ", "")
+        if any(k in out for k in ("MI355", "MI350")):
             return "gfx950"
         if "MI300X" in out:
             return "gfx942"
@@ -73,12 +75,29 @@ def detect_gpu() -> str:
             return "gfx940"
         if "MI250" in out:
             return "gfx90a"
-        # RDNA4 cards may show up in rocm-smi on Linux too
-        if any(k in out for k in ["9070", "9060"]):
+        if any(k in out for k in ("9070", "9060")):
             return "gfx1201"
-        # RDNA2 cards (RX 6000 series)
-        if any(k in out for k in ["6600", "6700", "6800", "6900"]):
+        # RDNA2 (RX 6000): map each SKU to its accurate gcn arch string
+        if "RX6700XT" in out or "6700" in out:
+            return "gfx1031"
+        if any(k in out for k in ("RX6800XT", "RX6900XT", "6800", "6900")):
             return "gfx1030"
+        if any(k in out for k in ("RX6650XT", "RX6600XT", "6650", "6600")):
+            return "gfx1032"
+    except Exception:
+        pass
+
+    # Robust fallback for headless Linux where rocm-smi is absent/broken:
+    # parse `rocminfo` for the GPU agent's "Name: gfx..." line. rocminfo emits
+    # this before "Vendor Name:", so match the "Name:" + "gfx" line directly;
+    # the arch string there is authoritative for the offload target.
+    try:
+        info = subprocess.check_output(["rocminfo"], text=True, timeout=10, stderr=subprocess.DEVNULL)
+        for line in info.splitlines():
+            if "Name:" in line and "gfx" in line and "amdgcn" not in line:
+                m = re.search(r"gfx\d+[a-z]?", line)
+                if m:
+                    return m.group()
     except Exception as e:
         _log.debug("GPU detection failed, using default %s: %s", DEFAULT_TARGET, e)
     return DEFAULT_TARGET

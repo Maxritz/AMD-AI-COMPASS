@@ -16,6 +16,7 @@ from datetime import datetime
 
 # Architecture profiles
 # Each profile: (cu_count, wave_size, simd_per_cu, waves_per_simd, lds_per_cu, l2_cache_kb)
+# l2 = family-max. For SKU-aware tiling budgets on the 6700 XT, use 3072 (3 MiB) instead of 4096.
 ARCH_PROFILES = {
     "rdna1":  {"cu": 36, "wave": 64, "simd": 4, "waves_per_simd": 16, "lds": 65536, "l2": 4096},
     "rdna2":  {"cu": 40, "wave": 64, "simd": 4, "waves_per_simd": 16, "lds": 65536, "l2": 4096},
